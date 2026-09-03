@@ -60,12 +60,18 @@ itself, not by this document:
    (a `tests`/`test`/`__tests__`/`spec` path segment, or a basename like `test_*` / `*_test.*` /
    `*.test.*` / `*.spec.*` / `*_spec.*` / `conftest.py` — add more with `TWOPERSON_TEST_GLOBS`,
    which only *extends* the built-in rule and can never switch it off) with any status other than
-   `"added"` or `"copied"`, the cited verdict must also have `acknowledges_test_changes: true`
-   (`twoperson verdict --ack-test-changes`). Only adding or copying a test is safe; every other
-   status — `"modified"`, `"deleted"`, `"renamed"`, the `"unknown"` sentinel, or any status added
-   to the schema later — is treated as a possible weakening, so nothing slips through by carrying
-   an unrecognised or ambiguous status. The point is to make sure a reviewer actually looked at a
-   test being *changed*, not to discourage writing more of them. A `"renamed"` entry is checked from both ends: a
+   `"added"` or `"copied"`, the cited verdict's `acknowledged_tests` must be a SUPERSET of those
+   altered paths (`twoperson verdict --ack-test-changes`, which derives the paths from the
+   `--packet` being reviewed — never hand-typed). The check is content-bound on purpose: recording
+   the specific test paths, rather than a bare "I acknowledge test changes" flag, means a verdict
+   written for one packet's test changes cannot be cited to silently unlock a *different* ship
+   report's *different* test changes at the same head — `changed_files` is self-reported per
+   packet, so a boolean acknowledgment could otherwise be replayed across reports. Only adding or
+   copying a test is safe; every other status — `"modified"`, `"deleted"`, `"renamed"`, the
+   `"unknown"` sentinel, or any status added to the schema later — is treated as a possible
+   weakening, so nothing slips through by carrying an unrecognised or ambiguous status. The point
+   is to make sure a reviewer actually looked at a test being *changed*, not to discourage writing
+   more of them. A `"renamed"` entry is checked from both ends: a
    `changed_files` entry may carry an optional `old_path` (the pre-rename path), and the rename is
    flagged if either `path` or `old_path` is a test file — otherwise a test renamed to a non-test
    path (`tests/test_auth.py` -> `src/auth.py`) would read as "not a test" and its coverage could

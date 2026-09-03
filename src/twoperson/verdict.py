@@ -25,11 +25,11 @@ from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from .packet import (
+    MAX_LIST,
     UNKNOWN,
     PacketError,
     SchemaError,
     SecretLeakError,
-    _boolean,
     _enum,
     _iso_timestamp,
     _sha,
@@ -80,19 +80,22 @@ _VERDICT_SCHEMA: dict[str, Any] = {
     "reviewer": _short,
     "findings": lambda v, f: _string_list(v, f, limit=64),
     "note": _optional_text,
-    # Optional: "did the reviewer notice the packet altered a test?" (see `twoperson.testset` and
-    # `inbox.assert_review_ref_resolves`). Absent on a verdict is the same as `False` — a verdict
-    # written before this field existed, or one that never touched a test, must still validate
-    # unchanged, so it is not in `_REQUIRED_VERDICT_FIELDS` below and is only ever written when
-    # `True` (see `build_verdict`), keeping every verdict that does not need it byte-identical to
-    # what it would have been without this field.
-    "acknowledges_test_changes": _boolean,
+    # Optional: the SPECIFIC test paths the reviewer acknowledges (see `twoperson.testset` and
+    # `inbox.assert_review_ref_resolves`). This is content-bound, not a bare flag: a verdict written
+    # for one packet's test changes must not be able to silently unlock a DIFFERENT ship report's
+    # different test changes at the same head (`changed_files` is self-reported per packet, so a
+    # boolean acknowledgment could be replayed across reports). Absent is the same as "acknowledged
+    # nothing" — a verdict that never touched a test, or one written before this field existed, must
+    # still validate unchanged, so it is not in `_REQUIRED_VERDICT_FIELDS` below and is only ever
+    # written when the list is non-empty (see `build_verdict`), keeping every verdict that does not
+    # need it byte-identical to what it would have been without this field.
+    "acknowledged_tests": lambda v, f: _string_list(v, f, limit=MAX_LIST),
 }
 
 #: Fields in `_VERDICT_SCHEMA` that `validate_verdict` does NOT require to be present. Missing is
 #: accepted (and simply absent from the validated result); present is still type-checked like any
 #: other field. Everything else in `_VERDICT_SCHEMA` remains required, as before this field existed.
-_OPTIONAL_VERDICT_FIELDS = frozenset({"acknowledges_test_changes"})
+_OPTIONAL_VERDICT_FIELDS = frozenset({"acknowledged_tests"})
 
 VERDICT_FIELDS = frozenset(_VERDICT_SCHEMA)
 
@@ -150,16 +153,24 @@ def build_verdict(
     reviewer: str = "reviewer",
     findings: Any = None,
     note: Any = None,
-    acknowledges_test_changes: bool = False,
+    acknowledged_tests: Any = None,
     now: datetime | None = None,
 ) -> dict:
     """Assemble a validated verdict. Untrusted inputs are validated, never trusted or echoed raw.
 
-    ``acknowledges_test_changes`` records that the reviewer noticed the packet altered a test (see
-    `twoperson.testset`). It defaults to ``False`` and, like the template packet's `unknown`
-    sentinels, is only ever written into the verdict when ``True`` — a verdict that never touched
-    the question is left exactly as it would have been before this field existed.
+    ``acknowledged_tests`` records the SPECIFIC test paths the reviewer acknowledges (see
+    `twoperson.testset`) — content-bound, not a bare flag, so an acknowledgment made for one
+    packet's test changes cannot be replayed to unlock a different ship report's different test
+    changes at the same head. It defaults to ``None`` (acknowledged nothing) and, like the template
+    packet's `unknown` sentinels, is only ever written into the verdict when non-empty — a verdict
+    that never touched the question is left exactly as it would have been before this field
+    existed. Only a real list (or tuple) is accepted: a bare string such as ``"false"`` would
+    otherwise silently spread into one-character "paths", so anything else raises `SchemaError`
+    here, before it ever reaches `_string_list`'s per-item type check.
     """
+    if acknowledged_tests is not None and not isinstance(acknowledged_tests, (list, tuple)):
+        raise SchemaError("acknowledged_tests: expected a list of test paths, got "
+                          f"{type(acknowledged_tests).__name__}")
     moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     verdict = {
         "schema_version": VERDICT_SCHEMA_VERSION,
@@ -173,8 +184,9 @@ def build_verdict(
         "findings": list(findings) if findings else [],
         "note": note if note else "",
     }
-    if acknowledges_test_changes:
-        verdict["acknowledges_test_changes"] = True
+    paths = list(acknowledged_tests) if acknowledged_tests else []
+    if paths:
+        verdict["acknowledged_tests"] = paths
     return validate_verdict(verdict)
 
 

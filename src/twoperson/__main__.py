@@ -63,6 +63,7 @@ from .signal import (
     render_signal,
     session_id_from_hook_payload,
 )
+from .testset import altered_test_files
 from .verdict import DECISIONS, build_verdict, render_verdict
 from .consult import (
     AREAS,
@@ -192,12 +193,20 @@ def _emit_verdict(args) -> int:
     schema validates before the tree is touched, exactly like `publish`.
     """
     try:
+        # One lookup of the reviewed packet, reused for both the head default and the
+        # `--ack-test-changes` derivation below — `found` is `(lane, path, packet)` or `None`.
+        found = inbox.find_packet(args.packet)
         head = args.head
         if head is None:
             # No --head: bind to the packet's own head rather than guessing. If the packet does not
             # exist, publish_verdict will say so; keep the sentinel so the schema path is unchanged.
-            found = inbox.find_packet(args.packet)
             head = found[2]["git"]["head_sha"] if found else "unknown"
+        acknowledged = []
+        if args.ack_test_changes and found is not None:
+            # Derive the acknowledged paths from the REVIEWED packet's own `changed_files` — never
+            # from a hand-typed list — so the verdict can only ever acknowledge tests this reviewer
+            # actually had in front of them for `--packet`.
+            acknowledged = altered_test_files(found[2]["changed_files"])
         verdict = build_verdict(
             packet_id=args.packet,
             decision=args.decision,
@@ -205,7 +214,7 @@ def _emit_verdict(args) -> int:
             reviewer=args.reviewer,
             findings=args.finding or [],
             note=args.note,
-            acknowledges_test_changes=args.ack_test_changes,
+            acknowledged_tests=acknowledged,
         )
         path = inbox.publish_verdict(verdict)
     except (PacketError, OSError) as exc:
@@ -408,8 +417,9 @@ def main(argv: list[str] | None = None) -> int:
                      help="a finding; repeatable for several")
     vdt.add_argument("--note", default=None, help="one free-text summary line")
     vdt.add_argument("--ack-test-changes", dest="ack_test_changes", action="store_true",
-                     help="acknowledge that the packet altered a test file (required for "
-                          "Approve/'Approve with nits' on a packet whose changed_files modifies, "
+                     help="acknowledge the test changes in the reviewed packet (--packet): derives "
+                          "the specific test paths from that packet's own changed_files (required "
+                          "for Approve/'Approve with nits' on a packet whose changed_files modifies, "
                           "deletes, or renames a test — see docs/PROTOCOL.md)")
 
     vdts = sub.add_parser("verdicts", help="Builder: read audit verdicts Reviewer has returned")

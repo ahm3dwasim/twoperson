@@ -72,23 +72,29 @@ not carry over to a different commit
 ```
 
 And if the packet's `changed_files` says it changed a test — anything but a fresh add or copy — the
-cited verdict has to say the reviewer noticed:
+cited verdict has to acknowledge those exact paths:
 
 ```
 $ twoperson verify --from packet.json
 packet rejected — push_status.review_ref: packet altered tests (tests/test_gate.py)
-but the approving verdict did not acknowledge the test change (needs
-acknowledges_test_changes / --ack-test-changes)
+that the approving verdict did not acknowledge — the reviewer must acknowledge these
+exact test paths (twoperson verdict --ack-test-changes)
 ```
 
-`twoperson verdict --ack-test-changes` clears it. It's a narrow check on purpose: it only sees
-the `changed_files` the builder reported (leaving a changed test off that list evades it — the
-same self-reporting gap `diff_summary` already has), and it flags *any* qualifying test change
-for acknowledgment rather than deciding whether it strengthens or weakens the test. It exists so
-a builder can't get a quietly weakened test past a reviewer who never looked at the diff, not so
-a machine can judge test quality. Only adding or copying a test is treated as safe; every other
-status — including an `unknown` one — needs the ack, so a change can't slip through on a vague
-status, and `TWOPERSON_TEST_GLOBS` only *adds* patterns rather than being able to switch detection off.
+`twoperson verdict --ack-test-changes` clears it — it derives the acknowledged paths from the
+`--packet` being reviewed, never from a hand-typed list, so a verdict can only ever acknowledge
+tests the reviewer actually had in front of them. That's deliberate: the acknowledgment records
+the *specific* test paths, not a bare "I acknowledge test changes" flag, so a verdict written for
+one packet's test changes can't be cited to silently unlock a *different* ship report's *different*
+test changes at the same head (`changed_files` is self-reported per packet). It's still a narrow
+check in every other respect: it only sees the `changed_files` the builder reported (leaving a
+changed test off that list evades it — the same self-reporting gap `diff_summary` already has),
+and it flags *any* qualifying test change for acknowledgment rather than deciding whether it
+strengthens or weakens the test. It exists so a builder can't get a quietly weakened test past a
+reviewer who never looked at the diff, not so a machine can judge test quality. Only adding or
+copying a test is treated as safe; every other status — including an `unknown` one — needs the
+ack, so a change can't slip through on a vague status, and `TWOPERSON_TEST_GLOBS` only *adds*
+patterns rather than being able to switch detection off.
 
 A rename is the one status where the changed path alone isn't enough: `changed_files` only
 records where a file ended up, so renaming `tests/test_auth.py` to `src/auth.py` would look like

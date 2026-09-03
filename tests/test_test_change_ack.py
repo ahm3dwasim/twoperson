@@ -3,9 +3,12 @@
 `twoperson.testset.altered_test_files` picks out `changed_files` entries that look like a test
 being modified, deleted, or renamed (never merely added). `assert_review_ref_resolves` — the same
 function that binds a ship report to an approving verdict for the right head — refuses that report
-unless the cited verdict also has `acknowledges_test_changes: true`. This mirrors
-`tests/test_gate_binding.py`'s style: a fixture packet, a verdict built with `build_verdict`, and
-an assertion that `inbox.publish`/`main(["verify", ...])` raises or does not.
+unless the cited verdict's `acknowledged_tests` is a SUPERSET of those altered paths. The check is
+content-bound, not a bare flag: a verdict written for one packet's test changes must not be able to
+unlock a DIFFERENT ship report's different test changes at the same head, since `changed_files` is
+self-reported per packet. This mirrors `tests/test_gate_binding.py`'s style: a fixture packet, a
+verdict built with `build_verdict`, and an assertion that `inbox.publish`/`main(["verify", ...])`
+raises or does not.
 """
 from __future__ import annotations
 
@@ -57,7 +60,7 @@ def test_a_modified_test_file_without_ack_is_refused(root):
     msg = str(excinfo.value)
     assert "altered tests" in msg
     assert "tests/test_gate.py" in msg
-    assert "acknowledges_test_changes" in msg and "--ack-test-changes" in msg
+    assert "--ack-test-changes" in msg
     assert inbox.find_packet("ship-tc-1") is None  # the refused ship report never landed
 
 
@@ -65,7 +68,7 @@ def test_a_modified_test_file_with_ack_is_accepted(root):
     packet_for("pkt-tc-2", head_sha="0900128")
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-2", decision="Approve", head_sha="0900128",
-                      acknowledges_test_changes=True)
+                      acknowledged_tests=["tests/test_gate.py"])
     ).stem
     packet = _pushed_with_files(
         "ship-tc-2",
@@ -165,7 +168,7 @@ def test_a_test_renamed_to_a_nontest_path_with_old_path_is_accepted_when_acked(r
     packet_for("pkt-tc-rename-1b", head_sha="0900128")
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-rename-1b", decision="Approve", head_sha="0900128",
-                      acknowledges_test_changes=True)
+                      acknowledged_tests=["src/auth.py"])
     ).stem
     packet = _pushed_with_files(
         "ship-tc-rename-1b",
@@ -262,39 +265,117 @@ def test_verify_also_refuses_an_unacknowledged_test_change(root, tmp_path, capsy
     assert inbox.find_packet("ship-tc-verify") is None  # verify writes nothing
 
 
-def test_cli_ack_test_changes_flag_sets_the_verdict_field(root, capsys):
-    packet_for("pkt-tc-cli", head_sha="0900128")
-    rc = main(["verdict", "--packet", "pkt-tc-cli", "--decision", "Approve",
+def test_ack_test_changes_flag_derives_paths_from_the_reviewed_packet(root, capsys):
+    """The flag never takes a hand-typed list — it reads the REVIEWED packet's own `changed_files`,
+    so a verdict can only ever acknowledge tests this reviewer actually had in front of them."""
+    packet_for("pkt-cli", head_sha="0900128", changed_files=[
+        {"path": "tests/test_thing.py", "status": "modified", "insertions": 1, "deletions": 2},
+    ])
+    rc = main(["verdict", "--packet", "pkt-cli", "--decision", "Approve",
                "--head", "0900128", "--ack-test-changes"])
     assert rc == 0
     (_, verdict), = inbox.read_verdicts()
-    assert verdict["acknowledges_test_changes"] is True
+    assert verdict["acknowledged_tests"] == ["tests/test_thing.py"]
+
+
+def test_ack_test_changes_flag_on_a_packet_with_no_test_changes_writes_nothing(root):
+    """The default fixture packet's own test file is status "added" — the flag derives an empty
+    list from it, and `build_verdict` never writes the key for an empty list."""
+    packet_for("pkt-cli-noop", head_sha="0900128")
+    rc = main(["verdict", "--packet", "pkt-cli-noop", "--decision", "Approve",
+               "--head", "0900128", "--ack-test-changes"])
+    assert rc == 0
+    (_, verdict), = inbox.read_verdicts()
+    assert "acknowledged_tests" not in verdict
 
 
 def test_verdict_without_the_flag_never_carries_the_field(root):
-    """`build_verdict` only writes the key when True, so an ordinary verdict round-trips unchanged."""
+    """`build_verdict` only writes the key for a non-empty list, so an ordinary verdict round-trips
+    unchanged."""
     v = build_verdict(packet_id="pkt-x", decision="Approve", head_sha="0900128")
-    assert "acknowledges_test_changes" not in v
+    assert "acknowledged_tests" not in v
 
 
 # ---- verdict schema: an old verdict on disk without the field still validates ----------------
 
 def test_a_verdict_missing_the_field_entirely_still_validates(root):
-    """Compat: a verdict recorded before this field existed has no `acknowledges_test_changes` key
-    at all — `validate_verdict` (and therefore `loads_verdict`) must accept it unchanged."""
+    """Compat: a verdict recorded before this field existed has no `acknowledged_tests` key at
+    all — `validate_verdict` (and therefore `loads_verdict`) must accept it unchanged."""
     from twoperson.verdict import validate_verdict
     v = build_verdict(packet_id="pkt-x", decision="Approve", head_sha="0900128")
-    assert "acknowledges_test_changes" not in v
+    assert "acknowledged_tests" not in v
     assert validate_verdict(v) == v
 
 
-def test_the_field_is_a_real_boolean_not_a_string(root):
+def test_build_verdict_rejects_a_nonlist_acknowledgment():
+    """A bare string like "false" must be rejected outright, not spread into one-character "paths"
+    by `list("false")`. `build_verdict` guards this before the value ever reaches `_string_list`."""
+    from twoperson.packet import SchemaError
+    with pytest.raises(SchemaError):
+        build_verdict(packet_id="pkt-x", decision="Approve", head_sha="0900128",
+                      acknowledged_tests="false")
+    with pytest.raises(SchemaError):
+        build_verdict(packet_id="pkt-x", decision="Approve", head_sha="0900128",
+                      acknowledged_tests=5)
+    v = build_verdict(packet_id="pkt-x", decision="Approve", head_sha="0900128",
+                      acknowledged_tests=["tests/test_x.py"])
+    assert v["acknowledged_tests"] == ["tests/test_x.py"]
+    v_empty = build_verdict(packet_id="pkt-x", decision="Approve", head_sha="0900128",
+                            acknowledged_tests=[])
+    assert "acknowledged_tests" not in v_empty
+    v_none = build_verdict(packet_id="pkt-x", decision="Approve", head_sha="0900128",
+                           acknowledged_tests=None)
+    assert "acknowledged_tests" not in v_none
+
+
+def test_the_field_is_a_list_of_strings_not_a_bare_string(root):
     from twoperson.packet import SchemaError
     from twoperson.verdict import validate_verdict
     v = build_verdict(packet_id="pkt-x", decision="Approve", head_sha="0900128")
-    v["acknowledges_test_changes"] = "true"
+    v["acknowledged_tests"] = "tests/test_x.py"
     with pytest.raises(SchemaError):
         validate_verdict(v)
+
+
+# ---- content-bound: an acknowledgment for one packet's tests must not unlock another's --------
+
+def test_a_verdict_acknowledging_other_tests_does_not_unlock_this_ship_report(root):
+    """The exact r4 finding, now closed: a verdict acknowledging test changes for ONE packet must
+    not silently unlock a DIFFERENT ship report at the same head whose altered tests differ."""
+    packet_for("pkt-tc-other", head_sha="0900128")
+    ref = inbox.publish_verdict(
+        build_verdict(packet_id="pkt-tc-other", decision="Approve", head_sha="0900128",
+                      acknowledged_tests=["tests/test_other.py"])
+    ).stem
+    packet = _pushed_with_files(
+        "ship-tc-other",
+        [{"path": "tests/test_gate.py", "status": "modified", "insertions": 1, "deletions": 3}],
+        head="0900128",
+    )
+    packet["push_status"]["review_ref"] = ref
+    with pytest.raises(PacketError) as excinfo:
+        inbox.publish(packet)
+    msg = str(excinfo.value)
+    assert "altered tests" in msg
+    assert "tests/test_gate.py" in msg
+    assert inbox.find_packet("ship-tc-other") is None
+
+
+def test_a_subset_of_acknowledged_tests_is_accepted(root):
+    """A verdict that acknowledges a SUPERSET of the ship report's altered tests still unlocks it —
+    only the exact-match replay is what the gate closes."""
+    packet_for("pkt-tc-superset", head_sha="0900128")
+    ref = inbox.publish_verdict(
+        build_verdict(packet_id="pkt-tc-superset", decision="Approve", head_sha="0900128",
+                      acknowledged_tests=["tests/test_gate.py", "tests/test_extra.py"])
+    ).stem
+    packet = _pushed_with_files(
+        "ship-tc-superset",
+        [{"path": "tests/test_gate.py", "status": "modified", "insertions": 1, "deletions": 3}],
+        head="0900128",
+    )
+    packet["push_status"]["review_ref"] = ref
+    assert inbox.publish(packet).exists()
 
 
 # ---- twoperson.testset: the detection helper on its own -------------------------------------

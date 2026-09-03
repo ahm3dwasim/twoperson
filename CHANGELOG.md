@@ -9,14 +9,25 @@ All notable changes to this project are documented here. The format follows
 ### Added
 
 - The ship gate now also refuses a packet whose `changed_files` changes a test file
-  (`twoperson.testset`) unless the cited verdict has `acknowledges_test_changes: true`
-  (`twoperson verdict --ack-test-changes`). Detection fails closed: only `added`/`copied` statuses
-  are safe, so `modified`, `deleted`, `renamed`, the `unknown` sentinel, or any status added to the
-  schema later all require the ack; `TWOPERSON_TEST_GLOBS` only *extends* the built-in test-path
-  rule and can never switch it off; and an optional `old_path` (rename source) is honored on any
-  entry that carries it — a test source flags the change whatever its status, and an absent, empty,
-  or `unknown` source is flagged conservatively — closing bypasses where a test moved to a non-test
+  (`twoperson.testset`) unless the cited verdict's `acknowledged_tests` names those exact paths
+  (`twoperson verdict --ack-test-changes`, which derives the paths from the packet under review —
+  never a hand-typed list). Detection fails closed: only `added`/`copied` statuses are safe, so
+  `modified`, `deleted`, `renamed`, the `unknown` sentinel, or any status added to the schema later
+  all require the ack; `TWOPERSON_TEST_GLOBS` only *extends* the built-in test-path rule and can
+  never switch it off; and an optional `old_path` (rename source) is honored on any entry that
+  carries it — a test source flags the change whatever its status, and an absent, empty, or
+  `unknown` source is flagged conservatively — closing bypasses where a test moved to a non-test
   path evaded detection because only the destination path was ever checked.
+
+### Changed
+
+- `acknowledged_tests` (a list of the specific test paths the reviewer acknowledges) replaces the
+  earlier boolean `acknowledges_test_changes`. The gate now requires the ship report's altered
+  tests to be a subset of what the cited verdict acknowledged, rather than accepting any truthy
+  flag — a verdict acknowledging one packet's test changes can no longer be cited to unlock a
+  different ship report's different test changes at the same head, since `changed_files` is
+  self-reported per packet. The feature was unreleased, so there is no compatibility path for the
+  old boolean field.
 
 ## [0.1.1] - 2026-09-03
 

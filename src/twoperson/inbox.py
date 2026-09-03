@@ -369,9 +369,14 @@ def assert_review_ref_resolves(packet: Mapping[str, Any], *, root: Path | str | 
     shipped nothing is not checked at all.
 
     On top of that binding, a packet whose ``changed_files`` modifies, deletes, or renames anything
-    `twoperson.testset` considers a test file must cite a verdict that acknowledged noticing (see
-    `build_verdict`/``--ack-test-changes``) — otherwise a builder under deadline pressure could get
-    a weakened test quietly approved by a reviewer who never looked at the test diff at all.
+    `twoperson.testset` considers a test file must cite a verdict whose `acknowledged_tests` is a
+    SUPERSET of those altered paths (see `build_verdict`/``--ack-test-changes``) — otherwise a
+    builder under deadline pressure could get a weakened test quietly approved by a reviewer who
+    never looked at the test diff at all. The check is content-bound on purpose: `acknowledged_tests`
+    names the exact paths the reviewer acknowledged, so a verdict written for one packet's test
+    changes cannot silently unlock a DIFFERENT ship report's different test changes at the same
+    head — `changed_files` is self-reported per packet, and a bare boolean acknowledgment could be
+    replayed across reports.
     """
     push = packet["push_status"]
     if not (push["pushed"] or push["deployed"] or push["restarted"]):
@@ -395,12 +400,15 @@ def assert_review_ref_resolves(packet: Mapping[str, Any], *, root: Path | str | 
             f"packet shipped {head!r} — an approval does not carry over to a different commit"
         )
     altered = altered_test_files(packet["changed_files"])
-    if altered and not match.get("acknowledges_test_changes"):
-        raise PacketError(
-            "push_status.review_ref: packet altered tests (" + ", ".join(altered) + ") but the "
-            "approving verdict did not acknowledge the test change (needs "
-            "acknowledges_test_changes / --ack-test-changes)"
-        )
+    if altered:
+        acked = set(match.get("acknowledged_tests", ()))
+        missing = [p for p in altered if p not in acked]
+        if missing:
+            raise PacketError(
+                "push_status.review_ref: packet altered tests (" + ", ".join(missing) + ") that the "
+                "approving verdict did not acknowledge — the reviewer must acknowledge these exact test "
+                "paths (twoperson verdict --ack-test-changes)"
+            )
 
 
 def publish_signal(signal: Mapping[str, Any], *, root: Path | str | None = None) -> Path:
