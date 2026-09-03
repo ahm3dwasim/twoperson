@@ -128,6 +128,43 @@ def test_changed_file_status_is_constrained():
         validate_packet(packet)
 
 
+def test_changed_file_accepts_an_optional_old_path_on_a_rename():
+    """`old_path` (the pre-rename path) is the one OPTIONAL field on a changed_files entry — added
+    so `twoperson.testset` can tell a rename's source from its destination. It is validated the
+    same way `path` is (repo-relative, no `..`, no absolute/drive paths)."""
+    packet = valid_packet()
+    packet["changed_files"] = [{"path": "src/auth.py", "status": "renamed", "old_path": "tests/test_auth.py",
+                                "insertions": 2, "deletions": 40}]
+    out = validate_packet(packet)
+    assert out["changed_files"][0]["old_path"] == "tests/test_auth.py"
+
+
+def test_changed_file_old_path_is_still_validated_as_a_safe_repo_path():
+    packet = valid_packet()
+    packet["changed_files"] = [{"path": "src/auth.py", "status": "renamed", "old_path": "/etc/passwd",
+                                "insertions": 2, "deletions": 40}]
+    with pytest.raises(UnsafePathError):
+        validate_packet(packet)
+
+
+def test_changed_file_without_old_path_still_validates():
+    """The overwhelming majority of entries — not renames — must round-trip exactly as before."""
+    packet = valid_packet()
+    packet["changed_files"] = [{"path": "src/auth.py", "status": "modified",
+                                "insertions": 2, "deletions": 1}]
+    out = validate_packet(packet)
+    assert "old_path" not in out["changed_files"][0]
+
+
+def test_changed_file_rejects_a_genuinely_unknown_key():
+    """Only `old_path` is the new allowance — every other key stays rejected, exactly as before."""
+    packet = valid_packet()
+    packet["changed_files"] = [{"path": "src/auth.py", "status": "modified", "insertions": 2,
+                                "deletions": 1, "surprise": "no"}]
+    with pytest.raises(SchemaError):
+        validate_packet(packet)
+
+
 def test_test_result_is_constrained():
     packet = valid_packet()
     packet["tests"] = [{"name": "n", "command": "c", "result": "probably fine", "evidence": "e"}]
