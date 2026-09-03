@@ -15,11 +15,13 @@ slip a change past the gate:
   weaken an existing one). *Every other* status — `"modified"`, `"deleted"`, `"renamed"`, the
   `"unknown"` sentinel, and any status added to the schema later — is a possible weakening. The
   rule is a safe-list, not a weakening-list, so a new or unknown status can never silently bypass.
-* **Rename source.** `changed_files` records only the *destination* path, so a test moved to a
+* **Change source.** `changed_files` records only the *destination* path, so a test moved to a
   non-test path (`tests/test_auth.py` -> `src/auth.py`) reads as "not a test file" if only `path`
-  is checked. Entries may carry an OPTIONAL `old_path` (the pre-rename path) so a rename is judged
-  from both ends. When `old_path` is absent, empty, or the `"unknown"` sentinel, the source cannot
-  be ruled out as a test, so the rename is flagged unconditionally.
+  is checked. Entries may carry an OPTIONAL `old_path` (the pre-rename path); it is honored
+  whatever status carries it, so a test source is not ignored just because the status is
+  `"unknown"` or `"modified"` rather than `"renamed"`. A present `old_path` that is empty or the
+  `"unknown"` sentinel cannot be ruled out as a test and is flagged; and a `"renamed"` status with
+  no recorded source is flagged unconditionally, since the move could be exactly that.
 * **Test-path globs.** `TWOPERSON_TEST_GLOBS` can only *add* patterns to the built-in rule; it can
   never replace or narrow it. A builder who controls the environment at publish time therefore
   cannot set a nonmatching glob to switch detection off — the defaults always still apply.
@@ -94,16 +96,21 @@ def is_test_path(path: str) -> bool:
     return any(fnmatch.fnmatch(lowered, glob.lower()) for glob in _extra_globs())
 
 
-def _renamed_from_a_test(entry: Mapping[str, Any]) -> bool:
-    """Whether a `"renamed"` entry's *source* could have been a test file.
+def _source_could_be_a_test(entry: Mapping[str, Any]) -> bool:
+    """Whether a `changed_files` entry's declared source (`old_path`) forces acknowledgment.
 
-    `old_path` is optional. When it names a concrete path, its own test-ness is what matters — a
-    rename can move a file INTO `tests/` (not a weakening; the destination already covers that case
-    via `is_test_path(path)`) or OUT of it (a weakening this catches). When it is absent, empty, or
-    the `"unknown"` sentinel, the source cannot be ruled out as a test, so this returns `True`: a
-    rename with no usable recorded source is treated as though it *might* have come from a test,
-    rather than assumed innocent.
+    `old_path` is the pre-rename path, but the schema permits it on ANY entry, so it is honored
+    whatever status carries it — a test source does not stop mattering because the status is
+    `"unknown"` or `"modified"` instead of `"renamed"`. When `old_path` names a concrete path, its
+    own test-ness is what matters (a move INTO `tests/` is already covered by `is_test_path(path)`;
+    a move OUT of it is what this catches). When `old_path` is present but empty or the `"unknown"`
+    sentinel, the source cannot be ruled out as a test, so it is flagged. When `old_path` is absent
+    entirely, only a `"renamed"` status is inherently a move that could hide a test — any other
+    status with no recorded source is just a change to `path`, which `is_test_path(path)` already
+    judges.
     """
+    if "old_path" not in entry:
+        return entry.get("status") == "renamed"
     old_path = entry.get("old_path")
     if not old_path or old_path == UNKNOWN:
         return True
@@ -115,19 +122,17 @@ def altered_test_files(changed_files: Iterable[Mapping[str, Any]]) -> list[str]:
 
     An entry is skipped only when its `status` is in `SAFE_STATUSES` (`"added"`/`"copied"`).
     Otherwise — for `"modified"`, `"deleted"`, `"renamed"`, the `"unknown"` sentinel, or any other
-    status — it is flagged when `path` is a test file, OR (for a `"renamed"` entry) when its source
-    could have been a test file (`_renamed_from_a_test`: `old_path` is a test path, or is
-    absent/empty/`"unknown"`). A packet that only *adds* or *copies* test files returns an empty
-    list.
+    status — it is flagged when `path` is a test file, OR its declared source could have been one
+    (`_source_could_be_a_test`: a present `old_path` that is a test / empty / `"unknown"`, or a
+    `"renamed"` status carrying no source at all). A packet that only *adds* or *copies* test files
+    returns an empty list.
     """
     flagged: list[str] = []
     for entry in changed_files:
         if entry.get("status") in SAFE_STATUSES:
             continue
         path = str(entry.get("path", ""))
-        if is_test_path(path):
-            flagged.append(path)
-        elif entry.get("status") == "renamed" and _renamed_from_a_test(entry):
+        if is_test_path(path) or _source_could_be_a_test(entry):
             flagged.append(path)
     return flagged
 

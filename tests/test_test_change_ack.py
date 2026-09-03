@@ -480,3 +480,46 @@ def test_unknown_status_test_file_needs_ack_at_the_gate(root):
     packet["push_status"]["review_ref"] = ref
     with pytest.raises(PacketError):
         inbox.publish(packet)
+
+
+# ---- old_path is honored regardless of status (r3 audit finding) ------------------------------
+
+def test_old_path_test_source_is_honored_regardless_of_status():
+    # r3 finding: a declared test source must not be ignored because the status isn't "renamed".
+    for status in ("unknown", "modified", "deleted", "renamed"):
+        changed = [{"path": "src/auth.py", "status": status, "old_path": "tests/test_auth.py"}]
+        assert altered_test_files(changed) == ["src/auth.py"], status
+
+
+def test_old_path_present_but_unknown_is_flagged_for_any_status():
+    for status in ("unknown", "modified", "renamed"):
+        changed = [{"path": "src/auth.py", "status": status, "old_path": "unknown"}]
+        assert altered_test_files(changed) == ["src/auth.py"], status
+
+
+def test_non_test_change_with_no_old_path_is_not_flagged():
+    # A normal modify/delete/unknown of a non-test file with no source recorded is left alone.
+    for status in ("modified", "deleted", "unknown"):
+        assert altered_test_files([{"path": "src/auth.py", "status": status}]) == [], status
+
+
+def test_non_test_to_non_test_rename_with_old_path_is_not_over_flagged():
+    changed = [{"path": "src/b.py", "status": "renamed", "old_path": "src/a.py"}]
+    assert altered_test_files(changed) == []
+
+
+def test_inconsistent_status_old_path_test_source_needs_ack_at_the_gate(root):
+    # The exact r3 bypass, exercised through the real gate.
+    packet_for("pkt-tc-src", head_sha="0900128")
+    ref = inbox.publish_verdict(
+        build_verdict(packet_id="pkt-tc-src", decision="Approve", head_sha="0900128")
+    ).stem
+    packet = _pushed_with_files(
+        "ship-tc-src",
+        [{"path": "src/auth.py", "status": "unknown", "old_path": "tests/test_auth.py",
+          "insertions": 2, "deletions": 40}],
+        head="0900128",
+    )
+    packet["push_status"]["review_ref"] = ref
+    with pytest.raises(PacketError):
+        inbox.publish(packet)

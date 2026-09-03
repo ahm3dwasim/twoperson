@@ -13,10 +13,10 @@ All notable changes to this project are documented here. The format follows
   (`twoperson verdict --ack-test-changes`). Detection fails closed: only `added`/`copied` statuses
   are safe, so `modified`, `deleted`, `renamed`, the `unknown` sentinel, or any status added to the
   schema later all require the ack; `TWOPERSON_TEST_GLOBS` only *extends* the built-in test-path
-  rule and can never switch it off; and a `renamed` entry is judged from both ends via an optional
-  `old_path` (an absent, empty, or `unknown` source is flagged conservatively), closing a bypass
-  where a test renamed to a non-test path evaded detection because only the destination path was
-  ever checked.
+  rule and can never switch it off; and an optional `old_path` (rename source) is honored on any
+  entry that carries it — a test source flags the change whatever its status, and an absent, empty,
+  or `unknown` source is flagged conservatively — closing bypasses where a test moved to a non-test
+  path evaded detection because only the destination path was ever checked.
 
 ## [0.1.1] - 2026-09-03
 
