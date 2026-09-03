@@ -96,21 +96,19 @@ def is_test_path(path: str) -> bool:
     return any(fnmatch.fnmatch(lowered, glob.lower()) for glob in _extra_globs())
 
 
-def _source_could_be_a_test(entry: Mapping[str, Any]) -> bool:
-    """Whether a `changed_files` entry's declared source (`old_path`) forces acknowledgment.
+def _declared_source_is_testish(entry: Mapping[str, Any]) -> bool:
+    """Whether the entry declares a rename source (`old_path`) that is — or cannot be ruled out as —
+    a test.
 
     `old_path` is the pre-rename path, but the schema permits it on ANY entry, so it is honored
-    whatever status carries it — a test source does not stop mattering because the status is
-    `"unknown"` or `"modified"` instead of `"renamed"`. When `old_path` names a concrete path, its
-    own test-ness is what matters (a move INTO `tests/` is already covered by `is_test_path(path)`;
-    a move OUT of it is what this catches). When `old_path` is present but empty or the `"unknown"`
-    sentinel, the source cannot be ruled out as a test, so it is flagged. When `old_path` is absent
-    entirely, only a `"renamed"` status is inherently a move that could hide a test — any other
-    status with no recorded source is just a change to `path`, which `is_test_path(path)` already
-    judges.
+    whatever status carries it, `"added"`/`"copied"` included: an `old_path` on an "added" file is
+    itself inconsistent and must not be usable to hide a test that was moved out. A present
+    `old_path` that is empty or the `"unknown"` sentinel cannot be ruled out as a test, so it counts.
+    Returns `False` when `old_path` is absent (that case is left to the status/destination rules) or
+    names a concrete non-test path (a genuine non-test rename, which must not be over-flagged).
     """
     if "old_path" not in entry:
-        return entry.get("status") == "renamed"
+        return False
     old_path = entry.get("old_path")
     if not old_path or old_path == UNKNOWN:
         return True
@@ -118,21 +116,33 @@ def _source_could_be_a_test(entry: Mapping[str, Any]) -> bool:
 
 
 def altered_test_files(changed_files: Iterable[Mapping[str, Any]]) -> list[str]:
-    """Paths, in packet order, of changed test files whose status is a possible weakening.
+    """Paths, in packet order, of changed files that touch a test in a possibly-weakening way.
 
-    An entry is skipped only when its `status` is in `SAFE_STATUSES` (`"added"`/`"copied"`).
-    Otherwise — for `"modified"`, `"deleted"`, `"renamed"`, the `"unknown"` sentinel, or any other
-    status — it is flagged when `path` is a test file, OR its declared source could have been one
-    (`_source_could_be_a_test`: a present `old_path` that is a test / empty / `"unknown"`, or a
-    `"renamed"` status carrying no source at all). A packet that only *adds* or *copies* test files
-    returns an empty list.
+    An entry is flagged when ANY of these hold, checked in order:
+
+    * its declared source (`old_path`) is, or cannot be ruled out as, a test
+      (`_declared_source_is_testish`) — honored on any status, so a moved-out test cannot be hidden
+      behind an `"added"`/`"copied"`/`"unknown"` status;
+    * otherwise, its `status` is NOT in `SAFE_STATUSES` (`"added"`/`"copied"`) and its destination
+      `path` is a test file;
+    * otherwise, its `status` is `"renamed"` with NO recorded `old_path` — a bare rename whose
+      source is unknown could be a test moved out of the tree.
+
+    A packet that only *adds* or *copies* non-test-sourced files returns an empty list.
     """
     flagged: list[str] = []
     for entry in changed_files:
-        if entry.get("status") in SAFE_STATUSES:
-            continue
         path = str(entry.get("path", ""))
-        if is_test_path(path) or _source_could_be_a_test(entry):
+        status = entry.get("status")
+        if _declared_source_is_testish(entry):
+            flagged.append(path)
+            continue
+        if status in SAFE_STATUSES:
+            continue
+        if is_test_path(path):
+            flagged.append(path)
+            continue
+        if status == "renamed" and "old_path" not in entry:
             flagged.append(path)
     return flagged
 

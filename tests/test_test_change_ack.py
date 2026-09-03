@@ -523,3 +523,35 @@ def test_inconsistent_status_old_path_test_source_needs_ack_at_the_gate(root):
     packet["push_status"]["review_ref"] = ref
     with pytest.raises(PacketError):
         inbox.publish(packet)
+
+
+# ---- a declared test source is honored even under a "safe" status (r3 fix, completed) ---------
+
+def test_a_test_source_is_flagged_even_under_a_safe_status():
+    # "added"/"copied" normally skip, but an old_path naming a test must not let a moved-out test
+    # hide behind an inconsistent status.
+    for status in ("added", "copied"):
+        changed = [{"path": "src/auth.py", "status": status, "old_path": "tests/test_auth.py"}]
+        assert altered_test_files(changed) == ["src/auth.py"], status
+
+
+def test_added_or_copied_test_with_no_source_still_does_not_require_ack():
+    # The normal case — writing or duplicating a test — must stay unflagged.
+    assert altered_test_files([{"path": "tests/test_new.py", "status": "added"}]) == []
+    assert altered_test_files([{"path": "tests/test_new.py", "status": "copied"}]) == []
+
+
+def test_added_with_test_old_path_needs_ack_at_the_gate(root):
+    packet_for("pkt-tc-addsrc", head_sha="0900128")
+    ref = inbox.publish_verdict(
+        build_verdict(packet_id="pkt-tc-addsrc", decision="Approve", head_sha="0900128")
+    ).stem
+    packet = _pushed_with_files(
+        "ship-tc-addsrc",
+        [{"path": "src/auth.py", "status": "added", "old_path": "tests/test_auth.py",
+          "insertions": 2, "deletions": 0}],
+        head="0900128",
+    )
+    packet["push_status"]["review_ref"] = ref
+    with pytest.raises(PacketError):
+        inbox.publish(packet)
