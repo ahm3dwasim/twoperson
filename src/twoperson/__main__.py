@@ -205,6 +205,7 @@ def _emit_verdict(args) -> int:
             reviewer=args.reviewer,
             findings=args.finding or [],
             note=args.note,
+            acknowledges_test_changes=args.ack_test_changes,
         )
         path = inbox.publish_verdict(verdict)
     except (PacketError, OSError) as exc:
@@ -406,6 +407,10 @@ def main(argv: list[str] | None = None) -> int:
     vdt.add_argument("--finding", action="append", default=None, metavar="TEXT",
                      help="a finding; repeatable for several")
     vdt.add_argument("--note", default=None, help="one free-text summary line")
+    vdt.add_argument("--ack-test-changes", dest="ack_test_changes", action="store_true",
+                     help="acknowledge that the packet altered a test file (required for "
+                          "Approve/'Approve with nits' on a packet whose changed_files modifies, "
+                          "deletes, or renames a test — see docs/PROTOCOL.md)")
 
     vdts = sub.add_parser("verdicts", help="Builder: read audit verdicts Reviewer has returned")
     vdts.add_argument("--ack", action="store_true",
