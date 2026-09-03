@@ -250,11 +250,10 @@ def test_cli_rejects_an_approve_without_a_head(root, capsys):
     assert main(["verdicts"]) == 1  # nothing was written
 
 
-def test_publish_rejects_an_oversize_serialized_verdict(root):
-    """Reviewer P2: a verdict whose serialized bytes exceed the cap is refused at write time."""
-    packet_for("PKT-x")
-    big = build_verdict(packet_id="PKT-x", decision="Request changes",
-                        findings=["x" * 500 for _ in range(64)], now=NOW)
+def test_build_verdict_rejects_an_oversize_serialized_verdict(root):
+    """A verdict whose serialized bytes exceed the cap is refused at construction, so build_verdict
+    never hands back something publish_verdict would then reject — the count and byte caps agree."""
     with pytest.raises(PacketError):
-        inbox.publish_verdict(big)
+        build_verdict(packet_id="PKT-x", decision="Request changes",
+                      acknowledged_tests=["tests/" + "x" * 3900 for _ in range(100)], now=NOW)
     assert not inbox.has_pending_verdicts()  # nothing landed in the lane

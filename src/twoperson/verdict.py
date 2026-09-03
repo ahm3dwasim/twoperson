@@ -26,6 +26,7 @@ from typing import Any, Mapping
 
 from .packet import (
     MAX_CHANGED_FILES,
+    MAX_PACKET_BYTES,
     UNKNOWN,
     PacketError,
     SchemaError,
@@ -54,9 +55,15 @@ def _optional_text(value: Any, field: str) -> str:
 VERDICT_SCHEMA_VERSION = "1"
 VERDICT_KIND = "audit_verdict"
 
-#: A verdict is a decision plus a bounded list of findings. Two orders of magnitude under the
-#: packet cap, so a hostile or runaway writer cannot turn the return lane into a memory sink.
-MAX_VERDICT_BYTES = 32_768
+#: A verdict is a decision, findings, and — when it acknowledges test changes — the acknowledged
+#: test paths. Those paths are derived from a reviewed packet's `changed_files`, so a verdict must
+#: be allowed to hold as many of them (up to `MAX_CHANGED_FILES`, each up to `MAX_PATH`) as the
+#: packet that produced them could. It therefore shares the packet byte cap rather than sitting far
+#: under it: a JSON array of the paths is strictly smaller than the `changed_files` array of objects
+#: those same paths came from (each of which also carries a status and two counts), so any
+#: acknowledgment derivable from a valid packet fits, while a hostile writer is still bounded and
+#: cannot turn the return lane into an unbounded memory sink.
+MAX_VERDICT_BYTES = MAX_PACKET_BYTES
 
 #: The protocol §4 outcomes. Only the first two unlock the ship gate; the schema records which.
 DECISIONS = frozenset({
@@ -187,7 +194,17 @@ def build_verdict(
     paths = list(acknowledged_tests) if acknowledged_tests else []
     if paths:
         verdict["acknowledged_tests"] = paths
-    return validate_verdict(verdict)
+    result = validate_verdict(verdict)
+    # publish_verdict/loads_verdict size-guard the serialized verdict; enforce the SAME cap here so
+    # build_verdict can never hand back a verdict that would then be rejected at write time. The
+    # count and byte caps thus agree: any acknowledgment small enough to build is small enough to
+    # ship, and a pathological one is refused at construction, not silently after review.
+    if len(dumps_verdict(result).encode("utf-8")) > MAX_VERDICT_BYTES:
+        raise SchemaError(
+            f"verdict: serialized size exceeds the {MAX_VERDICT_BYTES}-byte limit — too many or too "
+            "long acknowledged_tests/findings to record in one verdict"
+        )
+    return result
 
 
 def validate_verdict(verdict: Any) -> dict:
