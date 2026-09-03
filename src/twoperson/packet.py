@@ -239,10 +239,19 @@ def _string_list(value: Any, field: str, *, limit: int = MAX_LIST, minimum: int 
     return [_text(item, f"{field}[{i}]") for i, item in enumerate(value)]
 
 
-def _object(value: Any, field: str, fields: dict[str, Any]) -> dict:
+def _object(value: Any, field: str, fields: dict[str, Any], *,
+           optional: dict[str, Any] | None = None) -> dict:
+    """Validate ``value`` as an object with exactly ``fields`` required and, if given,
+    ``optional`` fields that may be absent. Every key in ``value`` must belong to one of the two —
+    this stays as strict about unknown keys as the all-required case; only presence, not the set of
+    recognised keys, becomes flexible. Most callers pass no ``optional`` and keep the old
+    every-field-required behaviour unchanged.
+    """
     if not isinstance(value, Mapping):
         raise _bad(field, f"expected an object, got {type(value).__name__}")
-    unknown = sorted(set(value) - set(fields))
+    optional = optional or {}
+    allowed = set(fields) | set(optional)
+    unknown = sorted(set(value) - allowed)
     if unknown:
         raise _bad(field, f"unknown key(s) {unknown}")
     out: dict[str, Any] = {}
@@ -250,15 +259,19 @@ def _object(value: Any, field: str, fields: dict[str, Any]) -> dict:
         if key not in value:
             raise _bad(f"{field}.{key}", "missing")
         out[key] = check(value[key], f"{field}.{key}")
+    for key, check in optional.items():
+        if key in value:
+            out[key] = check(value[key], f"{field}.{key}")
     return out
 
 
-def _object_list(value: Any, field: str, fields: dict[str, Any], *, limit: int) -> list[dict]:
+def _object_list(value: Any, field: str, fields: dict[str, Any], *, limit: int,
+                 optional: dict[str, Any] | None = None) -> list[dict]:
     if not isinstance(value, list):
         raise _bad(field, f"expected a list, got {type(value).__name__}")
     if len(value) > limit:
         raise _bad(field, f"more than {limit} entries ({len(value)})")
-    return [_object(item, f"{field}[{i}]", fields) for i, item in enumerate(value)]
+    return [_object(item, f"{field}[{i}]", fields, optional=optional) for i, item in enumerate(value)]
 
 
 # --------------------------------------------------------------------------------------------
@@ -283,6 +296,15 @@ _CHANGED_FILE_FIELDS = {
     "status": lambda v, f: _enum(v, f, _FILE_STATUSES),
     "insertions": lambda v, f: _number(v, f, integral=True),
     "deletions": lambda v, f: _number(v, f, integral=True),
+}
+
+#: `old_path` is OPTIONAL and only ever meaningful for a `"renamed"` entry — the schema does not
+#: require the caller to state a status/old_path relationship, it only accepts the field, typed the
+#: same as `path`, when present. `twoperson.testset.altered_test_files` is what actually reads it:
+#: a rename whose `old_path` was a test file must be treated as a possible test removal even though
+#: `path` (the destination) is not itself a test file.
+_CHANGED_FILE_OPTIONAL_FIELDS = {
+    "old_path": _repo_path,
 }
 
 _TEST_FIELDS = {
@@ -331,7 +353,8 @@ _SCHEMA: dict[str, Any] = {
     "acceptance_criteria": lambda v, f: _string_list(v, f, minimum=1),
     "git": lambda v, f: _object(v, f, _GIT_FIELDS),
     "diff_summary": lambda v, f: _object(v, f, _DIFF_FIELDS),
-    "changed_files": lambda v, f: _object_list(v, f, _CHANGED_FILE_FIELDS, limit=MAX_CHANGED_FILES),
+    "changed_files": lambda v, f: _object_list(v, f, _CHANGED_FILE_FIELDS, limit=MAX_CHANGED_FILES,
+                                               optional=_CHANGED_FILE_OPTIONAL_FIELDS),
     "tests": lambda v, f: _object_list(v, f, _TEST_FIELDS, limit=MAX_LIST),
     "evidence": lambda v, f: _object_list(v, f, _EVIDENCE_FIELDS, limit=MAX_LIST),
     "model_class": lambda v, f: _object(v, f, _MODEL_CLASS_FIELDS),
@@ -494,7 +517,8 @@ def render_for_review(packet: Mapping) -> str:
 
     lines.append("Changed files:" if packet["changed_files"] else "Changed files: none stated")
     for entry in packet["changed_files"]:
-        lines.append(f"  - {entry['status']:9s} {entry['path']} "
+        origin = f" (from {entry['old_path']})" if "old_path" in entry else ""
+        lines.append(f"  - {entry['status']:9s} {entry['path']}{origin} "
                      f"(+{entry['insertions']} -{entry['deletions']})")
 
     lines.append("Tests:" if packet["tests"] else "Tests: none stated")
