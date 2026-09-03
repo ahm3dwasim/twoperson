@@ -139,6 +139,111 @@ def test_a_copied_test_file_does_not_require_ack(root):
     assert inbox.publish(packet).exists()
 
 
+# ---- renames: old_path closes the renamed-away-test bypass -----------------------------------
+
+def test_a_test_renamed_to_a_nontest_path_with_old_path_is_refused(root):
+    """The bypass: `path` alone (tests/test_auth.py -> src/auth.py) would read as "not a test"."""
+    packet_for("pkt-tc-rename-1", head_sha="0900128")
+    ref = inbox.publish_verdict(
+        build_verdict(packet_id="pkt-tc-rename-1", decision="Approve", head_sha="0900128")
+    ).stem
+    packet = _pushed_with_files(
+        "ship-tc-rename-1",
+        [{"path": "src/auth.py", "status": "renamed", "old_path": "tests/test_auth.py",
+          "insertions": 2, "deletions": 40}],
+        head="0900128",
+    )
+    packet["push_status"]["review_ref"] = ref
+    with pytest.raises(PacketError) as excinfo:
+        inbox.publish(packet)
+    msg = str(excinfo.value)
+    assert "altered tests" in msg and "src/auth.py" in msg
+    assert inbox.find_packet("ship-tc-rename-1") is None
+
+
+def test_a_test_renamed_to_a_nontest_path_with_old_path_is_accepted_when_acked(root):
+    packet_for("pkt-tc-rename-1b", head_sha="0900128")
+    ref = inbox.publish_verdict(
+        build_verdict(packet_id="pkt-tc-rename-1b", decision="Approve", head_sha="0900128",
+                      acknowledges_test_changes=True)
+    ).stem
+    packet = _pushed_with_files(
+        "ship-tc-rename-1b",
+        [{"path": "src/auth.py", "status": "renamed", "old_path": "tests/test_auth.py",
+          "insertions": 2, "deletions": 40}],
+        head="0900128",
+    )
+    packet["push_status"]["review_ref"] = ref
+    assert inbox.publish(packet).exists()
+
+
+def test_a_rename_without_old_path_is_conservatively_refused(root):
+    """No recorded source: could have been a test moved out of the tree, so it is not waved through."""
+    packet_for("pkt-tc-rename-2", head_sha="0900128")
+    ref = inbox.publish_verdict(
+        build_verdict(packet_id="pkt-tc-rename-2", decision="Approve", head_sha="0900128")
+    ).stem
+    packet = _pushed_with_files(
+        "ship-tc-rename-2",
+        [{"path": "src/auth.py", "status": "renamed", "insertions": 2, "deletions": 40}],
+        head="0900128",
+    )
+    packet["push_status"]["review_ref"] = ref
+    with pytest.raises(PacketError) as excinfo:
+        inbox.publish(packet)
+    assert "altered tests" in str(excinfo.value)
+
+
+def test_a_nontest_renamed_to_a_nontest_with_old_path_does_not_require_ack(root):
+    """No over-flagging: both ends declared and neither is a test file."""
+    packet_for("pkt-tc-rename-3", head_sha="0900128")
+    ref = inbox.publish_verdict(
+        build_verdict(packet_id="pkt-tc-rename-3", decision="Approve", head_sha="0900128")
+    ).stem
+    packet = _pushed_with_files(
+        "ship-tc-rename-3",
+        [{"path": "src/new_name.py", "status": "renamed", "old_path": "src/old_name.py",
+          "insertions": 0, "deletions": 0}],
+        head="0900128",
+    )
+    packet["push_status"]["review_ref"] = ref
+    assert inbox.publish(packet).exists()
+
+
+def test_a_test_renamed_to_a_test_is_refused_without_ack(root):
+    """Both ends under tests/ — the destination alone already trips it, unchanged from before."""
+    packet_for("pkt-tc-rename-4", head_sha="0900128")
+    ref = inbox.publish_verdict(
+        build_verdict(packet_id="pkt-tc-rename-4", decision="Approve", head_sha="0900128")
+    ).stem
+    packet = _pushed_with_files(
+        "ship-tc-rename-4",
+        [{"path": "tests/test_auth_new.py", "status": "renamed", "old_path": "tests/test_auth.py",
+          "insertions": 0, "deletions": 0}],
+        head="0900128",
+    )
+    packet["push_status"]["review_ref"] = ref
+    with pytest.raises(PacketError):
+        inbox.publish(packet)
+
+
+def test_a_nontest_renamed_to_a_test_is_also_refused(root):
+    """The destination alone already covers this direction, old_path or not."""
+    packet_for("pkt-tc-rename-5", head_sha="0900128")
+    ref = inbox.publish_verdict(
+        build_verdict(packet_id="pkt-tc-rename-5", decision="Approve", head_sha="0900128")
+    ).stem
+    packet = _pushed_with_files(
+        "ship-tc-rename-5",
+        [{"path": "tests/test_new.py", "status": "renamed", "old_path": "src/new.py",
+          "insertions": 40, "deletions": 0}],
+        head="0900128",
+    )
+    packet["push_status"]["review_ref"] = ref
+    with pytest.raises(PacketError):
+        inbox.publish(packet)
+
+
 def test_verify_also_refuses_an_unacknowledged_test_change(root, tmp_path, capsys):
     packet_for("pkt-tc-verify", head_sha="0900128")
     ref = inbox.publish_verdict(
@@ -238,6 +343,38 @@ def test_altered_test_files_preserves_changed_files_order():
         {"path": "tests/a.py", "status": "deleted"},
     ]
     assert altered_test_files(changed) == ["tests/z.py", "tests/a.py"]
+
+
+# ---- altered_test_files: rename handling via old_path -----------------------------------------
+
+def test_rename_to_nontest_path_is_flagged_via_old_path():
+    changed = [{"path": "src/auth.py", "status": "renamed", "old_path": "tests/test_auth.py"}]
+    assert altered_test_files(changed) == ["src/auth.py"]
+
+
+def test_rename_to_nontest_path_without_old_path_is_flagged_conservatively():
+    changed = [{"path": "src/auth.py", "status": "renamed"}]
+    assert altered_test_files(changed) == ["src/auth.py"]
+
+
+def test_rename_to_nontest_path_with_empty_old_path_is_flagged_conservatively():
+    changed = [{"path": "src/auth.py", "status": "renamed", "old_path": ""}]
+    assert altered_test_files(changed) == ["src/auth.py"]
+
+
+def test_rename_between_two_nontest_paths_with_old_path_is_not_flagged():
+    changed = [{"path": "src/new_name.py", "status": "renamed", "old_path": "src/old_name.py"}]
+    assert altered_test_files(changed) == []
+
+
+def test_rename_test_to_test_is_flagged():
+    changed = [{"path": "tests/test_b.py", "status": "renamed", "old_path": "tests/test_a.py"}]
+    assert altered_test_files(changed) == ["tests/test_b.py"]
+
+
+def test_rename_nontest_to_test_is_flagged_regardless_of_old_path():
+    changed = [{"path": "tests/test_new.py", "status": "renamed", "old_path": "src/new.py"}]
+    assert altered_test_files(changed) == ["tests/test_new.py"]
 
 
 # ---- TWOPERSON_TEST_GLOBS override ------------------------------------------------------------
