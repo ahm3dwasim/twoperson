@@ -29,6 +29,7 @@ from .packet import (
     PacketError,
     SchemaError,
     SecretLeakError,
+    _boolean,
     _enum,
     _iso_timestamp,
     _sha,
@@ -79,7 +80,19 @@ _VERDICT_SCHEMA: dict[str, Any] = {
     "reviewer": _short,
     "findings": lambda v, f: _string_list(v, f, limit=64),
     "note": _optional_text,
+    # Optional: "did the reviewer notice the packet altered a test?" (see `twoperson.testset` and
+    # `inbox.assert_review_ref_resolves`). Absent on a verdict is the same as `False` — a verdict
+    # written before this field existed, or one that never touched a test, must still validate
+    # unchanged, so it is not in `_REQUIRED_VERDICT_FIELDS` below and is only ever written when
+    # `True` (see `build_verdict`), keeping every verdict that does not need it byte-identical to
+    # what it would have been without this field.
+    "acknowledges_test_changes": _boolean,
 }
+
+#: Fields in `_VERDICT_SCHEMA` that `validate_verdict` does NOT require to be present. Missing is
+#: accepted (and simply absent from the validated result); present is still type-checked like any
+#: other field. Everything else in `_VERDICT_SCHEMA` remains required, as before this field existed.
+_OPTIONAL_VERDICT_FIELDS = frozenset({"acknowledges_test_changes"})
 
 VERDICT_FIELDS = frozenset(_VERDICT_SCHEMA)
 
@@ -137,9 +150,16 @@ def build_verdict(
     reviewer: str = "reviewer",
     findings: Any = None,
     note: Any = None,
+    acknowledges_test_changes: bool = False,
     now: datetime | None = None,
 ) -> dict:
-    """Assemble a validated verdict. Untrusted inputs are validated, never trusted or echoed raw."""
+    """Assemble a validated verdict. Untrusted inputs are validated, never trusted or echoed raw.
+
+    ``acknowledges_test_changes`` records that the reviewer noticed the packet altered a test (see
+    `twoperson.testset`). It defaults to ``False`` and, like the template packet's `unknown`
+    sentinels, is only ever written into the verdict when ``True`` — a verdict that never touched
+    the question is left exactly as it would have been before this field existed.
+    """
     moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     verdict = {
         "schema_version": VERDICT_SCHEMA_VERSION,
@@ -153,6 +173,8 @@ def build_verdict(
         "findings": list(findings) if findings else [],
         "note": note if note else "",
     }
+    if acknowledges_test_changes:
+        verdict["acknowledges_test_changes"] = True
     return validate_verdict(verdict)
 
 
@@ -178,6 +200,8 @@ def validate_verdict(verdict: Any) -> dict:
     out: dict[str, Any] = {}
     for field, check in _VERDICT_SCHEMA.items():
         if field not in verdict:
+            if field in _OPTIONAL_VERDICT_FIELDS:
+                continue
             raise SchemaError(f"{field}: missing (required)")
         out[field] = check(verdict[field], field)
 
