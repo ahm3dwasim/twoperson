@@ -6,11 +6,23 @@ narrow, stdlib-only question — "did this packet's `changed_files` touch someth
 a test, in a way that could be a weakening?" — so `twoperson.inbox.assert_review_ref_resolves` can
 require the approving verdict to say it noticed.
 
+A rename is the one status where the changed path alone is not enough: `changed_files` records
+only the *destination* path, so a test moved to a non-test path (`tests/test_auth.py` ->
+`src/auth.py`) would read as "not a test file" if only `path` were checked, silently dropping the
+coverage with nobody asked to acknowledge it. `changed_files` entries may carry an OPTIONAL
+`old_path` (the pre-rename path) precisely so a rename can be judged from both ends: a rename is
+flagged if either `path` or `old_path` looks like a test file. When `old_path` is absent, the
+rename is flagged unconditionally — a rename with no recorded source could be exactly that
+undetectable move, so the conservative default is to require acknowledgment rather than assume it
+was not a test.
+
 Two limitations, stated here because they matter more than the feature:
 
-* It acts on the builder-declared `changed_files` list, nothing else. A builder who edits a test
-  and simply omits it from that list is not caught — that is a separate integrity gap (the
-  packet's `changed_files` is self-reported, same as `diff_summary`).
+* It acts on the builder-declared `changed_files` list (`path` and, for renames, `old_path`),
+  nothing else. A builder who edits a test and simply omits it from that list — or renames one and
+  omits `old_path` while also renaming it in a way that dodges every default pattern — is not
+  caught. That is a separate integrity gap: the packet's `changed_files` is self-reported, same as
+  `diff_summary`.
 * It flags any qualifying test change for acknowledgment; it does not attempt to judge whether the
   change is a legitimate strengthening or an actual weakening. That judgment stays with the
   reviewer — this only makes sure the change was seen and acknowledged, not silently approved.
@@ -72,17 +84,42 @@ def is_test_path(path: str) -> bool:
     return any(fnmatch.fnmatch(basename, glob.lower()) for glob in DEFAULT_TEST_BASENAME_GLOBS)
 
 
+def _renamed_from_a_test(entry: Mapping[str, Any]) -> bool:
+    """Whether a `"renamed"` entry's *source* looks like it was a test file.
+
+    `old_path` is optional. When it is present, its own test-ness is what matters — a rename can
+    move a file INTO `tests/` (not a weakening; the destination already covers that case via
+    `is_test_path(path)`) or OUT of it (a weakening this function exists to catch). When it is
+    absent, there is no way to tell the two apart, so this returns `True`: a rename with an
+    unrecorded source is treated as though it *might* have come from a test, rather than assumed
+    innocent.
+    """
+    old_path = entry.get("old_path")
+    if not old_path:
+        return True
+    return is_test_path(str(old_path))
+
+
 def altered_test_files(changed_files: Iterable[Mapping[str, Any]]) -> list[str]:
     """Paths, in packet order, of changed test files whose status is a possible weakening.
 
-    Only entries whose `status` is in `WEAKENING_STATUSES` and whose `path` is a test file
-    (`is_test_path`) are returned. A packet that only *adds* test files returns an empty list.
+    Only entries whose `status` is in `WEAKENING_STATUSES` are considered at all — `"added"` and
+    `"copied"` never appear here. For `"modified"`/`"deleted"`, an entry is flagged when `path` is a
+    test file. For `"renamed"`, an entry is flagged when `path` is a test file (moved test-to-test),
+    OR `old_path` is present and is a test file (moved test-to-non-test — the bypass this exists to
+    close), OR `old_path` is absent entirely (conservative: an unrecorded source might have been a
+    test). A packet that only *adds* test files returns an empty list.
     """
-    return [
-        str(entry["path"])
-        for entry in changed_files
-        if entry.get("status") in WEAKENING_STATUSES and is_test_path(str(entry.get("path", "")))
-    ]
+    flagged: list[str] = []
+    for entry in changed_files:
+        if entry.get("status") not in WEAKENING_STATUSES:
+            continue
+        path = str(entry.get("path", ""))
+        if is_test_path(path):
+            flagged.append(path)
+        elif entry.get("status") == "renamed" and _renamed_from_a_test(entry):
+            flagged.append(path)
+    return flagged
 
 
 def any_test_change_needs_ack(changed_files: Iterable[Mapping[str, Any]]) -> bool:
