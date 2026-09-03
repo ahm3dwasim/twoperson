@@ -636,3 +636,18 @@ def test_added_with_test_old_path_needs_ack_at_the_gate(root):
     packet["push_status"]["review_ref"] = ref
     with pytest.raises(PacketError):
         inbox.publish(packet)
+
+
+# ---- acknowledged_tests cap matches the packet's changed_files cap (r5 audit finding) ---------
+
+def test_acknowledged_tests_cap_matches_changed_files_not_max_list():
+    from twoperson.packet import MAX_CHANGED_FILES
+    # 150 > the old MAX_LIST(100) but <= MAX_CHANGED_FILES(500): a report altering that many test
+    # files derives that many paths and must remain acknowledgeable.
+    paths = [f"tests/test_{i}.py" for i in range(150)]
+    v = build_verdict(packet_id="p", decision="Approve", head_sha="0900128", acknowledged_tests=paths)
+    assert len(v["acknowledged_tests"]) == 150
+    # Over the packet's own cap is still rejected, so the two limits stay in lockstep.
+    with pytest.raises(PacketError):
+        build_verdict(packet_id="p", decision="Approve", head_sha="0900128",
+                      acknowledged_tests=[f"tests/test_{i}.py" for i in range(MAX_CHANGED_FILES + 1)])

@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from .packet import (
-    MAX_LIST,
+    MAX_CHANGED_FILES,
     UNKNOWN,
     PacketError,
     SchemaError,
@@ -89,7 +89,7 @@ _VERDICT_SCHEMA: dict[str, Any] = {
     # still validate unchanged, so it is not in `_REQUIRED_VERDICT_FIELDS` below and is only ever
     # written when the list is non-empty (see `build_verdict`), keeping every verdict that does not
     # need it byte-identical to what it would have been without this field.
-    "acknowledged_tests": lambda v, f: _string_list(v, f, limit=MAX_LIST),
+    "acknowledged_tests": lambda v, f: _string_list(v, f, limit=MAX_CHANGED_FILES),
 }
 
 #: Fields in `_VERDICT_SCHEMA` that `validate_verdict` does NOT require to be present. Missing is
