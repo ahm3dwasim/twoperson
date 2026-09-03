@@ -78,9 +78,11 @@ itself, not by this document:
    `changed_files` entry may carry an optional `old_path` (the pre-rename path), and the rename is
    flagged if either `path` or `old_path` is a test file — otherwise a test renamed to a non-test
    path (`tests/test_auth.py` -> `src/auth.py`) would read as "not a test" and its coverage could
-   disappear unacknowledged. When `old_path` is absent, empty, or the `"unknown"` sentinel on a
-   rename, it is flagged unconditionally: an unrecorded source might have been a test, and the
-   conservative default is to ask rather than assume. Two limits worth knowing: this reads the builder's *declared* `changed_files` (`path`
+   disappear unacknowledged. When `old_path` is absent or the `"unknown"` sentinel on a rename, it
+   is flagged unconditionally: an unrecorded source might have been a test, and the conservative
+   default is to ask rather than assume. (An *empty* `old_path` never reaches the gate — the
+   schema's path validator rejects it — so only "absent" and `"unknown"` are the reachable
+   conservative cases.) Two limits worth knowing: this reads the builder's *declared* `changed_files` (`path`
    and `old_path`), so a builder that edits or renames a test and simply leaves it (or `old_path`)
    off that list is not caught (the same self-reporting gap `diff_summary` already has); and it
    flags the change for acknowledgment without judging whether it strengthens or weakens the test —

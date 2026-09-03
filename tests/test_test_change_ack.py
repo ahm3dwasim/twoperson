@@ -476,6 +476,9 @@ def test_rename_to_nontest_path_without_old_path_is_flagged_conservatively():
 
 
 def test_rename_to_nontest_path_with_empty_old_path_is_flagged_conservatively():
+    # Defence in depth: a valid packet can never carry an empty old_path (the schema's _repo_path
+    # rejects it), but altered_test_files is also called on raw, unvalidated changed_files, so an
+    # empty source must still fail closed rather than read as a concrete non-test path.
     changed = [{"path": "src/auth.py", "status": "renamed", "old_path": ""}]
     assert altered_test_files(changed) == ["src/auth.py"]
 

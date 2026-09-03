@@ -19,9 +19,11 @@ slip a change past the gate:
   non-test path (`tests/test_auth.py` -> `src/auth.py`) reads as "not a test file" if only `path`
   is checked. Entries may carry an OPTIONAL `old_path` (the pre-rename path); it is honored
   whatever status carries it, so a test source is not ignored just because the status is
-  `"unknown"` or `"modified"` rather than `"renamed"`. A present `old_path` that is empty or the
-  `"unknown"` sentinel cannot be ruled out as a test and is flagged; and a `"renamed"` status with
-  no recorded source is flagged unconditionally, since the move could be exactly that.
+  `"unknown"` or `"modified"` rather than `"renamed"`. A present `old_path` equal to the `"unknown"`
+  sentinel cannot be ruled out as a test and is flagged (in a valid packet `old_path` is otherwise a
+  concrete non-empty path — the schema's `_repo_path` rejects an empty one before it could reach
+  here); and a `"renamed"` status with no recorded source is flagged unconditionally, since the move
+  could be exactly that.
 * **Test-path globs.** `TWOPERSON_TEST_GLOBS` can only *add* patterns to the built-in rule; it can
   never replace or narrow it. A builder who controls the environment at publish time therefore
   cannot set a nonmatching glob to switch detection off — the defaults always still apply.
@@ -103,14 +105,17 @@ def _declared_source_is_testish(entry: Mapping[str, Any]) -> bool:
     `old_path` is the pre-rename path, but the schema permits it on ANY entry, so it is honored
     whatever status carries it, `"added"`/`"copied"` included: an `old_path` on an "added" file is
     itself inconsistent and must not be usable to hide a test that was moved out. A present
-    `old_path` that is empty or the `"unknown"` sentinel cannot be ruled out as a test, so it counts.
-    Returns `False` when `old_path` is absent (that case is left to the status/destination rules) or
-    names a concrete non-test path (a genuine non-test rename, which must not be over-flagged).
+    `old_path` equal to the `"unknown"` sentinel cannot be ruled out as a test, so it counts. In a
+    valid packet a present `old_path` is a concrete non-empty path — `_repo_path` rejects an empty
+    one — so the falsy branch below never fires for schema-validated input; it stays as defence in
+    depth for a caller that hands `altered_test_files` an unvalidated `changed_files`. Returns
+    `False` when `old_path` is absent (that case is left to the status/destination rules) or names a
+    concrete non-test path (a genuine non-test rename, which must not be over-flagged).
     """
     if "old_path" not in entry:
         return False
     old_path = entry.get("old_path")
-    if not old_path or old_path == UNKNOWN:
+    if not old_path or old_path == UNKNOWN:  # `not old_path`: defensive; a valid packet can't reach it
         return True
     return is_test_path(str(old_path))
 

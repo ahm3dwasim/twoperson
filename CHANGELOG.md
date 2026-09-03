@@ -15,9 +15,9 @@ All notable changes to this project are documented here. The format follows
   `modified`, `deleted`, `renamed`, the `unknown` sentinel, or any status added to the schema later
   all require the ack; `TWOPERSON_TEST_GLOBS` only *extends* the built-in test-path rule and can
   never switch it off; and an optional `old_path` (rename source) is honored on any entry that
-  carries it — a test source flags the change whatever its status, and an absent, empty, or
-  `unknown` source is flagged conservatively — closing bypasses where a test moved to a non-test
-  path evaded detection because only the destination path was ever checked.
+  carries it — a test source flags the change whatever its status, and an absent or `unknown` source
+  is flagged conservatively — closing bypasses where a test moved to a non-test path evaded
+  detection because only the destination path was ever checked.
 - `publish_verdict` now refuses to write a verdict whose `acknowledged_tests` names a test path the
   reviewed packet doesn't actually alter, so a verdict can only ever acknowledge the test changes
   present in the packet it reviews. This makes the content-binding structural rather than a CLI
