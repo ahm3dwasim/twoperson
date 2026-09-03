@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The ship gate now also refuses a packet whose `changed_files` modifies, deletes, or renames a
+  test file (`twoperson.testset`) unless the cited verdict has `acknowledges_test_changes: true`
+  (`twoperson verdict --ack-test-changes`). Adding a new test does not trigger it. Override the
+  default test-path detection with `TWOPERSON_TEST_GLOBS`.
+
 ## [0.1.1] - 2026-09-03
 
 ### Security

@@ -36,7 +36,7 @@ The builder writes a **review packet**: a JSON record of what it was trying to d
 which files changed, what tests it ran and what they said. `twoperson publish` validates it and
 drops it in `.twoperson/pending/`. The reviewer claims it, reads it, and writes a **verdict**.
 
-Four refusals do the real work. They're all real output.
+Five refusals do the real work. They're all real output.
 
 A verdict has to answer a packet that actually exists in the inbox:
 
@@ -70,6 +70,24 @@ packet rejected — push_status.review_ref: verdict 'vdt-20260902T215020Z-e2e38d
 approved head '6e5acc68…', but this packet shipped 'f00dbabe…' — an approval does
 not carry over to a different commit
 ```
+
+And if the packet's `changed_files` says it modified, deleted, or renamed a test, the cited
+verdict has to say the reviewer noticed:
+
+```
+$ twoperson verify --from packet.json
+packet rejected — push_status.review_ref: packet altered tests (tests/test_gate.py)
+but the approving verdict did not acknowledge the test change (needs
+acknowledges_test_changes / --ack-test-changes)
+```
+
+`twoperson verdict --ack-test-changes` clears it. It's a narrow check on purpose: it only sees
+the `changed_files` the builder reported (leaving a changed test off that list evades it — the
+same self-reporting gap `diff_summary` already has), and it flags *any* qualifying test change
+for acknowledgment rather than deciding whether it strengthens or weakens the test. It exists so
+a builder can't get a quietly weakened test past a reviewer who never looked at the diff, not so
+a machine can judge test quality. Adding a new test doesn't trigger it — only touching an
+existing one does.
 
 So an approval is for one sha of one packet. Rebase, amend, or add a commit and it's stale. The
 builder has to publish again and the reviewer has to look again. `verify` runs the same checks as

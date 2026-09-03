@@ -56,6 +56,17 @@ itself, not by this document:
    `verdict_id` of a verdict that exists, whose decision unlocks a ship, and whose `head_sha` equals
    the packet's `git.head_sha`. If the head moved, the approval is stale: rebase, publish a
    replacement packet, get a new verdict.
+5. If that packet's `changed_files` modifies, deletes, or renames anything `twoperson.testset`
+   considers a test file (a `tests`/`test`/`__tests__`/`spec` path segment, or a basename like
+   `test_*` / `*_test.*` / `*.test.*` / `*.spec.*` / `*_spec.*` / `conftest.py` — override with
+   `TWOPERSON_TEST_GLOBS`), the cited verdict must also have `acknowledges_test_changes: true`
+   (`twoperson verdict --ack-test-changes`). Adding a new test file (`status: "added"`) does not
+   trigger this — the point is to make sure a reviewer actually looked at a test being *changed*,
+   not to discourage writing more of them. Two limits worth knowing: this reads the builder's
+   *declared* `changed_files`, so a builder that edits a test and simply leaves it off that list is
+   not caught (the same self-reporting gap `diff_summary` already has); and it flags the change for
+   acknowledgment without judging whether it strengthens or weakens the test — that judgment is
+   still the reviewer's.
 
 Only `Approve` and `Approve with nits` unlock the ship step. `Request changes` and
 `Needs owner decision` do not.
