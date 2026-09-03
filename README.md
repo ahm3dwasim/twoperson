@@ -89,6 +89,12 @@ a builder can't get a quietly weakened test past a reviewer who never looked at 
 a machine can judge test quality. Adding a new test doesn't trigger it — only touching an
 existing one does.
 
+A rename is the one status where the changed path alone isn't enough: `changed_files` only
+records where a file ended up, so renaming `tests/test_auth.py` to `src/auth.py` would look like
+"not a test" if `path` were all this checked, quietly deleting the coverage. `changed_files`
+entries may carry an optional `old_path`, and a rename is flagged if *either* end looks like a
+test — or if `old_path` is missing entirely, since an unrecorded source might have been one.
+
 So an approval is for one sha of one packet. Rebase, amend, or add a commit and it's stale. The
 builder has to publish again and the reviewer has to look again. `verify` runs the same checks as
 `publish` and writes nothing, so a builder can dry-run its own ship report.
