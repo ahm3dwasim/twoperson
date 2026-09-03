@@ -19,7 +19,7 @@ No server, no API keys, no network. Two agents share a directory. That's the who
 
 ![demo](docs/demo.gif)
 
-## Why I built it
+## Why
 
 I run two coding agents against the same repo: one builds, the other reviews. For a while the
 "get a review first" step was a line in a system prompt. It worked until it didn't. Left alone
