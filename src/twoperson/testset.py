@@ -31,9 +31,10 @@ slip a change past the gate:
 Two limitations, stated here because they matter more than the feature:
 
 * It acts on the builder-declared `changed_files` list (`path` and, for renames, `old_path`),
-  nothing else. A builder who edits a test and simply omits it from that list — or renames one and
-  omits `old_path` while also giving it a non-test destination path — is not caught. That is a
-  separate integrity gap: the packet's `changed_files` is self-reported, same as `diff_summary`.
+  nothing else. A builder who edits or deletes a test and omits that entry from the list altogether
+  is not caught — nothing here reads the real diff. (A rename that omits `old_path` *is* caught: a
+  bare `"renamed"` entry is flagged conservatively.) That is a separate integrity gap: the packet's
+  `changed_files` is self-reported, same as `diff_summary`.
 * It flags any qualifying test change for acknowledgment; it does not attempt to judge whether the
   change is a legitimate strengthening or an actual weakening. That judgment stays with the
   reviewer — this only makes sure the change was seen and acknowledged, not silently approved.
