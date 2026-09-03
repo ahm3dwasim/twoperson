@@ -72,6 +72,7 @@ from .packet import (
     validate_packet,
 )
 from .signal import MAX_SIGNAL_BYTES, dumps_signal, loads_signal, validate_signal
+from .testset import altered_test_files
 from .verdict import (
     MAX_VERDICT_BYTES,
     SHIP_DECISIONS,
@@ -366,6 +367,11 @@ def assert_review_ref_resolves(packet: Mapping[str, Any], *, root: Path | str | 
     ``verdict_id`` of a verdict that exists, whose decision unlocks a ship, and whose ``head_sha``
     equals this packet's ``git.head_sha``. Raises :class:`PacketError` otherwise. A packet that
     shipped nothing is not checked at all.
+
+    On top of that binding, a packet whose ``changed_files`` modifies, deletes, or renames anything
+    `twoperson.testset` considers a test file must cite a verdict that acknowledged noticing (see
+    `build_verdict`/``--ack-test-changes``) — otherwise a builder under deadline pressure could get
+    a weakened test quietly approved by a reviewer who never looked at the test diff at all.
     """
     push = packet["push_status"]
     if not (push["pushed"] or push["deployed"] or push["restarted"]):
@@ -387,6 +393,13 @@ def assert_review_ref_resolves(packet: Mapping[str, Any], *, root: Path | str | 
         raise PacketError(
             f"push_status.review_ref: verdict {ref!r} approved head {match['head_sha']!r}, but this "
             f"packet shipped {head!r} — an approval does not carry over to a different commit"
+        )
+    altered = altered_test_files(packet["changed_files"])
+    if altered and not match.get("acknowledges_test_changes"):
+        raise PacketError(
+            "push_status.review_ref: packet altered tests (" + ", ".join(altered) + ") but the "
+            "approving verdict did not acknowledge the test change (needs "
+            "acknowledges_test_changes / --ack-test-changes)"
         )
 
 
