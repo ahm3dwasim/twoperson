@@ -56,19 +56,22 @@ itself, not by this document:
    `verdict_id` of a verdict that exists, whose decision unlocks a ship, and whose `head_sha` equals
    the packet's `git.head_sha`. If the head moved, the approval is stale: rebase, publish a
    replacement packet, get a new verdict.
-5. If that packet's `changed_files` modifies, deletes, or renames anything `twoperson.testset`
-   considers a test file (a `tests`/`test`/`__tests__`/`spec` path segment, or a basename like
-   `test_*` / `*_test.*` / `*.test.*` / `*.spec.*` / `*_spec.*` / `conftest.py` — override with
-   `TWOPERSON_TEST_GLOBS`), the cited verdict must also have `acknowledges_test_changes: true`
-   (`twoperson verdict --ack-test-changes`). Adding a new test file (`status: "added"`) does not
-   trigger this — the point is to make sure a reviewer actually looked at a test being *changed*,
-   not to discourage writing more of them. A `"renamed"` entry is checked from both ends: a
+5. If that packet's `changed_files` touches anything `twoperson.testset` considers a test file
+   (a `tests`/`test`/`__tests__`/`spec` path segment, or a basename like `test_*` / `*_test.*` /
+   `*.test.*` / `*.spec.*` / `*_spec.*` / `conftest.py` — add more with `TWOPERSON_TEST_GLOBS`,
+   which only *extends* the built-in rule and can never switch it off) with any status other than
+   `"added"` or `"copied"`, the cited verdict must also have `acknowledges_test_changes: true`
+   (`twoperson verdict --ack-test-changes`). Only adding or copying a test is safe; every other
+   status — `"modified"`, `"deleted"`, `"renamed"`, the `"unknown"` sentinel, or any status added
+   to the schema later — is treated as a possible weakening, so nothing slips through by carrying
+   an unrecognised or ambiguous status. The point is to make sure a reviewer actually looked at a
+   test being *changed*, not to discourage writing more of them. A `"renamed"` entry is checked from both ends: a
    `changed_files` entry may carry an optional `old_path` (the pre-rename path), and the rename is
    flagged if either `path` or `old_path` is a test file — otherwise a test renamed to a non-test
    path (`tests/test_auth.py` -> `src/auth.py`) would read as "not a test" and its coverage could
-   disappear unacknowledged. When `old_path` is absent on a rename, it is flagged unconditionally:
-   an unrecorded source might have been a test, and the conservative default is to ask rather than
-   assume. Two limits worth knowing: this reads the builder's *declared* `changed_files` (`path`
+   disappear unacknowledged. When `old_path` is absent, empty, or the `"unknown"` sentinel on a
+   rename, it is flagged unconditionally: an unrecorded source might have been a test, and the
+   conservative default is to ask rather than assume. Two limits worth knowing: this reads the builder's *declared* `changed_files` (`path`
    and `old_path`), so a builder that edits or renames a test and simply leaves it (or `old_path`)
    off that list is not caught (the same self-reporting gap `diff_summary` already has); and it
    flags the change for acknowledgment without judging whether it strengthens or weakens the test —

@@ -379,40 +379,60 @@ def test_rename_nontest_to_test_is_flagged_regardless_of_old_path():
 
 # ---- TWOPERSON_TEST_GLOBS override ------------------------------------------------------------
 
-def test_env_override_replaces_the_default_rule_entirely(monkeypatch):
-    # "tests/foo.py" matches the DEFAULT rule but not this override's glob -> no longer a test path
+def test_env_globs_extend_the_default_rule_and_never_replace_it(monkeypatch):
+    # Extra globs ADD patterns; the built-in rule still applies, so a default test path stays one.
     monkeypatch.setenv("TWOPERSON_TEST_GLOBS", "qa/**,*.e2e.py")
-    assert is_test_path("tests/foo.py") is False
-    assert is_test_path("qa/anything/here.py") is True
-    assert is_test_path("thing.e2e.py") is True
+    assert is_test_path("tests/foo.py") is True        # default rule still in force
+    assert is_test_path("qa/anything/here.py") is True  # added by the env glob
+    assert is_test_path("thing.e2e.py") is True         # added by the env glob
 
 
-def test_env_override_is_comma_separated_and_trims_whitespace(monkeypatch):
+def test_env_globs_cannot_switch_off_default_detection(root, monkeypatch):
+    """A builder controls the environment at publish time. A nonmatching glob must NOT disable the
+    built-in detection, or `TWOPERSON_TEST_GLOBS=nomatch` would be a one-line bypass (r2 finding)."""
+    monkeypatch.setenv("TWOPERSON_TEST_GLOBS", "does/not/match/anything/**")
+    assert is_test_path("tests/test_gate.py") is True
+    packet_for("pkt-tc-envoff", head_sha="0900128")
+    ref = inbox.publish_verdict(
+        build_verdict(packet_id="pkt-tc-envoff", decision="Approve", head_sha="0900128")
+    ).stem
+    packet = _pushed_with_files(
+        "ship-tc-envoff",
+        [{"path": "tests/test_gate.py", "status": "modified", "insertions": 1, "deletions": 3}],
+        head="0900128",
+    )
+    packet["push_status"]["review_ref"] = ref
+    with pytest.raises(PacketError):
+        inbox.publish(packet)
+
+
+def test_env_globs_are_comma_separated_and_trim_whitespace(monkeypatch):
     monkeypatch.setenv("TWOPERSON_TEST_GLOBS", " qa/** , *.e2e.py ")
     assert is_test_path("qa/x.py") is True
     assert is_test_path("x.e2e.py") is True
 
 
-def test_env_override_flows_through_to_the_gate(root, monkeypatch):
-    """The override is not just a helper detail — the gate itself must honor it."""
+def test_env_globs_add_paths_to_the_gate_while_defaults_still_bite(root, monkeypatch):
+    """Both the added glob AND the built-in rule must flow through to the gate."""
     monkeypatch.setenv("TWOPERSON_TEST_GLOBS", "qa/**")
     packet_for("pkt-tc-env", head_sha="0900128")
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-env", decision="Approve", head_sha="0900128")
     ).stem
-    # Under the override, tests/test_gate.py is no longer considered a test path at all.
+    # A default test path still needs the ack even with the env set.
     packet = _pushed_with_files(
         "ship-tc-env-1",
         [{"path": "tests/test_gate.py", "status": "modified", "insertions": 1, "deletions": 1}],
         head="0900128",
     )
     packet["push_status"]["review_ref"] = ref
-    assert inbox.publish(packet).exists()
+    with pytest.raises(PacketError):
+        inbox.publish(packet)
 
     ref2 = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-env", decision="Approve", head_sha="0900128")
     ).stem
-    # ...but a path matching the override glob now needs the ack.
+    # ...and so does a path matching the added glob.
     packet2 = _pushed_with_files(
         "ship-tc-env-2",
         [{"path": "qa/checks.py", "status": "modified", "insertions": 1, "deletions": 1}],
@@ -421,3 +441,42 @@ def test_env_override_flows_through_to_the_gate(root, monkeypatch):
     packet2["push_status"]["review_ref"] = ref2
     with pytest.raises(PacketError):
         inbox.publish(packet2)
+
+
+# ---- fail-closed on ambiguous / builder-chosen inputs (r2 audit findings) ---------------------
+
+def test_old_path_unknown_sentinel_on_rename_is_flagged_conservatively():
+    # A rename to a non-test path whose source is the "unknown" sentinel must not be waved through:
+    # "unknown" means the source cannot be ruled out as a test.
+    changed = [{"path": "src/auth.py", "status": "renamed", "old_path": "unknown"}]
+    assert altered_test_files(changed) == ["src/auth.py"]
+
+
+def test_unknown_status_on_a_test_file_is_flagged():
+    # status "unknown" is not in the safe-list, so a test file carrying it is still flagged.
+    changed = [{"path": "tests/test_auth.py", "status": "unknown"}]
+    assert altered_test_files(changed) == ["tests/test_auth.py"]
+
+
+def test_only_added_and_copied_are_safe_statuses():
+    for safe in ("added", "copied"):
+        assert altered_test_files([{"path": "tests/test_x.py", "status": safe}]) == []
+    for unsafe in ("modified", "deleted", "renamed", "unknown"):
+        assert altered_test_files(
+            [{"path": "tests/test_x.py", "status": unsafe}]
+        ) == ["tests/test_x.py"]
+
+
+def test_unknown_status_test_file_needs_ack_at_the_gate(root):
+    packet_for("pkt-tc-unk", head_sha="0900128")
+    ref = inbox.publish_verdict(
+        build_verdict(packet_id="pkt-tc-unk", decision="Approve", head_sha="0900128")
+    ).stem
+    packet = _pushed_with_files(
+        "ship-tc-unk",
+        [{"path": "tests/test_auth.py", "status": "unknown", "insertions": 0, "deletions": 0}],
+        head="0900128",
+    )
+    packet["push_status"]["review_ref"] = ref
+    with pytest.raises(PacketError):
+        inbox.publish(packet)

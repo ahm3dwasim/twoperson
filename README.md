@@ -71,8 +71,8 @@ approved head '6e5acc68…', but this packet shipped 'f00dbabe…' — an approv
 not carry over to a different commit
 ```
 
-And if the packet's `changed_files` says it modified, deleted, or renamed a test, the cited
-verdict has to say the reviewer noticed:
+And if the packet's `changed_files` says it changed a test — anything but a fresh add or copy — the
+cited verdict has to say the reviewer noticed:
 
 ```
 $ twoperson verify --from packet.json
@@ -86,14 +86,15 @@ the `changed_files` the builder reported (leaving a changed test off that list e
 same self-reporting gap `diff_summary` already has), and it flags *any* qualifying test change
 for acknowledgment rather than deciding whether it strengthens or weakens the test. It exists so
 a builder can't get a quietly weakened test past a reviewer who never looked at the diff, not so
-a machine can judge test quality. Adding a new test doesn't trigger it — only touching an
-existing one does.
+a machine can judge test quality. Only adding or copying a test is treated as safe; every other
+status — including an `unknown` one — needs the ack, so a change can't slip through on a vague
+status, and `TWOPERSON_TEST_GLOBS` only *adds* patterns rather than being able to switch detection off.
 
 A rename is the one status where the changed path alone isn't enough: `changed_files` only
 records where a file ended up, so renaming `tests/test_auth.py` to `src/auth.py` would look like
 "not a test" if `path` were all this checked, quietly deleting the coverage. `changed_files`
 entries may carry an optional `old_path`, and a rename is flagged if *either* end looks like a
-test — or if `old_path` is missing entirely, since an unrecorded source might have been one.
+test — or if `old_path` is missing or `unknown`, since an unrecorded source might have been one.
 
 So an approval is for one sha of one packet. Rebase, amend, or add a commit and it's stale. The
 builder has to publish again and the reviewer has to look again. `verify` runs the same checks as
