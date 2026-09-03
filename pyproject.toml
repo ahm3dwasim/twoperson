@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "twoperson"
-version = "0.1.0"
+version = "0.1.1"
 description = "A two-person rule for AI coding agents: a ship report cannot be recorded without an approving verdict for that exact commit."
 readme = "README.md"
 license = { text = "MIT" }

@@ -187,22 +187,44 @@ quietly upgraded to "this was reviewed".
 
 ## How this compares
 
-There are a few projects in this space and I looked at them before writing this one.
+There are several projects in this space and I read them before writing this one. Most of them
+are more capable than this is. They solve a different half of the problem.
 
-[claude-review-loop](https://github.com/hamelsmu/claude-review-loop) runs Codex on Claude's
-work from a slash command. It writes each review to a `reviews/` file, and its Stop hook asks for
-a Codex pass once the loop is invoked (failing open if the review can't be produced). What it
-doesn't have is a sha-bound approval or a ship-report binding: nothing ties "reviewed" to one
-commit, and nothing refuses a "shipped" record that lacks one.
-[sd0x-harness](https://github.com/sd0xdev/sd0x-harness) is much bigger (skills, agents,
-hooks) and puts its hard gates at the git level with review as a reminder layer.
-[quorum](https://github.com/berrzebb/quorum) does enforce an audit gate, over MCP and SQLite,
-with a lot more machinery. [shiplog](https://github.com/devallibus/shiplog) leans on GitHub
-branch protection and needs a remote.
+[codex-plugin-cc](https://github.com/openai/codex-plugin-cc) is OpenAI's own plugin for driving
+Codex from inside Claude Code, and it's the closest thing to an official answer here. Turn on its
+optional review gate and a `Stop` hook runs a targeted Codex review of Claude's response; if the
+review finds something, the stop is blocked. That gates the *turn*. The check happens while the
+session is alive, no durable record says which commit was reviewed, and nothing afterwards refuses
+a claim that the work was pushed. It also needs a ChatGPT subscription or an OpenAI key and spends
+Codex usage on every review, which its own README warns can drain limits quickly. If what you want
+is a second model reading the diff before the session ends, use it; it does that better than this
+does.
 
-`twoperson` is smaller than all of those and does one thing: the schema won't let "shipped
-without review" or "approved without a sha" exist. It doesn't care which agents you use or
-whether you have a GitHub remote.
+[claude-review-loop](https://github.com/hamelsmu/claude-review-loop) runs a set of parallel Codex
+reviewers when a session tries to stop and writes the consolidated review to a `reviews/` file. The
+review is real and it persists, but nothing ties it to one commit, and nothing later refuses a
+record that says the work shipped.
+
+[sd0x-harness](https://github.com/sd0xdev/sd0x-harness) is far bigger (99 skills, hooks, rules) and
+made the opposite trade on purpose: its git-level guards stay hard while, in its own words, "the
+review layer became advisory by design". Its hooks report facts and the model decides.
+
+[quorum](https://github.com/berrzebb/quorum), which absorbed the earlier consensus-loop, does
+enforce an audit gate, over MCP and a SQLite event store, with 22 hooks and 30 tools. Approval there
+is a state in that store rather than something bound to a particular commit.
+
+[secondmate](https://github.com/eshwarvijay/secondmate) is the one I found that also refuses a
+stale approval: its `verify-gate.sh` fails if the head moved since the checker's verdict. It gets
+there by being an orchestrator that spawns the maker and the checker itself. This is the same idea
+with none of the orchestration, which matters if you already have two agents you like.
+
+[shiplog](https://github.com/devallibus/shiplog) records reviews as signed `Reviewed-by:` lines on
+pull requests, with four dispositions. It needs an authenticated `gh` and a GitHub remote.
+
+So: everything above either runs the review for you, or records it without binding it to a commit,
+or both. `twoperson` runs nothing and reviews nothing. It is a schema and a directory, and the only
+thing it does is make "shipped without review" and "approved without a sha" impossible to write
+down. It has no opinion about which agents you use and doesn't need a network, a key, or a remote.
 
 ## What it doesn't do
 

@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-03
+
+### Changed
+
+- Rewrote the comparison section. It now covers OpenAI's `codex-plugin-cc` and `secondmate`, which
+  were missing, and describes what each project actually enforces rather than what it resembles.
+
+### Fixed
+
+- The comparison said `shiplog` leans on GitHub branch protection. It doesn't: it records signed
+  `Reviewed-by:` lines on pull requests, and needs an authenticated `gh` and a GitHub remote.
+- `quorum` is credited with absorbing the earlier `consensus-loop`.
+
 ## [0.1.0] - 2026-09-03
 
 First public release.
@@ -27,5 +40,6 @@ First public release.
   `TWOPERSON_TIER` / `TWOPERSON_TIER_SCORE` / `TWOPERSON_PACKET_ID`, plus the `ESCALATE:`
   convention for asking for a stronger reviewer.
 
-[Unreleased]: https://github.com/ahm3dwasim/twoperson/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/ahm3dwasim/twoperson/releases/tag/v0.1.0
+[Unreleased]: https://github.com/ahm3dwasim/twoperson/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/ahm3dwasim/twoperson/releases/tag/v0.1.1
+[0.1.0]: https://pypi.org/project/twoperson/0.1.0/
