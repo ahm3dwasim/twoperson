@@ -3,21 +3,119 @@ on:
   push:
     tags: ["v*"]
 
+# Read-only by default. The jobs below check out the repository and then run code from it — the
+# test suite, the build backend — and a checkout that persists a write-capable token would let any
+# of that mutate the repository after it had been verified. Only the upload job gets more, and what
+# it gets is an OIDC identity rather than a token.
+permissions:
+  contents: read
+
 jobs:
-  build:
+  # Pushing a tag is enough to reach the upload. Whatever a maintainer checks before pushing cannot
+  # bind a push that did not come from them, so the checks that matter live here, where they gate.
+  guard:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with: { python-version: "3.12" }
-      - run: pip install build && python -m build
-      - uses: actions/upload-artifact@v4
+
+      # Tag names and shas arrive through the environment, never spliced into the script body.
+      # ${{ }} is substituted into the source before bash sees it, so a tag named with shell
+      # metacharacters becomes code in this step rather than data it compares.
+      - name: the tag must name a commit on main
+        env:
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::$TAG points at a commit that is not on main"
+            exit 1
+          fi
+
+      - name: the tag must match the version being published
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          declared=$(python -c "import re;print(re.search(r'^version = \"([^\"]+)\"', open('pyproject.toml').read(), re.M).group(1))")
+          if [ "$TAG" != "v${declared}" ]; then
+            echo "::error::tag $TAG does not match the declared version ${declared}"
+            exit 1
+          fi
+
+  build:
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with: { python-version: "3.12" }
+      # The whole toolchain, by version and hash, and --no-isolation so pip cannot resolve anything
+      # else into the environment that produces the artifact. Pinning only the two top-level tools
+      # left their dependencies free, inside an isolated build environment nobody ever looks at.
+      - run: |
+          set -euo pipefail
+          pip install --require-hashes -r requirements-build.txt
+          python -m build --no-isolation
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: dist
           path: dist/
 
-  pypi:
+  # The artifact itself is what gets published, so the artifact itself is what gets tested, on every
+  # version this project claims to support. Testing the source tree on one version and uploading a
+  # wheel nobody ran would prove the wrong thing.
+  test:
     needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        # Both distributions are uploaded, so both are tested. Installing only the wheel would let
+        # an sdist nobody built from reach PyPI, where it is what anyone without a matching wheel
+        # gets.
+        dist: [wheel, sdist]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with: { python-version: "${{ matrix.python }}" }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: dist
+          path: dist/
+      - env:
+          KIND: ${{ matrix.dist }}
+        run: |
+          set -euo pipefail
+          if [ "$KIND" = "wheel" ]; then
+            pip install dist/*.whl
+          else
+            # Installing an sdist runs a PEP 517 build. Left to itself pip creates an isolated
+            # environment and resolves the backend and its dependencies there, outside everything
+            # this file pins — so the artifact would be exercised under a toolchain nobody froze.
+            pip install --require-hashes -r requirements-build.txt
+            pip install --no-build-isolation dist/*.tar.gz
+          fi
+          # The suite's own dependencies, not just the runner. Installing the wheel and pytest alone
+          # leaves out what the tests themselves import, and this job is a gate: if it cannot run,
+          # nothing is published, and the failure looks like a broken release rather than a missing
+          # line here.
+          pip install pytest PyYAML
+          pytest -q
+
+  pypi:
+    needs: test
     runs-on: ubuntu-latest
     # Trusted publishing: PyPI trusts this repo+workflow+environment via OIDC.
     # No API token exists anywhere. Configure the publisher at
@@ -26,8 +124,12 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      # Pinned to a commit, not to the moving release/v1 branch. This job holds id-token:write
+      # for trusted publishing, so whatever this reference resolves to at run time can mint a
+      # PyPI token for the project. A branch is mutable by definition; a commit is not.
+      # dc37677b2e1c63e2034f94d8a5b11f265b73ba33 is v1.14.2.
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33

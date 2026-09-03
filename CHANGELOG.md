@@ -8,6 +8,32 @@ All notable changes to this project are documented here. The format follows
 
 ## [0.1.1] - 2026-09-03
 
+### Security
+
+- The publish workflow verifies what it was handed before anything reaches the trusted-publishing
+  step: the tag must name a commit on `main` and match the version declared in `pyproject.toml`.
+  Pushing a tag is enough to reach the upload, so the checks that matter live where they gate it
+  rather than in whatever a maintainer happened to run first.
+- The entire build toolchain is pinned by version and hash in `requirements-build.txt` and used
+  with `--no-isolation`, so nothing resolves freely into the environment that produces the artifact.
+  Pinning the actions, or even the two top-level tools, while their dependencies float would leave
+  the same door open.
+- Both distributions that will be uploaded, the wheel and the sdist, are installed and tested on
+  every Python version this package claims to support before the upload runs, and the sdist is
+  installed under the same frozen toolchain rather than letting pip resolve a build environment of
+  its own. The supported versions are now listed explicitly as classifiers, 3.10 through 3.14, and a
+  test fails if that list and the release matrix ever disagree in either direction. Testing the source tree on one interpreter
+  and publishing artifacts nobody ran proves the wrong thing.
+- Values that come from outside, such as the tag name, reach the workflow's shell steps through the
+  environment rather than being substituted into the script text, where a tag named with shell
+  metacharacters would become code.
+- The workflow is read-only by default, checkouts do not persist credentials, and only the
+  publishing job holds anything more.
+- Every GitHub Action in every workflow is pinned to a commit rather than a moving tag or branch.
+  The upload job is the one that holds `id-token: write`, so a mutable reference in it could mint a
+  token for this project; the jobs before it are pinned too, because they decide what that token is
+  used to upload. A test fails the suite if any workflow reintroduces a mutable reference.
+
 ### Changed
 
 - Rewrote the comparison section. It now covers OpenAI's `codex-plugin-cc` and `secondmate`, which

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -8,6 +8,10 @@ version = "0.1.1"
 description = "A two-person rule for AI coding agents: a ship report cannot be recorded without an approving verdict for that exact commit."
 readme = "README.md"
 license = { text = "MIT" }
+# A floor, deliberately not a ceiling. Capping this would make the metadata exactly match the
+# versions the release gate tests, at the cost of refusing to install on every new Python until a
+# release widens the cap. The versions this package actually claims to support are the classifiers
+# below, and a test holds that list equal to the release matrix in both directions.
 requires-python = ">=3.10"
 keywords = ["ai", "agents", "code-review", "claude-code", "codex", "llm", "guardrails", "multi-agent"]
 classifiers = [
@@ -15,6 +19,11 @@ classifiers = [
   "Intended Audience :: Developers",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Software Development :: Quality Assurance",
 ]
 dependencies = ["structlog>=23.1"]
@@ -27,7 +36,7 @@ Issues = "https://github.com/ahm3dwasim/twoperson/issues"
 twoperson = "twoperson.__main__:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+dev = ["pytest>=7.4", "PyYAML>=6.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/twoperson"]

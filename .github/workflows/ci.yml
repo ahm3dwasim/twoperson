@@ -3,17 +3,24 @@ on:
   push: { branches: [main] }
   pull_request:
 
+# These jobs check out the repository and then run its tests and its build backend. A checkout that
+# leaves a write-capable token behind would let any of that change the repository.
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python: ["3.10", "3.11", "3.12", "3.13"]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[dev]"
@@ -22,8 +29,10 @@ jobs:
   wheel:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with: { python-version: "3.12" }
       - run: pip install build && python -m build --wheel
       # The hook scripts must survive packaging: install-hook writes their installed path into
@@ -31,3 +40,28 @@ jobs:
       - run: |
           pip install dist/*.whl
           python -c "from twoperson.hook import hook_script_path; assert hook_script_path().exists()"
+
+  # The release builds under a hash-pinned toolchain, and that file is resolved by hand on whatever
+  # interpreter the author happened to be using. Conditional dependencies are the trap: build and
+  # hatchling need tomli only before 3.11, so a file resolved on a newer Python is missing an entry
+  # that nothing notices until the release itself fails on the oldest supported version. Proving it
+  # resolves on the floor version here means that failure happens on a pull request instead.
+  build-toolchain:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every version, not only the floor. A conditional dependency can key on any interpreter,
+        # not just the oldest, and the release build itself runs on one particular version. Checking
+        # a single version would leave exactly the same trap one release later.
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with: { python-version: "${{ matrix.python }}" }
+      - run: |
+          set -euo pipefail
+          pip install --require-hashes -r requirements-build.txt
+          python -m build --no-isolation
