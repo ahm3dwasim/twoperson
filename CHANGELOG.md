@@ -18,6 +18,11 @@ All notable changes to this project are documented here. The format follows
   carries it — a test source flags the change whatever its status, and an absent, empty, or
   `unknown` source is flagged conservatively — closing bypasses where a test moved to a non-test
   path evaded detection because only the destination path was ever checked.
+- `publish_verdict` now refuses to write a verdict whose `acknowledged_tests` names a test path the
+  reviewed packet doesn't actually alter, so a verdict can only ever acknowledge the test changes
+  present in the packet it reviews. This makes the content-binding structural rather than a CLI
+  convention: without it, a caller writing verdicts directly (bypassing `--ack-test-changes`) could
+  mint an acknowledgment for arbitrary paths and have it replayed onto an unrelated ship report.
 
 ### Changed
 

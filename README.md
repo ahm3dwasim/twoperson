@@ -86,7 +86,10 @@ exact test paths (twoperson verdict --ack-test-changes)
 tests the reviewer actually had in front of them. That's deliberate: the acknowledgment records
 the *specific* test paths, not a bare "I acknowledge test changes" flag, so a verdict written for
 one packet's test changes can't be cited to silently unlock a *different* ship report's *different*
-test changes at the same head (`changed_files` is self-reported per packet). It's still a narrow
+test changes at the same head (`changed_files` is self-reported per packet). The binding isn't just
+a CLI convention, either: `publish_verdict` itself refuses to write a verdict whose
+`acknowledged_tests` names a path the reviewed packet didn't alter, so an API caller can't mint an
+acknowledgment for arbitrary paths and have it replayed onto a different report later. It's still a narrow
 check in every other respect: it only sees the `changed_files` the builder reported (leaving a
 changed test off that list evades it — the same self-reporting gap `diff_summary` already has),
 and it flags *any* qualifying test change for acknowledgment rather than deciding whether it

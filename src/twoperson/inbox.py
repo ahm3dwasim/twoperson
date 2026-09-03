@@ -437,6 +437,15 @@ def publish_verdict(verdict: Mapping[str, Any], *, root: Path | str | None = Non
     work; it reports the outcome of work. The ship gate is unchanged: only an `Approve` /
     `Approve with nits` decision for a still-current head unlocks a push, and the manager checks
     that head itself.
+
+    A verdict's `acknowledged_tests` is also bound at write time: every path it names must be one
+    `twoperson.testset.altered_test_files` derives from the REVIEWED packet's own `changed_files`
+    (`--ack-test-changes` already does this; this is what makes it structural rather than a CLI
+    convention). Without this, an API caller could mint a verdict acknowledging arbitrary test
+    paths that were never in the reviewed packet, and a later ship report could cite that verdict
+    to unlock tests nobody actually reviewed — the content-binding in `assert_review_ref_resolves`
+    only checks that the acknowledgment is a superset of what the *ship report* altered, not that
+    it was honestly derived from what the *reviewed packet* altered.
     """
     validated = validate_verdict(verdict)
     # Bind the verdict to a packet that exists in THIS inbox. A verdict is a statement about a
@@ -455,6 +464,17 @@ def publish_verdict(verdict: Mapping[str, Any], *, root: Path | str | None = Non
             f"{validated['packet_id']!r} is at {packet['git']['head_sha']!r} — an approval binds to "
             "the packet's own head"
         )
+    acked = validated.get("acknowledged_tests")
+    if acked:
+        altered = set(altered_test_files(packet["changed_files"]))
+        stray = [p for p in acked if p not in altered]
+        if stray:
+            raise PacketError(
+                "acknowledged_tests: verdict acknowledges tests (" + ", ".join(stray) + ") that packet "
+                f"{validated['packet_id']!r} does not alter — a verdict may only acknowledge the test "
+                "changes in the packet it reviews (`--ack-test-changes` derives them), so an "
+                "acknowledgment cannot be minted for arbitrary paths and replayed onto another report"
+            )
     body = dumps_verdict(validated)
     # Guard the serialized size at WRITE time, not only on read. A verdict whose fields each pass but
     # whose JSON total exceeds the cap (e.g. 64 findings at the length limit) would otherwise land in

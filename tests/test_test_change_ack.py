@@ -65,7 +65,9 @@ def test_a_modified_test_file_without_ack_is_refused(root):
 
 
 def test_a_modified_test_file_with_ack_is_accepted(root):
-    packet_for("pkt-tc-2", head_sha="0900128")
+    packet_for("pkt-tc-2", head_sha="0900128", changed_files=[
+        {"path": "tests/test_gate.py", "status": "modified", "insertions": 1, "deletions": 3},
+    ])
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-2", decision="Approve", head_sha="0900128",
                       acknowledged_tests=["tests/test_gate.py"])
@@ -165,7 +167,10 @@ def test_a_test_renamed_to_a_nontest_path_with_old_path_is_refused(root):
 
 
 def test_a_test_renamed_to_a_nontest_path_with_old_path_is_accepted_when_acked(root):
-    packet_for("pkt-tc-rename-1b", head_sha="0900128")
+    packet_for("pkt-tc-rename-1b", head_sha="0900128", changed_files=[
+        {"path": "src/auth.py", "status": "renamed", "old_path": "tests/test_auth.py",
+         "insertions": 2, "deletions": 40},
+    ])
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-rename-1b", decision="Approve", head_sha="0900128",
                       acknowledged_tests=["src/auth.py"])
@@ -342,7 +347,9 @@ def test_the_field_is_a_list_of_strings_not_a_bare_string(root):
 def test_a_verdict_acknowledging_other_tests_does_not_unlock_this_ship_report(root):
     """The exact r4 finding, now closed: a verdict acknowledging test changes for ONE packet must
     not silently unlock a DIFFERENT ship report at the same head whose altered tests differ."""
-    packet_for("pkt-tc-other", head_sha="0900128")
+    packet_for("pkt-tc-other", head_sha="0900128", changed_files=[
+        {"path": "tests/test_other.py", "status": "modified", "insertions": 1, "deletions": 1},
+    ])
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-other", decision="Approve", head_sha="0900128",
                       acknowledged_tests=["tests/test_other.py"])
@@ -364,7 +371,10 @@ def test_a_verdict_acknowledging_other_tests_does_not_unlock_this_ship_report(ro
 def test_a_subset_of_acknowledged_tests_is_accepted(root):
     """A verdict that acknowledges a SUPERSET of the ship report's altered tests still unlocks it —
     only the exact-match replay is what the gate closes."""
-    packet_for("pkt-tc-superset", head_sha="0900128")
+    packet_for("pkt-tc-superset", head_sha="0900128", changed_files=[
+        {"path": "tests/test_gate.py", "status": "modified", "insertions": 1, "deletions": 1},
+        {"path": "tests/test_extra.py", "status": "modified", "insertions": 1, "deletions": 1},
+    ])
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-superset", decision="Approve", head_sha="0900128",
                       acknowledged_tests=["tests/test_gate.py", "tests/test_extra.py"])
@@ -376,6 +386,33 @@ def test_a_subset_of_acknowledged_tests_is_accepted(root):
     )
     packet["push_status"]["review_ref"] = ref
     assert inbox.publish(packet).exists()
+
+
+# ---- publish_verdict itself refuses an acknowledgment for paths outside the reviewed packet ----
+
+def test_publish_verdict_refuses_acknowledging_a_test_the_reviewed_packet_does_not_alter(root):
+    """The write-time binding: a verdict may only acknowledge test changes the packet it reviews
+    actually altered — not an arbitrary path an API caller hand-typed."""
+    packet_for("pkt-mint", head_sha="0900128", changed_files=[
+        {"path": "tests/test_a.py", "status": "modified", "insertions": 1, "deletions": 1},
+    ])
+    with pytest.raises(PacketError) as excinfo:
+        inbox.publish_verdict(
+            build_verdict(packet_id="pkt-mint", decision="Approve", head_sha="0900128",
+                          acknowledged_tests=["tests/test_b.py"])
+        )
+    assert "tests/test_b.py" in str(excinfo.value)
+
+
+def test_publish_verdict_accepts_acknowledging_a_test_the_reviewed_packet_alters(root):
+    packet_for("pkt-mint-ok", head_sha="0900128", changed_files=[
+        {"path": "tests/test_a.py", "status": "modified", "insertions": 1, "deletions": 1},
+    ])
+    written = inbox.publish_verdict(
+        build_verdict(packet_id="pkt-mint-ok", decision="Approve", head_sha="0900128",
+                      acknowledged_tests=["tests/test_a.py"])
+    )
+    assert written.exists()
 
 
 # ---- twoperson.testset: the detection helper on its own -------------------------------------
@@ -663,8 +700,10 @@ def test_a_verdict_acknowledging_max_changed_files_paths_publishes(root):
     # cap is now the packet cap, and a JSON array of paths is smaller than the changed_files array
     # of objects those paths came from, so any acknowledgment a valid packet can produce publishes.
     assert MAX_VERDICT_BYTES == MAX_PACKET_BYTES
-    packet_for("pkt-big-ack", head_sha="0900128")
     paths = [f"tests/{'sub/' * 15}test_module_{i:04d}.py" for i in range(500)]
+    packet_for("pkt-big-ack", head_sha="0900128", changed_files=[
+        {"path": p, "status": "modified", "insertions": 1, "deletions": 1} for p in paths
+    ])
     v = build_verdict(packet_id="pkt-big-ack", decision="Approve", head_sha="0900128",
                       acknowledged_tests=paths)
     assert len(dumps_verdict(v).encode("utf-8")) > 32_768   # would have failed the old 32 KB cap

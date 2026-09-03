@@ -66,7 +66,10 @@ itself, not by this document:
    the specific test paths, rather than a bare "I acknowledge test changes" flag, means a verdict
    written for one packet's test changes cannot be cited to silently unlock a *different* ship
    report's *different* test changes at the same head — `changed_files` is self-reported per
-   packet, so a boolean acknowledgment could otherwise be replayed across reports. Only adding or
+   packet, so a boolean acknowledgment could otherwise be replayed across reports. That binding is
+   enforced when the verdict is *written*, not only when it is later cited: `publish_verdict`
+   refuses to record a verdict whose `acknowledged_tests` names a path the reviewed packet did not
+   alter, so an acknowledgment cannot be minted for arbitrary paths in the first place. Only adding or
    copying a test is safe; every other status — `"modified"`, `"deleted"`, `"renamed"`, the
    `"unknown"` sentinel, or any status added to the schema later — is treated as a possible
    weakening, so nothing slips through by carrying an unrecognised or ambiguous status. The point
