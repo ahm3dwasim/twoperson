@@ -42,7 +42,7 @@ Default review areas — tune these for your project:
 - data deletion or destructive operations
 - the review gate itself
 
-Four rules make the gate real rather than advisory, and all four are enforced by `twoperson`
+Five rules make the gate real rather than advisory, and all five are enforced by `twoperson`
 itself, not by this document:
 
 1. A verdict must answer a packet that exists in the inbox (`pending/`, `claimed/` or `audited/`).

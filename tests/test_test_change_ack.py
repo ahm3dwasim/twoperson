@@ -655,7 +655,7 @@ def test_acknowledged_tests_cap_matches_changed_files_not_max_list():
 
 # ---- a verdict acknowledging many paths fits the byte cap too (r6 audit finding) --------------
 
-def test_a_verdict_acknowledging_max_changed_files_paths_still_publishes():
+def test_a_verdict_acknowledging_max_changed_files_paths_publishes(root):
     from twoperson.verdict import dumps_verdict, loads_verdict, MAX_VERDICT_BYTES
     from twoperson.packet import MAX_PACKET_BYTES
     # The count cap alone was not enough: publish_verdict also size-guards the serialized verdict,
@@ -663,9 +663,12 @@ def test_a_verdict_acknowledging_max_changed_files_paths_still_publishes():
     # cap is now the packet cap, and a JSON array of paths is smaller than the changed_files array
     # of objects those paths came from, so any acknowledgment a valid packet can produce publishes.
     assert MAX_VERDICT_BYTES == MAX_PACKET_BYTES
+    packet_for("pkt-big-ack", head_sha="0900128")
     paths = [f"tests/{'sub/' * 15}test_module_{i:04d}.py" for i in range(500)]
-    v = build_verdict(packet_id="p", decision="Approve", head_sha="0900128", acknowledged_tests=paths)
-    raw = dumps_verdict(v)
-    data = raw if isinstance(raw, bytes) else raw.encode("utf-8")
-    assert len(data) > 32_768               # would have been rejected under the old 32 KB cap
-    assert loads_verdict(raw)["acknowledged_tests"] == paths   # accepted, and round-trips
+    v = build_verdict(packet_id="pkt-big-ack", decision="Approve", head_sha="0900128",
+                      acknowledged_tests=paths)
+    assert len(dumps_verdict(v).encode("utf-8")) > 32_768   # would have failed the old 32 KB cap
+    written = inbox.publish_verdict(v)                       # exercise the REAL write path
+    assert written.exists()
+    # ...and it round-trips off disk with the full acknowledgment intact.
+    assert loads_verdict(written.read_bytes())["acknowledged_tests"] == paths
