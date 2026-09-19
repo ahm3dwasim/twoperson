@@ -170,6 +170,39 @@ All notable changes to this project are documented here. The format follows
   ceiling on how cheaply a change may be audited has to fail the other way, so naming the prose is
   now the only way to get it.
 
+### Security
+
+- **A hard link planted in the inbox could make the package truncate a file outside it.** Quarantine
+  wrote `rejected/<stem>.reason.txt` with `O_TRUNC`, and `O_NOFOLLOW` does not refuse a hard link —
+  it is not a symlink — so a name pre-linked to any file the process can write had that file's
+  contents destroyed by an ordinary rejection. Nothing is written through a name any more: bytes go
+  to a fresh `O_EXCL` temp and arrive at the destination by `os.replace`, which names a *directory
+  entry*, so a second link to the same inode is never reached. The lock, mute-switch and cursor
+  writes had the same shape and are covered by the same change.
+- **FIFO protection covered readers only, so a FIFO at a writable name blocked the package forever.**
+  The previous round refused a non-regular file before *reading* it, but `O_WRONLY` on a FIFO with no
+  reader blocks in the open exactly as `O_RDONLY` does with no writer — a FIFO at a `.reason.txt`,
+  `.watch.lock`, `.watch_seen.json` or `.watch_muted` name hung the command with no timeout and no
+  error. Every open is now `O_NONBLOCK` and type-checked before use, in both directions, and a
+  lockfile that is not a regular file with a single link is refused rather than locked.
+- **The watcher's cursor was an unbounded, path-based read.** `load_cursor` resolved a path (so a
+  symlinked root was followed), opened without `O_NONBLOCK` (so a FIFO hung the watcher's first
+  tick), read without a size limit, and decoded with an implicit UTF-8 that raised
+  `UnicodeDecodeError` — which is neither an `OSError` nor a `JSONDecodeError`, so it escaped the
+  tolerant loader and killed the pass it was written to survive. It now reads through the root
+  descriptor, bounded by `MAX_CURSOR_BYTES`, and answers non-UTF-8 bytes explicitly as "no cursor"
+  with a log line, separately from malformed JSON.
+- **A full disk at lane creation escaped as a raw traceback instead of a refusal.** Lane `mkdir` and
+  the directory `fchmod` sat outside the error-converting open, so an injected `ENOSPC` produced a
+  bare `OSError` — not a `PacketError`, not exit `2` — from exactly the failure the refusal net
+  exists to report. Both are now converted at the chain, like every other root and lane hop.
+- **The class, not the four sites.** `twoperson._safefs` is now the one module that opens anything
+  under an inbox root — `open_dir`, `read_regular`, `replace_regular`, `open_lockfile` — with the
+  threat model written down in its docstring and in `docs/PROTOCOL.md`, and
+  `tests/test_safefs_guard.py` fails the suite by AST if any other module performs file I/O from
+  `os`/`shutil`/`pathlib`. Three prior rounds each fixed the sites they found and the next round
+  found the next site; the guard is what makes the fourth round impossible rather than unlikely.
+
 ## [0.1.1] - 2026-09-03
 
 ### Security

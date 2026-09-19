@@ -54,7 +54,7 @@ import structlog
 from .inbox import inbox_root, pending, pending_advice, pending_consults, pending_verdicts
 from .packet import LaneUnreadable, PacketError
 
-from . import inbox
+from . import _safefs, inbox
 
 log = structlog.get_logger(__name__)
 
@@ -147,59 +147,31 @@ def _writable_root_fd(root: Path | str | None) -> int | None:
     occupies the name, and `inbox._open_root_dir` answers that question — and refuses it — in the
     single syscall that would otherwise have followed it.
     """
-    directory = inbox_root(root)
     try:
-        directory.mkdir(parents=True, exist_ok=True)
-    except FileExistsError:
-        pass                # occupied; the open below decides whether what occupies it is usable
-    except OSError as exc:
-        log.warning("twoperson.watch_root_unavailable", error=str(exc))
-        return None
-    try:
-        return inbox._open_root_dir(directory)
+        return inbox._open_root_dir(inbox_root(root), create=True)
     except (OSError, PacketError) as exc:
         # `PacketError` is the refusal (`LaneUnreadable`) the chain raises for a root that is not a
-        # real directory; it is not an `OSError`, so catching only `OSError` would raise out of the
-        # watcher on exactly the hostile case this guards.
+        # real directory, AND for a root it could not create; it is not an `OSError`, so catching
+        # only `OSError` would raise out of the watcher on exactly the cases this guards.
         log.warning("twoperson.watch_root_unavailable", error=str(exc))
         return None
 
 
-def _replace_in_root(root_fd: int, tmp_name: str, final_name: str, body: bytes) -> None:
-    """Write ``body`` to ``tmp_name``, then reveal it as ``final_name`` — both by descriptor.
+def _replace_in_root(root_fd: int, final_name: str, body: bytes) -> None:
+    """Make ``final_name`` in the root mean exactly ``body`` — by descriptor, never through a link.
 
-    The create is ``O_CREAT | O_EXCL | O_NOFOLLOW``: ``O_EXCL`` so a pre-created name cannot be
-    written through, ``O_NOFOLLOW`` so an existing symlink is refused rather than followed. Both
-    operations are addressed relative to ONE held root descriptor, so neither can be redirected by a
-    swap of a path it does not name; the cursor file used to be written with ``Path.write_text`` and
-    moved with ``os.replace``, each re-resolving the root.
+    One call into :func:`twoperson._safefs.replace_regular`, which writes a fresh
+    ``O_CREAT | O_EXCL | O_NOFOLLOW`` temporary in the same held directory, drains it, ``fsync``s it
+    and reveals it with an ``os.replace`` addressed by ``dir_fd``. Neither half can be redirected by
+    a swap of a path it does not name, which is what the cursor file used to be exposed to when it
+    was written with ``Path.write_text`` and moved with a path-based ``os.replace``.
 
-    A name that ALREADY EXISTS is cleared and the create retried once. Every production save runs
-    inside `_dispatch_lock`, so a `.tmp` sitting there is a save that did not finish, never a live
-    writer — and ``O_EXCL`` without this would let that one leftover block every future save forever,
-    which is the same defect `inbox._atomic_publish` fixes for its staging entry. Failing after the
-    create removes it for the same reason: a retry of this save has to be able to succeed.
+    ``SafeFsRefusal`` rather than ``LaneUnreadable``: the cursor lives directly in the inbox root,
+    not in a lane of it. Both are `PacketError`s, so the CLI net and the watcher's own degradation
+    read them the same way; the type only says which of the two things refused.
     """
-    inbox._assert_plain_name(tmp_name)
-    inbox._assert_plain_name(final_name)
-    try:
-        fd = inbox._create_at(root_fd, tmp_name,
-                              os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW)
-    except FileExistsError:
-        os.unlink(tmp_name, dir_fd=root_fd)     # a save that did not finish; see the docstring
-        fd = inbox._create_at(root_fd, tmp_name,
-                              os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW)
-    try:
-        inbox._write_all(fd, body)      # a short write would publish a truncated cursor
-        os.replace(tmp_name, final_name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
-    except BaseException:
-        try:
-            os.unlink(tmp_name, dir_fd=root_fd)
-        except OSError as exc:
-            log.warning("twoperson.watch_temp_cleanup_failed", name=tmp_name, error=str(exc))
-        raise
-    finally:
-        os.close(fd)
+    _safefs.replace_regular(root_fd, final_name, body,
+                            what=f"the cursor file {final_name!r}", kind=_safefs.SafeFsRefusal)
 
 
 def is_muted(root: Path | str | None = None) -> bool:
@@ -215,10 +187,7 @@ def is_muted(root: Path | str | None = None) -> bool:
     except (OSError, PacketError):
         return False        # an unreadable inbox is not a mute; the caller's own probe fails closed
     try:
-        os.stat(SWITCH_NAME, dir_fd=root_fd, follow_symlinks=False)
-        return True
-    except OSError:
-        return False
+        return _safefs.stat_nolink(root_fd, SWITCH_NAME) is not None
     finally:
         os.close(root_fd)
 
@@ -237,16 +206,18 @@ def set_muted(muted: bool, root: Path | str | None = None) -> bool:
     root_fd = _writable_root_fd(root)
     if root_fd is None:
         return is_muted(root)
+    what = f"the mute switch {SWITCH_NAME!r}"
     try:
         if muted:
-            os.close(inbox._create_at(root_fd, SWITCH_NAME,
-                                      os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW))
-        else:
             try:
-                os.unlink(SWITCH_NAME, dir_fd=root_fd)
-            except FileNotFoundError:
-                pass        # already un-muted: the switch is idempotent in both directions
-    except OSError as exc:
+                os.close(_safefs.create_exclusive(root_fd, SWITCH_NAME, what=what,
+                                                  kind=_safefs.SafeFsRefusal))
+            except FileExistsError:
+                pass        # already muted: the switch is idempotent in both directions
+        else:
+            _safefs.unlink(root_fd, SWITCH_NAME, missing_ok=True, what=what,
+                           kind=_safefs.SafeFsRefusal)
+    except (OSError, PacketError) as exc:
         log.warning("twoperson.watch_switch_failed", muted=muted, error=str(exc))
     finally:
         os.close(root_fd)
@@ -392,6 +363,11 @@ def _dispatch_lock(root: Path | str | None):
     symlink — and truncates: a `.watch.lock` pre-created as a symlink had its target's bytes wiped by
     an ordinary dispatch pass. A lock file's content is nothing, so nothing here needs truncating, and
     the file this opens is provably the one inside the inbox root that was opened.
+
+    One call into :func:`twoperson._safefs.open_lockfile`, which also proves the name is a regular
+    file with ``st_nlink == 1`` before it takes the lock: a hard link at a lock's name is a second
+    name for a file someone else controls, which is not a lock. Both failure surfaces — the open and
+    the ``flock`` — arrive here as ``(OSError, PacketError)`` and degrade the same way.
     """
     root_fd = _writable_root_fd(root)
     if root_fd is None:
@@ -399,25 +375,18 @@ def _dispatch_lock(root: Path | str | None):
         return
     try:
         try:
-            handle = os.fdopen(
-                inbox._create_at(root_fd, DISPATCH_LOCK_NAME,
-                                 os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW),
-                "w",
-            )
-        except OSError as exc:
+            handle = _safefs.open_lockfile(root_fd, DISPATCH_LOCK_NAME,
+                                           what=f"the watch lock {DISPATCH_LOCK_NAME!r}")
+        except (OSError, PacketError) as exc:
+            # `PacketError` is the refusal the primitive raises for a lock name that is a FIFO, a
+            # hard link or not a regular file; it is not an `OSError`, so catching only `OSError`
+            # would crash the watcher on exactly the hostile case this guard exists for.
             log.warning("twoperson.watch_lock_unavailable", error=str(exc))
             yield
             return
     finally:
         os.close(root_fd)
     try:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX)
-        except OSError as exc:
-            # Locking unsupported on this filesystem — degrade to un-serialized behaviour, don't crash.
-            log.warning("twoperson.watch_lock_unavailable", error=str(exc))
-            yield
-            return
         try:
             yield
         finally:
@@ -429,12 +398,53 @@ def _dispatch_lock(root: Path | str | None):
         handle.close()
 
 
+#: The ceiling on the cursor file. It holds one filename per already-reacted-to entry, so a real one
+#: is a few kilobytes; anything past this is a name we will not read, not a cursor we will.
+MAX_CURSOR_BYTES = 1 << 20
+
+
 def load_cursor(root: Path | str | None = None) -> Cursor:
-    path = _cursor_path(root)
+    """Read the cursor through the root's descriptor — bounded, non-blocking, never fatal.
+
+    The old body was ``path.read_text(encoding="utf-8")`` on a PATH, which carried three separate
+    ways to take the watcher down on a ``--loop`` tick, all of them reachable by anyone who can write
+    a name into the inbox root:
+
+    * it re-resolved the root and FOLLOWED it (and the cursor) if either was a symlink;
+    * ``O_RDONLY`` on a FIFO with no writer BLOCKS forever — a ``.watch_seen.json`` swapped for a
+      FIFO hung the dispatch loop with no timeout and nothing to report;
+    * invalid UTF-8 escaped as ``UnicodeDecodeError``. That is not an ``OSError`` and not a
+      ``JSONDecodeError``, so it sailed past the ``except`` below and killed the pass, which is the
+      one thing a tolerant loader exists to prevent.
+
+    All three are answered here. The read goes through :mod:`twoperson._safefs` (``O_NOFOLLOW`` plus
+    ``O_NONBLOCK``, ``S_ISREG`` required, bounded), and the DECODE is caught explicitly and
+    separately from the parse — a cursor that is not UTF-8 is recovered from exactly like one that is
+    not JSON, and says so in the log rather than dying quietly.
+
+    Recovery is always the same, and always the cheap direction: treat the cursor as absent. The
+    worst case is one duplicate notification per already-seen entry, which is the cost this module's
+    design already accepts everywhere else; refusing to dispatch would be the expensive direction.
+    """
     try:
-        return Cursor.from_json(json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, json.JSONDecodeError):
-        return Cursor()  # missing or corrupt ⇒ start clean; the only cost is one duplicate notify
+        root_fd = inbox._open_root_dir(inbox_root(root))
+    except (OSError, PacketError):
+        return Cursor()
+    try:
+        raw = _safefs.read_regular(root_fd, CURSOR_NAME, MAX_CURSOR_BYTES,
+                                   what=f"the cursor file {CURSOR_NAME!r}",
+                                   kind=_safefs.SafeFsRefusal)
+    except (OSError, PacketError):
+        return Cursor()
+    finally:
+        os.close(root_fd)
+    try:
+        return Cursor.from_json(json.loads(raw.decode("utf-8")))
+    except UnicodeDecodeError as exc:
+        log.warning("twoperson.watch_cursor_unreadable", reason="not utf-8", error=str(exc))
+        return Cursor()
+    except json.JSONDecodeError:
+        return Cursor()
 
 
 def save_cursor(cursor: Cursor, root: Path | str | None = None) -> None:
@@ -450,9 +460,12 @@ def save_cursor(cursor: Cursor, root: Path | str | None = None) -> None:
     if root_fd is None:
         return
     try:
-        _replace_in_root(root_fd, f".{CURSOR_NAME}.tmp", CURSOR_NAME,
+        _replace_in_root(root_fd, CURSOR_NAME,
                          json.dumps(cursor.to_json(), ensure_ascii=False).encode("utf-8"))
-    except OSError as exc:
+    except (OSError, PacketError) as exc:
+        # `PacketError` is the refusal the primitive raises for a cursor name that is a FIFO, a hard
+        # link or a symlink; it is not an `OSError`, so catching only `OSError` would crash the
+        # watcher's save on exactly the hostile case this guard exists for.
         log.warning("twoperson.watch_cursor_save_failed", error=str(exc))
     finally:
         os.close(root_fd)

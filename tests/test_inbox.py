@@ -13,12 +13,12 @@ from datetime import datetime, timezone
 
 import pytest
 
-from twoperson import inbox
+from twoperson import _safefs, inbox
 from twoperson.advice import build_advice
 from twoperson.consult import build_consult
 from twoperson.packet import PacketError, SecretLeakError
 from twoperson.verdict import build_verdict
-from tests.fixtures import valid_packet, packet_for
+from tests.fixtures import guarded as _guarded, valid_packet, packet_for
 
 
 @pytest.fixture
@@ -543,35 +543,44 @@ def test_the_lane_is_opened_once_and_every_entry_is_stated_against_that_descript
 
     This pins the structural property instead of trying to lose a race in a test: the listing goes
     through ONE descriptor opened with `O_NOFOLLOW | O_DIRECTORY`, so nothing it returns depends on
-    the path resolving the same way twice. The descriptor now comes from the chain — root first,
-    then the lane relative to it — so the root cannot be re-resolved behind the listing's back
-    either. `_lane_dir_fd` is the chain (both hops, in order); the lane hop's own flags live in
-    `_open_lane_at`, which is the one place a lane is opened, so `_ensure_tree` gets the same
-    refusal for the same syscall instead of a second, hand-copied `os.open`.
+    the path resolving the same way twice. The descriptor comes from the chain — root first, then the
+    lane relative to it — so the root cannot be re-resolved behind the listing's back either.
+    `_lane_dir_fd` is the chain (both hops, in order); the lane hop's own flags live in
+    `twoperson._safefs.open_dir`, which is the ONE place any directory is opened, so `_ensure_tree`
+    gets the same refusal for the same syscall instead of a second, hand-copied `os.open`.
+
+    The flags assertion moved with the primitive: it is now made against `_safefs.open_dir`, which is
+    also what `tests/test_safefs_guard.py` enforces structurally — no module outside the primitive
+    may name a file operation at all.
     """
     import inspect
 
+    from twoperson import _safefs
+
     chain = inspect.getsource(inbox._lane_dir_fd)
     assert chain.count("_open_root_dir(") == 1, "the root is resolved more than once, or not at all"
-    assert "_open_lane_at(" in chain, (
+    assert "_safefs.open_dir(" in chain, (
         "the lane is opened by path, so the root above it is resolved by the kernel again"
     )
-    assert chain.index("_open_root_dir(") < chain.index("_open_lane_at("), (
+    assert chain.index("_open_root_dir(") < chain.index("_safefs.open_dir("), (
         "the lane hop must be relative to a root descriptor that was opened FIRST"
     )
-
-    lane_hop = inspect.getsource(inbox._open_lane_at)
+    # "inbox.py names no kernel flags of its own" is not asserted here: it is enforced strictly and
+    # repo-wide by `tests/test_safefs_guard.py`, which reads the AST rather than the prose and would
+    # fail on a raw call in ANY function of this module, not just this one.
+    lane_hop = inspect.getsource(_safefs.open_dir)
     assert "O_NOFOLLOW" in lane_hop and "O_DIRECTORY" in lane_hop, (
         "the lane is not opened with the flags that refuse a symlink atomically"
     )
-    assert "dir_fd=root_fd" in lane_hop, (
-        "the lane is named by path rather than addressed through the held root descriptor"
+    assert "dir_fd=" in lane_hop, (
+        "the directory is named by path rather than addressed through the held parent descriptor"
     )
-    assert lane_hop.count("os.open(") == 1, "the lane is resolved more than once"
 
     source = inspect.getsource(inbox._lane_scan)
     assert source.count("_lane_dir_fd(") == 1, "the lane is resolved more than once"
-    assert "dir_fd=fd" in source, "entries are stated by path, not against the open lane"
+    assert "fd," in source and "_safefs.stat_nolink(" in source, (
+        "entries are stated by path, not against the open lane"
+    )
 
 
 def test_ensure_tree_never_chmods_through_a_symlink(root, tmp_path):
@@ -687,12 +696,21 @@ def test_the_publish_rename_is_addressed_by_descriptor_not_by_path():
     """
     import inspect
 
+    from twoperson import _safefs
+
     source = inspect.getsource(inbox._atomic_publish)
-    assert "src_dir_fd=" in source and "dst_dir_fd=" in source, "the rename still names paths"
-    assert "O_EXCL" in source, (
+    assert "_safefs.stage_and_reveal(" in source, "the write does not go through the primitive"
+    assert "_lane_dir_fd" in source, "the directories are not held open across the operation"
+    assert "os.O_" not in source, (
+        "the operation names kernel flags itself instead of going through the primitive"
+    )
+
+    reveal = inspect.getsource(_safefs.reveal)
+    assert "src_dir_fd=" in reveal and "dst_dir_fd=" in reveal, "the rename still names paths"
+    create = inspect.getsource(_safefs.create_exclusive)
+    assert "O_EXCL" in create, (
         "without O_EXCL an attacker pre-creates the staging name and we write through it"
     )
-    assert "_lane_dir_fd" in source, "the directories are not held open across the operation"
 
 
 def test_the_staging_write_refuses_a_pre_created_symlink(root, tmp_path):
@@ -894,7 +912,7 @@ def test_a_short_write_is_looped_until_the_whole_body_is_written(tmp_path, monke
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         monkeypatch.setattr(inbox.os, "write", one_byte_at_a_time)
-        inbox._write_all(fd, body)
+        _safefs.write_all(fd, body)
         monkeypatch.undo()
     finally:
         os.close(fd)
@@ -929,7 +947,7 @@ def test_a_write_that_makes_no_progress_raises_rather_than_spinning(tmp_path, mo
     try:
         monkeypatch.setattr(inbox.os, "write", lambda fd, data: 0)
         with pytest.raises(OSError):
-            inbox._write_all(fd, b"anything")
+            _safefs.write_all(fd, b"anything")
     finally:
         os.close(fd)
 
@@ -951,13 +969,16 @@ def test_a_publish_that_fails_after_the_create_leaves_no_staging_leftover(root, 
     name = f"{_stamp(packet['created_at'])}-{packet['packet_id']}.json"
 
     if fail_at == "the write":
-        monkeypatch.setattr(inbox, "_write_all", _boom)
+        monkeypatch.setattr(_safefs, "write_all", _boom)
     elif fail_at == "the destination lookup":
-        monkeypatch.setattr(inbox, "_free_name_in", _boom)
+        monkeypatch.setattr(_safefs, "free_name", _boom)
     else:
         monkeypatch.setattr(inbox.os, "replace", _boom)
 
-    with pytest.raises(OSError):
+    # The reveal is the one of the three the primitive OWNS: a failed `os.replace` there is converted
+    # into the module's refusal rather than escaping as a raw errno. Both are caught, because the
+    # property under test is the cleanup, not which type reports the failure.
+    with pytest.raises((OSError, PacketError)):
         inbox.publish(packet, root=root)
 
     assert list((root / "staging").iterdir()) == [], (
@@ -981,11 +1002,19 @@ def test_ensure_tree_creates_every_lane_relative_to_one_root_descriptor():
     """
     import inspect
 
+    from twoperson import _safefs
+
     source = inspect.getsource(inbox._ensure_tree)
     assert source.count("_open_root_dir(") == 1, "the root is resolved more than once"
-    assert "dir_fd=root_fd" in source, "a lane is created by path, so the root is resolved per lane"
-    assert "_fchmod_dir(lane_fd)" in source, (
+    assert "_safefs.open_dir(root_fd, name, create=True" in source, (
+        "a lane is created by path, so the root is resolved per lane"
+    )
+    assert "os.mkdir" not in source and "os.fchmod" not in source, (
         "a lane's mode is set by name, which follows a symlink the open above just refused"
+    )
+    lane_hop = inspect.getsource(_safefs.open_dir)
+    assert "fchmod(fd" in lane_hop, (
+        "the mode is not set through the descriptor of the directory that was just opened"
     )
 
 
@@ -1000,11 +1029,17 @@ def test_the_move_rename_is_addressed_by_descriptor_not_by_path():
     """
     import inspect
 
+    from twoperson import _safefs
+
     source = inspect.getsource(inbox._move_lane_entry)
-    assert "src_dir_fd=" in source and "dst_dir_fd=" in source, "the rename still names paths"
+    assert "_safefs.rename(" in source, "the move does not go through the primitive"
     assert "_lane_dir_fd" in source, "the lanes are not held open across the move"
-    assert "_free_name_in" in source, (
-        "the destination name is chosen by path, so it can be answered by a different lane"
+    # That the move names no syscall of its own is `tests/test_safefs_guard.py`'s claim, checked
+    # against the AST for the whole package rather than against this one function's prose.
+    rename = inspect.getsource(_safefs.rename)
+    assert "src_dir_fd=" in rename and "dst_dir_fd=" in rename, "the rename still names paths"
+    assert "_safefs.free_name(dst_fd" in source, (
+        "the destination name is not chosen against the destination's own descriptor"
     )
 
 
@@ -1114,40 +1149,6 @@ def test_a_claim_refuses_a_pending_entry_that_is_not_in_this_inboxs_pending(root
 # would have refused it is an `fstat` behind that open. Every reader is opened `O_NONBLOCK`, fstat'ed
 # on the DESCRIPTOR, and refused unless it is a regular file.
 # --------------------------------------------------------------------------------------------
-
-#: Long enough that a slow machine is never a failure, short enough that a regression cannot hold the
-#: suite: a blocked open does not finish at all, so the timeout is not a duration to tune.
-_FIFO_GUARD_SECONDS = 20
-
-
-def _guarded(fn, *args, **kwargs):
-    """Run ``fn`` in a daemon thread and fail if it has not finished — a hang cannot pass as a pass.
-
-    The blocked open cannot be cancelled from here (that is the point: a thread stuck in `openat` is
-    not interruptible), so the thread is a daemon and the SUITE still finishes. What it buys is the
-    assertion: a regression reports "the reader blocked on a FIFO" instead of hanging CI.
-    """
-    import threading
-
-    box: dict = {}
-
-    def run():
-        try:
-            box["value"] = fn(*args, **kwargs)
-        except BaseException as exc:      # noqa: BLE001 - re-raised in the caller's thread
-            box["error"] = exc
-
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
-    thread.join(_FIFO_GUARD_SECONDS)
-    assert not thread.is_alive(), (
-        f"{getattr(fn, '__name__', fn)} blocked on a FIFO entry — the reader is uninterruptible, "
-        f"which is the defect: {_FIFO_GUARD_SECONDS}s with no answer"
-    )
-    if "error" in box:
-        raise box["error"]
-    return box.get("value")
-
 
 @pytest.mark.parametrize("reader", ["_read_lane_file", "_lane_entry_size"], ids=["read", "size"])
 def test_a_lane_entry_that_is_a_fifo_is_refused_without_blocking(reader, root):

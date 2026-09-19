@@ -99,6 +99,9 @@ def _read_source(source: str) -> str:
     if source == "-":
         return sys.stdin.read()
     try:
+        # safefs: out-of-model — the packet path the OPERATOR typed on the command line. It is not a
+        # name inside an inbox root and this package has no root to hold it against; the read is the
+        # operator's own file, and a failure is reported as the PacketError below.
         return Path(source).read_text(encoding="utf-8")
     except OSError as exc:
         raise PacketError(f"cannot read packet from {source}: {exc.strerror or exc}") from exc

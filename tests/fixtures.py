@@ -84,3 +84,47 @@ def packet_for(packet_id: str, head_sha: str = "0900128", **overrides: Any) -> d
     packet["git"]["head_sha"] = head_sha
     inbox.publish(packet)
     return packet
+
+
+# --------------------------------------------------------------------------------------------
+# A hang cannot pass as a pass.
+#
+# A hostile filesystem entry that blocks an open does not return an error and does not raise — it
+# does not finish at all. So a test for it cannot be written as "call this and assert"; without a
+# guard, a regression HANGS the suite instead of failing it, which reads as an infrastructure
+# problem rather than a defect and gets re-run rather than fixed. Every blocking-entry test in this
+# suite runs its call through `guarded`, which turns "never came back" into a named failure.
+# --------------------------------------------------------------------------------------------
+
+#: Long enough that a slow machine is never a failure, short enough that a regression cannot hold
+#: the suite: a blocked open does not finish at all, so the timeout is not a duration to tune.
+FIFO_GUARD_SECONDS = 20
+
+
+def guarded(fn, *args, **kwargs):
+    """Run ``fn`` in a daemon thread and fail if it has not finished — a hang cannot pass as a pass.
+
+    The blocked open cannot be cancelled from here (that is the point: a thread stuck in `openat` is
+    not interruptible), so the thread is a daemon and the SUITE still finishes. What it buys is the
+    assertion: a regression reports "blocked on a FIFO entry" instead of hanging CI.
+    """
+    import threading
+
+    box: dict = {}
+
+    def run():
+        try:
+            box["value"] = fn(*args, **kwargs)
+        except BaseException as exc:      # noqa: BLE001 - re-raised in the caller's thread
+            box["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(FIFO_GUARD_SECONDS)
+    assert not thread.is_alive(), (
+        f"{getattr(fn, '__name__', fn)} blocked on a FIFO entry — the reader is uninterruptible, "
+        f"which is the defect: {FIFO_GUARD_SECONDS}s with no answer"
+    )
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")

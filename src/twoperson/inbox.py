@@ -56,11 +56,17 @@ Safety properties this module owns:
   :class:`~twoperson.packet.LaneUnreadable` rather than answering "nothing here" — a poller that
   cannot tell those apart goes quiet on exactly the tampering the refusal exists to catch. The one
   lane that opts out is `signals/`, which gates nothing; it says so in its own docstring.
-* **A refusal is raised where it happens, not where it is remembered.** The descriptor chain itself
-  raises ``LaneUnreadable`` for any hop it cannot make, so a command reaches the refusal through the
-  operations it already calls rather than through a per-command `except` clause somebody has to
-  remember to add. The single exception is `FileNotFoundError`, which is the documented "not created
-  yet" / "already moved" answer and stays the caller's to interpret.
+* **A refusal is raised where it happens, not where it is remembered.** The file-access primitive
+  itself raises ``LaneUnreadable`` for any hop it cannot make, so a command reaches the refusal
+  through the operations it already calls rather than through a per-command `except` clause somebody
+  has to remember to add. The single exception is `FileNotFoundError`, which is the documented "not
+  created yet" / "already moved" answer and stays the caller's to interpret.
+
+**Every file this module touches goes through :mod:`twoperson._safefs`**, which states the threat
+model (which names are adversarial and which belong to the operator) and enforces it in one place —
+see its module docstring. This module holds no `open` of its own: the descriptor chain below is a
+sequence of calls into that primitive, and `tests/test_safefs_guard.py` fails the build if a raw
+file operation reappears here.
 
 See `docs/PROTOCOL.md` for the runbook.
 """
@@ -77,6 +83,7 @@ from typing import Any, Iterable, Mapping
 
 import structlog
 
+from . import _safefs
 from .packet import (
     MAX_PACKET_BYTES,
     LaneUnreadable,
@@ -118,7 +125,11 @@ INBOX_DIRNAME = ".twoperson"
 _SUBDIRS = ("staging", "pending", "claimed", "audited", "rejected", "signals", "signals_seen",
             "verdicts", "verdicts_seen", "consult", "consult_claimed", "consult_answered",
             "advice", "advice_seen")
-_DIR_MODE = 0o700
+#: The hard ceiling on one lane entry the chain will read. Each lane's own cap (``MAX_*_BYTES``) is
+#: the authority for that lane and is checked by its own reader; this is the outer bound the
+#: primitive needs so that "read this entry" can never mean "read however many bytes are there".
+_MAX_ENTRY_BYTES = max(MAX_PACKET_BYTES, MAX_VERDICT_BYTES, MAX_SIGNAL_BYTES,
+                       MAX_CONSULT_BYTES, MAX_ADVICE_BYTES)
 #: Where the repository search starts. ``None`` means "the process's current working directory",
 #: resolved at call time: a CLI must address the repository it is *run in*, never the one it was
 #: *installed from*. Pinning it to the package location works only for an editable checkout and
@@ -228,6 +239,9 @@ def _main_worktree_from_gitfile(marker: Path) -> Path | None:
     must degrade to "use this checkout", never to an arbitrary path or an exception in a poll.
     """
     try:
+        # safefs: out-of-model — a checkout's own `.git` marker, found by walking UP from the working
+        # directory; it is the operator's layout, outside every inbox root, and this module does not
+        # own it. The read is bounded, tolerant of bad bytes and any failure returns None.
         text = marker.read_text(encoding="utf-8", errors="replace")[:_GITFILE_MAX_CHARS]
         prefix, _, raw = text.partition(":")
         if prefix.strip() != "gitdir" or not raw.strip():
@@ -235,6 +249,8 @@ def _main_worktree_from_gitfile(marker: Path) -> Path | None:
         gitdir = Path(raw.strip())
         if not gitdir.is_absolute():
             gitdir = marker.parent / gitdir
+        # safefs: out-of-model — the same operator-owned `.git` tree, one hop further in; the path
+        # comes from the marker above, never from an inbox name, and the read is bounded.
         common_raw = (gitdir / "commondir").read_text(encoding="utf-8")[:_GITFILE_MAX_CHARS].strip()
         if not common_raw:
             return None
@@ -283,62 +299,28 @@ def inbox_root(root: Path | str | None = None) -> Path:
     return Path(override) if override else _default_parent() / INBOX_DIRNAME
 
 
-def _fchmod_dir(fd: int) -> None:
-    """Set a directory we are HOLDING to owner-only.
-
-    `mkdir(exist_ok=True)` SUCCEEDS on a symlink that points at a directory — it is an "already
-    exists" case, not an error — and `os.chmod` then follows that symlink. So a lane replaced by a
-    link to somewhere else had the *target's* permissions rewritten to 0700 by an ordinary `publish`
-    or `archive`, outside the inbox entirely. Every directory here is opened with `O_NOFOLLOW`
-    relative to the descriptor above it and permission-set with `fchmod`, so what is created, what
-    is checked, and what is modified are all provably the same object.
-    """
-    os.fchmod(fd, _DIR_MODE)
-
-
 def _ensure_tree(root: Path) -> Path:
-    """Create the inbox tree owner-only. `mkdir(mode=...)` is umask-masked, so chmod explicitly.
+    """Create the inbox tree owner-only, one level below a held descriptor at a time.
 
-    Each level is created RELATIVE to the descriptor of the level above it, and the chmod happens
-    through the level's own descriptor: see `_fchmod_dir` for why naming a directory twice is not
-    the same as holding it once. Creating `root / name` by path instead would re-resolve the root
-    once per lane, so a root swapped for a symlink part-way through the loop would have had the
-    remaining lanes created somewhere else.
+    Every step — the root's ``mkdir``, its ``fchmod``, each lane's ``mkdir`` and ``fchmod`` — is a
+    creation that can fail (a full disk, a permission wall) and each is performed by
+    :func:`twoperson._safefs.open_dir`, which wraps all four into the same `LaneUnreadable` the read
+    path raises. A root that is an existing regular file, a root that is a dangling symlink, and a
+    parent this process may not write to used to leave here as raw `FileExistsError` /
+    `PermissionError` / `OSError` — a traceback out of `next`, which is the one thing a refusal
+    exists to prevent.
 
-    CREATION IS A REFUSAL SURFACE TOO, and it is answered by the same open. A root that is an
-    existing regular file, a root that is a dangling symlink, and a parent this process may not
-    write to all used to leave here as raw `FileExistsError` / `PermissionError` — a traceback out
-    of `next`, which is the one thing `LaneUnreadable` exists to prevent, raised one hop *above* the
-    open that would have reported it. `FileExistsError` is deliberately passed through instead of
-    converted: it means something already occupies the name, which is exactly the question
-    `_open_root_dir` asks and answers in one syscall, with the refusal's own wording. Every other
-    `OSError` here (a permission wall, a parent that is not a directory) is a refusal and is raised
-    as one — and `FileNotFoundError` is not exempted: this is the CREATING path, so "there is
-    nothing there" is not an answer it can return as success.
+    Each level is created RELATIVE to the descriptor of the level above it and permission-set
+    through the level's own descriptor, so the directory that was checked and the directory that was
+    modified are provably the same object. Creating ``root / name`` by path instead would re-resolve
+    the root once per lane, so a root swapped for a symlink part-way through the loop would have had
+    the remaining lanes created somewhere else. ``mkdir``'s "already exists" answer is NOT the
+    check: a lane replaced by a symlink gives that answer too, and it is the open that refuses.
     """
+    root_fd = _open_root_dir(root, create=True)
     try:
-        root.mkdir(parents=True, exist_ok=True)
-    except FileExistsError:
-        pass                # occupied; the open below decides whether what occupies it is usable
-    except OSError as exc:
-        raise _refusal(f"the inbox root {root}", exc, verb="created") from exc
-    root_fd = _open_root_dir(root)      # refuses a root that is a symlink, not a real directory
-    try:
-        _fchmod_dir(root_fd)
         for name in _SUBDIRS:
-            try:
-                os.mkdir(name, dir_fd=root_fd)
-            except FileExistsError:
-                pass                    # already there; the open below decides whether it is usable
-            # `mkdir(exist_ok=True)`-style success above is NOT the check: it is an "already exists"
-            # answer that a lane replaced by a symlink also gives. The open is what refuses, and it
-            # refuses as `LaneUnreadable` — this is the hop every writing command takes, so leaving
-            # it raw is how `next` came to report a refusal as a traceback and exit 1.
-            lane_fd = _open_lane_at(root_fd, name)
-            try:
-                _fchmod_dir(lane_fd)
-            finally:
-                os.close(lane_fd)
+            os.close(_safefs.open_dir(root_fd, name, create=True, what=f"the lane {name!r}"))
     finally:
         os.close(root_fd)
     return root
@@ -355,14 +337,10 @@ def _publish_lock(root: Path):
     """
     root_fd = _open_root_dir(root)
     try:
-        handle = os.fdopen(
-            _create_at(root_fd, ".lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW),
-            "w",
-        )
+        handle = _safefs.open_lockfile(root_fd, ".lock", what="the publish lock")
     finally:
         os.close(root_fd)
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX)
         yield
     finally:
         try:
@@ -408,39 +386,6 @@ def _assert_inside(root: Path, target: Path) -> Path:
 # here (a symlinked lane, a lane that is a regular file, a permission wall) is a refusal.
 # --------------------------------------------------------------------------------------------
 
-def _refusal(what: str, exc: OSError, *, verb: str = "opened") -> LaneUnreadable:
-    """One refusal, spelled the same way at every hop of the chain.
-
-    ``what`` is built from the module's own lane names and the caller's root — never from a
-    dropped entry's name — so the message cannot be forged by whoever dropped it. It reaches a
-    terminal through `LaneScan.reason` and the CLI, so the errno's own `strerror` is carried rather
-    than the exception's `repr`, which would drag a path and a traceback into one line.
-
-    ``verb`` is the one thing that differs by hop, and it is a statement of fact rather than
-    decoration: a root this module had to CREATE cannot be said to have failed to open. The type —
-    which is what every caller and the CLI boundary net switch on — is identical either way.
-    """
-    return LaneUnreadable(f"{what} could not be {verb}: {exc.strerror or type(exc).__name__}")
-
-
-def _open_lane_at(root_fd: int, name: str) -> int:
-    """Open one lane relative to a root descriptor ALREADY HELD, or refuse.
-
-    `O_NOFOLLOW | O_DIRECTORY` rejects a symlink (`ELOOP` on Linux, `ENOTDIR` on macOS), a regular
-    file, a FIFO and a device in the one syscall that would otherwise have followed it, so no
-    enumeration of the ways a lane can fail to be a directory has to be complete. Taking the parent
-    descriptor rather than a path is what lets `_ensure_tree` create every lane from ONE root
-    resolution: handing it `root / name` would re-resolve the root per lane, and a root swapped
-    part-way through that loop would have had the remaining lanes created somewhere else.
-    """
-    try:
-        return os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=root_fd)
-    except FileNotFoundError:
-        raise               # never created here: the caller decides, and `_lane_scan` reads it empty
-    except OSError as exc:
-        raise _refusal(f"the lane {name!r}", exc) from exc
-
-
 def _refuse_a_root_that_cannot_be_created(root: Path) -> None:
     """A missing root is "provably empty" only where it COULD have existed.
 
@@ -461,15 +406,21 @@ def _refuse_a_root_that_cannot_be_created(root: Path) -> None:
         )
 
 
-def _open_root_dir(root: Path) -> int:
-    """The inbox root's own descriptor, or `LaneUnreadable` when the root is not a real directory."""
+def _open_root_dir(root: Path, *, create: bool = False) -> int:
+    """The inbox root's own descriptor, or `LaneUnreadable` when the root is not a real directory.
+
+    ``create`` is the writing path: the primitive makes the root (and reports a failure to make it
+    as a refusal) before opening it. Without it the absent root is the caller's own answer, and the
+    only question this adds is whether it *could* have existed — see
+    `_refuse_a_root_that_cannot_be_created`.
+    """
     try:
-        return os.open(root, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+        return _safefs.open_dir(None, str(root), create=create, what=f"the inbox root {root}")
     except FileNotFoundError:
+        if create:
+            raise           # the primitive already tried to make it; this is unreachable by rule
         _refuse_a_root_that_cannot_be_created(root)
         raise               # nothing has ever been published here — a provably empty inbox
-    except OSError as exc:
-        raise _refusal(f"the inbox root {root}", exc) from exc
 
 
 def _lane_dir_fd(root: Path, lane: str) -> int:
@@ -486,7 +437,7 @@ def _lane_dir_fd(root: Path, lane: str) -> int:
     """
     root_fd = _open_root_dir(root)
     try:
-        return _open_lane_at(root_fd, lane)
+        return _safefs.open_dir(root_fd, lane, what=f"the lane {lane!r}")
     finally:
         os.close(root_fd)
 
@@ -503,63 +454,29 @@ def _split_lane_path(path: Path) -> tuple[Path, str, str]:
     return lane_dir.parent, lane_dir.name, path.name
 
 
-def _open_lane_entry(path: Path) -> int:
-    """An open descriptor for one lane ENTRY, resolved from the root down under `O_NOFOLLOW`.
+def _entry_what(lane: str, name: str) -> str:
+    """The refusal's own wording for one lane entry, built from our names and never from the file's.
+
+    A dropped entry's name is chosen by whoever dropped it and reaches a terminal, so it goes through
+    `_safe_name` — bounded, printable, single-line — before it can be part of a message.
+    """
+    return f"the entry {_safe_name(name)!r} in lane {lane!r}"
+
+
+def _open_lane_entry_fd(path: Path) -> tuple[int, str, str]:
+    """The chain's last hop: ``(lane_fd, entry_name, lane)`` for one entry PATH.
 
     Handing a bare path to `open()` guards only its last component, so an entry could be listed
     safely and then read from outside the inbox once the *lane* above it was swapped for a symlink
-    in the window between the listing and the read. The chain is root -> lane -> entry, and each hop
-    is refused in the syscall that would have followed it.
+    in the window between the listing and the read. The chain is root -> lane -> entry, and every
+    hop is made by :mod:`twoperson._safefs`, which refuses in the syscall that would have followed
+    it. The caller owns the returned descriptor and must close it.
 
-    `O_NOFOLLOW` IS NOT ENOUGH ON ITS OWN: it refuses a symlink and permits everything else, and
-    "everything else" includes a FIFO. `O_RDONLY` on a FIFO with no writer BLOCKS until one appears,
-    so an entry listed as a name and swapped for a FIFO between the listing and the open hangs the
-    reader forever — with the size check itself (an `fstat` that never gets a descriptor to stat)
-    behind the block. Three things close it, in this order: `O_NONBLOCK` makes the open return
-    immediately whatever the entry is, `fstat` on the DESCRIPTOR asks what was actually opened, and
-    anything that is not `S_ISREG` is refused before a byte is read or a size is trusted. The
-    descriptor is what is checked, so the check and the read cannot be answered by two different
-    objects. `O_NONBLOCK` is cleared on the way out: it is opened with for the refusal's sake, not to
-    change how the caller reads the bytes.
-
-    :raises LaneUnreadable: any hop refused — including an ENTRY that is not a regular file, which is
-        the same refusal one level down rather than a different kind of event.
+    :raises LaneUnreadable: the root or the lane is not a real, openable directory.
     :raises FileNotFoundError: some hop is already gone; the caller decides what that means.
     """
     root, lane, name = _split_lane_path(path)
-    lane_fd = _lane_dir_fd(root, lane)
-    try:
-        try:
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=lane_fd)
-        except FileNotFoundError:
-            raise
-        except OSError as exc:
-            raise _refusal(f"the entry {_safe_name(name)!r} in lane {lane!r}", exc) from exc
-        try:
-            if not _stat.S_ISREG(os.fstat(fd).st_mode):
-                raise LaneUnreadable(
-                    f"the entry {_safe_name(name)!r} in lane {lane!r} could not be opened: "
-                    f"not a regular file"
-                )
-            _set_blocking(fd)
-        except BaseException:
-            os.close(fd)
-            raise
-        return fd
-    finally:
-        os.close(lane_fd)
-
-
-def _set_blocking(fd: int) -> None:
-    """Clear `O_NONBLOCK` on a descriptor already opened for reading.
-
-    `_open_lane_entry` sets it so the OPEN cannot block on a hostile entry; a regular file never
-    blocks on the open either way, so leaving it set would only decide how the read behaves. The
-    caller gets the ordinary blocking descriptor it expects, and the refusal above never depended on
-    this step succeeding.
-    """
-    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-    fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+    return _lane_dir_fd(root, lane), name, lane
 
 
 def _read_lane_file(path: Path) -> bytes:
@@ -569,14 +486,14 @@ def _read_lane_file(path: Path) -> bytes:
     refusal happens in the syscall that would otherwise have consumed the wrong file. A swap to a
     different REGULAR file is still possible and is not claimed otherwise; that attacker already
     holds write access to a 0700 directory, and what they would gain is writing a packet, which they
-    could do directly.
+    could do directly. A FIFO swapped in cannot hang the read, and a special file cannot be read at
+    all — both are refused by the primitive before a byte moves.
     """
-    fd = _open_lane_entry(path)
+    lane_fd, name, lane = _open_lane_entry_fd(path)
     try:
-        with os.fdopen(fd, "rb", closefd=False) as handle:
-            return handle.read()
+        return _safefs.read_regular(lane_fd, name, _MAX_ENTRY_BYTES, what=_entry_what(lane, name))
     finally:
-        os.close(fd)
+        os.close(lane_fd)
 
 
 def _lane_entry_size(path: Path) -> int:
@@ -586,98 +503,15 @@ def _lane_entry_size(path: Path) -> int:
     symlink, so the number a caller used to decide whether to open the file could come from a file
     the read itself would then refuse.
     """
-    fd = _open_lane_entry(path)
+    lane_fd, name, lane = _open_lane_entry_fd(path)
     try:
-        return os.fstat(fd).st_size
+        return _safefs.entry_size(lane_fd, name, what=_entry_what(lane, name))
     finally:
-        os.close(fd)
-
-
-def _assert_plain_name(name: str) -> str:
-    """Refuse a lane entry name that is not exactly ONE filesystem component.
-
-    Names moved by this module come from a directory listing, so they are one component by
-    construction. The check exists so a caller passing a constructed path cannot turn a move into a
-    traversal, and so the refusal is deliberate rather than whatever the kernel happened to answer.
-    Separators are POSIX ones, which is the surface this module already requires.
-    """
-    if not name or name in (".", "..") or "/" in name or "\0" in name:
-        raise PacketError(f"refusing a lane entry name that is not one component: {name!r}")
-    return name
-
-
-def _occupies(lane_fd: int, name: str) -> bool:
-    """Is this name already taken IN THIS LANE? A symlink occupies its own name, so it counts.
-
-    An error other than "there is no such entry" propagates: if the lane cannot be interrogated then
-    we do not know the name is free, and choosing it anyway is how a publish overwrites something.
-    """
-    try:
-        os.stat(name, dir_fd=lane_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return False
-    return True
-
-
-def _free_name_in(lane_fd: int, name: str) -> str:
-    """``name`` if it is free IN THIS LANE, else ``<stem>-2``, ``<stem>-3``… — never clobbers.
-
-    The question is asked, and the answer is used, against ONE descriptor. `Path.exists()` resolves
-    the lane by path, so the name that was chosen and the name that was then used could be answered
-    by two different directories; here the check and the operation cannot disagree about which lane
-    they mean.
-    """
-    if not _occupies(lane_fd, name):
-        return name
-    stem, suffix = os.path.splitext(name)
-    for index in range(2, 1000):
-        candidate = f"{stem}-{index}{suffix}"
-        if not _occupies(lane_fd, candidate):
-            return candidate
-    raise PacketError(f"cannot find a free filename for {name}")
-
-
-def _create_at(dir_fd: int, name: str, flags: int, mode: int = 0o600) -> int:
-    """``os.open`` a name in a directory we HOLD, retrying a concurrent create once.
-
-    macOS intermittently answers a create that another thread is performing at the same instant with
-    ``ENOENT`` — neither creating the file nor reporting ``EEXIST``. Measured on this platform: 62
-    failures in 320 concurrent ``openat(dir_fd, name, O_CREAT…)`` attempts, and 0 in 320 with the
-    single retry below. The answer cannot mean what it says, because the directory is open and the
-    create is unconditional, so it is not a refusal; treating it as one made a lock, a switch, a
-    cursor and a staging file all fail for no reason at all — the failures `_publish_lock`,
-    `_write_lane_file`, `_atomic_publish` and the whole watcher would otherwise inherit.
-
-    ONE retry, deliberately not a loop: by the time the loser asks again the winner's create has
-    landed, so the second call finds the name — ``O_CREAT`` opens it, and ``O_EXCL`` reports
-    ``EEXIST``, which IS the answer that caller asked for. Every other answer the kernel can give is
-    the caller's own and is returned unchanged. This is only for CREATING opens: a read that says
-    ``ENOENT`` means the entry is gone, and it keeps meaning that.
-    """
-    try:
-        return os.open(name, flags, mode, dir_fd=dir_fd)
-    except FileNotFoundError:
-        return os.open(name, flags, mode, dir_fd=dir_fd)
-
-
-def _write_all(fd: int, body: bytes) -> None:
-    """Write the WHOLE buffer, in as many calls as the kernel needs.
-
-    `os.write` may write fewer bytes than it was given and report how many. Ignoring that return
-    value publishes a TRUNCATED file and reports success — the tail of the body is silently dropped
-    — so the buffer is drained in a loop. A zero-byte write has made no progress and is raised
-    rather than spun on.
-    """
-    view = memoryview(body)
-    while view:
-        written = os.write(fd, view)
-        if written <= 0:
-            raise OSError(f"short write: {len(view)} byte(s) of the body were not written")
-        view = view[written:]
+        os.close(lane_fd)
 
 
 def _write_lane_file(root: Path, lane: str, name: str, body: bytes) -> None:
-    """Create or replace one file IN a lane of ``root``, through the descriptor chain.
+    """Make one file IN a lane of ``root`` mean exactly ``body``, through the descriptor chain.
 
     Used for the `.reason.txt` recorded beside a quarantined packet. `Path.write_text` resolves the
     lane again, so a lane swapped for a symlink would have had the reason — and only the reason —
@@ -688,25 +522,17 @@ def _write_lane_file(root: Path, lane: str, name: str, body: bytes) -> None:
     would discard the one the caller gave. The entry NAME is checked as one component here, so this
     hop carries its own authority rather than inheriting it from the move that produced the path.
 
-    The create is refused the same way the read side is: a `.reason.txt` name pre-created as a
-    symlink is refused by `O_NOFOLLOW`, and that refusal is a `LaneUnreadable` rather than a raw
-    `ELOOP`. It is reachable from an ordinary `next` — a malformed packet is quarantined on the way
-    past, and the quarantine writes this file — so leaving it raw hands the operator a traceback for
-    a lane that was tampered with, which is the one thing a refusal exists to report legibly.
+    The write REPLACES the directory entry rather than opening the file it names — see
+    `_safefs.replace_regular`. Opening it with `O_TRUNC | O_NOFOLLOW` refused a symlink but not a
+    HARD LINK, so a `rejected/<stem>.reason.txt` pre-created as a hard link to a writable file
+    outside the inbox had that outside file truncated by an ordinary quarantine. A refusal —
+    a `.reason.txt` name pre-created as a symlink, a lane that is not a directory — is raised as
+    `LaneUnreadable` and not as a raw `ELOOP`/`ENOTDIR`: this hop is reachable from an ordinary
+    `next`, because a malformed packet is quarantined on the way past.
     """
-    _assert_plain_name(name)
     lane_fd = _lane_dir_fd(root, lane)
     try:
-        try:
-            fd = _create_at(lane_fd, name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW)
-        except FileNotFoundError:
-            raise            # O_CREAT makes this unreachable; kept so the rule has no exception
-        except OSError as exc:
-            raise _refusal(f"the entry {_safe_name(name)!r} in lane {lane!r}", exc) from exc
-        try:
-            _write_all(fd, body)
-        finally:
-            os.close(fd)
+        _safefs.replace_regular(lane_fd, name, body, what=_entry_what(lane, name))
     finally:
         os.close(lane_fd)
 
@@ -732,7 +558,7 @@ def _lane_member(root: Path, lane: str, path: Path) -> str:
             f"refusing to move {_safe_name(path.name)!r}: it is not an entry in the {lane!r} lane "
             f"of the inbox root {root}"
         )
-    return _assert_plain_name(path.name)
+    return _safefs.plain_name(path.name)
 
 
 def _move_lane_entry(src: Path, *, root: Path, src_lane: str, dst_lane: str) -> Path:
@@ -761,8 +587,8 @@ def _move_lane_entry(src: Path, *, root: Path, src_lane: str, dst_lane: str) -> 
     try:
         dst_fd = _lane_dir_fd(root, dst_lane)
         try:
-            final = _free_name_in(dst_fd, name)
-            os.rename(name, final, src_dir_fd=src_fd, dst_dir_fd=dst_fd)
+            final = _safefs.free_name(dst_fd, name)
+            _safefs.rename(src_fd, name, dst_fd, final)
         finally:
             os.close(dst_fd)
     finally:
@@ -780,14 +606,6 @@ def _stamp(created_at: str) -> str:
 # Publish
 # --------------------------------------------------------------------------------------------
 
-def _unlink_staging(staging_fd: int, name: str) -> None:
-    """Best-effort removal of a staging entry — the caller's own failure is the one to report."""
-    try:
-        os.unlink(name, dir_fd=staging_fd)
-    except OSError as exc:
-        log.warning("twoperson.staging_cleanup_failed", name=_safe_name(name), error=str(exc))
-
-
 def _atomic_publish(directory: Path, lane: str, name: str, body: str) -> Path:
     """Write ``body`` into ``staging/`` and reveal it in ``lane/`` with a single `os.replace`.
 
@@ -803,10 +621,17 @@ def _atomic_publish(directory: Path, lane: str, name: str, body: str) -> Path:
     choice is made against the destination's descriptor too, so the name that is picked is the name
     the rename actually uses.
 
-    The staging entry is removed on ANY failure after it was created, not just on a failed
-    `os.replace`. `O_EXCL` means a leftover would refuse the next attempt at the same packet: a
-    short write, a destination lookup that raises, and a failed replace all have to leave
-    `staging/` as they found it, or one failed publish blocks every retry of it.
+    The whole write — the exclusive create of the staging name, the drained write, the ``fsync``, the
+    reveal, AND the removal of the staging entry on any failure in between — is one call into
+    :func:`twoperson._safefs.replace_regular`, given the destination lane's descriptor instead of its
+    own. That is deliberate rather than tidy: every one of those steps can fail, a short write and a
+    failed replace leave the staging name behind if they do, and `O_EXCL` makes a leftover fatal to
+    every retry of the same packet. A caller that had to remember the cleanup would get it right
+    until the first step nobody thought of; the primitive cannot forget it.
+
+    The create is ``O_EXCL | O_NOFOLLOW``, so an attacker can neither pre-create the staging name as
+    a symlink nor write through a name already there — and a stale one (a publish killed between the
+    create and the reveal) is cleared by the primitive rather than blocking this packet forever.
     """
     _assert_inside(directory, directory / "staging" / name)
     with _publish_lock(directory):
@@ -814,21 +639,12 @@ def _atomic_publish(directory: Path, lane: str, name: str, body: str) -> Path:
         try:
             lane_fd = _lane_dir_fd(directory, lane)
             try:
-                # O_EXCL so an attacker cannot pre-create the staging name as a symlink and have us
-                # write through it; O_NOFOLLOW so an existing symlink is refused, not followed.
-                handle = _create_at(staging_fd, name,
-                                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW)
-                # Everything from the create to the replace is inside this block on purpose: each of
-                # those steps can fail, and each of them leaves the staging name behind if it does.
-                try:
-                    _write_all(handle, body.encode("utf-8"))
-                    final = _free_name_in(lane_fd, name)
-                    os.replace(name, final, src_dir_fd=staging_fd, dst_dir_fd=lane_fd)
-                except BaseException:
-                    _unlink_staging(staging_fd, name)
-                    raise
-                finally:
-                    os.close(handle)
+                # The name is chosen against the DESTINATION's descriptor, then the write is told to
+                # reveal at exactly that name — so the name that was picked is the name that is used.
+                final = _safefs.free_name(lane_fd, name)
+                _safefs.stage_and_reveal(staging_fd, name, body.encode("utf-8"),
+                                         dst_dir_fd=lane_fd, dst_name=final,
+                                         what=f"the staging entry {_safe_name(name)!r}")
             finally:
                 os.close(lane_fd)
         finally:
@@ -1129,24 +945,17 @@ def _lane_scan(root: Path | str | None, lane: str) -> LaneScan:
     refused: list[str] = []
     try:
         try:
-            with os.scandir(fd) as entries:
-                names = [entry.name for entry in entries]
-        except OSError as exc:
-            return LaneScan(files=(), refused=(f"<the lane could not be listed: "
-                                               f"{exc.strerror or type(exc).__name__}>",),
-                            complete=False)
+            names = _safefs.list_names(fd, what=f"the lane {lane!r}")
+        except PacketError as exc:
+            return LaneScan(files=(), refused=(f"<{exc}>",), complete=False)
         for name in names:
             if not name.endswith(".json") or name.startswith("."):
                 continue
             # Stated against the open lane, not against a path that could now mean something else.
             # `follow_symlinks=False` reports the LINK, so `S_ISREG` is false for a symlink, a
             # directory, a FIFO or a device in a single answer.
-            try:
-                entry_stat = os.stat(name, dir_fd=fd, follow_symlinks=False)
-            except OSError:
-                refused.append(name)
-                continue
-            if not _stat.S_ISREG(entry_stat.st_mode):
+            entry_stat = _safefs.stat_nolink(fd, name)
+            if entry_stat is None or not _stat.S_ISREG(entry_stat.st_mode):
                 refused.append(name)
                 continue
             files.append(directory / lane / name)

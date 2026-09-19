@@ -441,17 +441,23 @@ def test_dispatch_lock_degrades_to_a_no_op_when_the_lock_file_cannot_be_opened(r
     contract — degrade to a no-op yield and still react, never raise."""
     inbox.publish(valid_packet())
 
-    real_open = open
+    # Patch the primitive, not `builtins.open`: the lock has been opened through
+    # `_safefs.open_lockfile` (i.e. `os.open`) since the descriptor-chain rewire, so a
+    # `builtins.open` patch intercepted nothing and this test passed without exercising the
+    # degrade at all. `tried` is asserted below so it cannot silently go vacuous again.
+    tried: list[str] = []
 
-    def guarded_open(path, *a, **k):
-        if str(path).endswith(watch.DISPATCH_LOCK_NAME):
-            raise OSError("cannot create lock file")
-        return real_open(path, *a, **k)
+    def guarded_open(dir_fd, name, **k):
+        tried.append(name)
+        raise OSError("cannot create lock file")
 
-    monkeypatch.setattr("builtins.open", guarded_open)
+    monkeypatch.setattr(watch._safefs, "open_lockfile", guarded_open)
 
     rec = Recorder()
     report = dispatch_once(audit_cmd="audit", notify_fn=rec.notify, run_fn=rec.run)
+    assert tried == [watch.DISPATCH_LOCK_NAME], (
+        "the dispatch lock must be opened through the primitive — otherwise this test proves nothing"
+    )
     assert "reviewer" in report.notified and rec.commands == ["audit"], (
         "an unopenable lock file must still dispatch, un-serialized, never raising"
     )

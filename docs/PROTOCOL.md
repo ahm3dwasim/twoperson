@@ -107,6 +107,44 @@ A packet is emitted by a language model. Treat every field as hostile input.
 - The renderer already wraps packet bodies in `BEGIN`/`END` markers under a data-not-instructions
   preamble and defangs forged markers. That is defense in depth, not a substitute for judgment.
 
+## 3a. The inbox filesystem is untrusted too
+
+Everything above is about packet *text*. The inbox is also a directory tree on a shared box, and
+anything that can write into it can plant a **name** — not hostile bytes, but a hostile file type or
+link count under a name the tools are about to use. That is the same class of problem and it gets
+the same answer: assume the name is adversarial, never the path.
+
+**What is defended, and by what.** Every file the package opens under an inbox root goes through one
+primitive, `twoperson._safefs`, which addresses each hop by descriptor (`openat`-style `dir_fd`)
+rather than by re-resolved path, and refuses by *type*, not by name:
+
+| Planted in the inbox | What it would do to a path-based open | What the primitive does |
+|---|---|---|
+| symlink at a root, lane, or entry | redirect the read/write outside the inbox | `O_NOFOLLOW` refuses it at the syscall that would follow it |
+| **hard link** at a writable name (e.g. `rejected/<stem>.reason.txt`) | `O_TRUNC` truncates the *linked* file anywhere on the volume — `O_NOFOLLOW` does not help, a hard link is not a symlink | nothing is ever written through the name: bytes go to a fresh `O_EXCL` temp and arrive by `os.replace`, which names a directory entry and so cannot touch a second link |
+| FIFO at a lock, switch, cursor, or entry name | `open()` blocks forever, in **both** directions — reader and writer | `O_NONBLOCK`, plus an `fstat` type check: only a regular file is used |
+| device / socket / directory at an entry name | reads garbage or hangs; writes to a device | same `fstat` type check |
+| oversized entry | unbounded read into memory | the reader is bounded by the lane's own `MAX_*_BYTES` |
+| non-UTF-8 bytes where JSON is expected | `UnicodeDecodeError` escapes a loader that only catches `OSError`/`JSONDecodeError` | the decode is caught and answered explicitly, at the layer that knows what to do |
+| a name that vanished between listing and open | a crash mid-operation | `FileNotFoundError` stays the documented "not created yet" / "already moved" answer |
+
+A refusal is never a silent empty answer: it is raised as `LaneUnreadable` (lane content) or
+`SafeFsRefusal` (root-level bookkeeping), both `PacketError`, so the CLI still exits 2 and a reader
+still cannot mistake "refused" for "nothing here".
+
+**What is deliberately out of scope.** The primitive protects files *inside* a root. It does not
+protect the parent directories of a root from being swapped, and it does not cover paths the
+operator types or configures — the hook script, the launchd plist, the checkout's own `.git`. Those
+are the operator's trust boundary, and they are marked as such in the source with
+`# safefs: out-of-model —` comments that the structural guard test reads.
+
+**Why one module, and why a test that enforces it.** Three audit rounds each found the *next* path
+based file operation that the previous round's fix had not reached, because each round fixed sites
+instead of the pattern. `tests/test_safefs_guard.py` is an AST check that fails if any module
+outside `_safefs.py` performs file I/O from `os`/`shutil`/`pathlib` — the allowlist is two
+operator-path entries in the hook/agent shims, each carrying its reason inline. A fourth round
+should find the guard, not a fifth site.
+
 ## 4. Verdict vocabulary
 
 | Decision | Meaning |
