@@ -103,6 +103,7 @@ __all__ = [
     "Cursor",
     "WatchDelta",
     "DispatchReport",
+    "MuteUnknown",
     "scan_new",
     "notify",
     "run_command",
@@ -173,33 +174,59 @@ def _replace_in_root(root_fd: int, final_name: str, body: bytes) -> None:
                             what=f"the cursor file {final_name!r}", kind=_safefs.SafeFsRefusal)
 
 
+class MuteUnknown(Exception):
+    """The mute switch's state could not be established this tick — neither confirmed present nor
+    confirmed absent.
+
+    `is_muted` raises this instead of returning a boolean for exactly this state, because a boolean
+    gives a caller no way to tell "I don't know" apart from "confirmed off"/"confirmed on" — which is
+    the defect this type exists to make structurally impossible to repeat. A prior fix answered one
+    of the two unknowable cases with ``True`` (fail closed) and the other with ``False`` (reasoning
+    that a later step would fail the same way and catch it) — but "a later step will fail the same
+    way" is a claim about a DIFFERENT syscall, made moments apart, and a transient fault (``EIO``,
+    ``EACCES``, a directory swapped back) is free to have cleared by then. `dispatch_once` must
+    therefore treat "unknown" as its own outcome — stopping scan/notify/launch/cursor-save exactly as
+    a confirmed mute does, but REPORTING a refusal rather than a successful mute, so an operator sees
+    the difference between "paused" and "could not tell whether it is paused". See `is_muted`.
+    """
+
+
 def is_muted(root: Path | str | None = None) -> bool:
-    """True when the watcher is switched OFF (the mute file exists), OR the switch's own occupancy
-    could not be determined. Never raises.
+    """True when the mute switch is CONFIRMED present (the watcher is switched OFF); False when it is
+    CONFIRMED absent. Raises `MuteUnknown` — never a boolean — when neither can be established.
 
-    The switch exists to STOP a launch (`dispatch_once` treats ``True`` here exactly like an explicit
-    mute: no notify, no launch, cursor untouched). An "I could not tell" answer must never be spelled
-    the same as "confirmed absent" — a probe that has already told us it cannot be trusted must not be
-    read as permission to launch anyway. So a refused `stat_nolink` on the switch's own name now
-    answers ``True`` — fail CLOSED — rather than ``False``:
+    Only two probes produce a confirmed answer:
 
-    * the root does not exist at all (``FileNotFoundError`` from `inbox._open_root_dir`) — nothing has
-      ever been published here, so the switch provably is not there either. That is a confirmed
-      answer, not an unknown one, and stays ``False`` (see `test_switch_survives_a_missing_inbox`).
+    * the root does not exist at all (``FileNotFoundError`` from `inbox._open_root_dir``) — nothing
+      has ever been published here, so the switch provably is not there either. That is a confirmed
+      fact about this root, not a probe that failed, and stays ``False``
+      (see `test_switch_survives_a_missing_inbox`).
+    * the root opens AND ``stat_nolink`` on the switch's own name answers cleanly — the switch's
+      PRESENCE or ABSENCE is exactly what was asked, and either answer is confirmed.
+
+    Both other cases raise `MuteUnknown`, because both were previously spelled as a confirmed boolean
+    and both let a launch through with the pause state genuinely unknown:
+
     * the root open itself is REFUSED (`PacketError` — a hostile or unreadable root: a symlink, a
-      permission wall, ``ENOTDIR``) also stays ``False`` here, and deliberately does NOT fail closed:
-      a root that cannot be opened cannot be scanned for lanes either, so `scan_new` (reached right
-      after this check) will find every lane refused and every ``new_*`` delta empty — nothing CAN
-      launch on this pass regardless of what this function answers, and the refusal must still reach
-      `dispatch_once` as a reportable `lane_unreadable`, not be swallowed here as a silent, successful
-      "muted" (the CLI's `watch --once` maps `report.muted` to exit 0 and `lane_unreadable` to exit 2 —
-      collapsing the first into the second here would turn a real root failure into a false success;
-      see `test_every_lane_command_refuses_a_root_it_cannot_use[watch-once-...]`).
-    * ``stat_nolink`` REFUSES rather than answers when the switch's occupancy cannot be determined at
-      all (``EIO``, ``EACCES``, ...), with the root otherwise open and every lane readable — that used
-      to read the same as "not there", so a transient fault on the switch's own ``stat`` let a launch
-      through with the pause state genuinely unknown, a new packet freshly found, and the cursor saved
-      over it. This is the one case only `is_muted` itself can catch, and it now fails CLOSED (``True``).
+      permission wall, ``ENOTDIR``). This used to answer ``False`` on the reasoning that a root which
+      cannot be opened cannot be scanned for lanes either, so nothing could launch on this pass
+      regardless of the answer — but that reasoning silently assumed `scan_new`'s OWN, separate root
+      open (a moment later) fails the identical way. A transient fault does not have to still be
+      failing by the time `scan_new` retries the open, and a directory the owner swaps back into place
+      between the two opens is not transient at all — either way `scan_new` can then read every lane
+      successfully while this probe's failure has already been reported as a confirmed "not muted".
+      Raising here stops `dispatch_once` before `scan_new` ever runs, so that race cannot occur; a
+      root that is persistently unopenable still reaches the CLI as a rejection (`dispatch_once`
+      converts `MuteUnknown` into `lane_unreadable`, and `watch --once` already maps that to exit 2 —
+      see `test_every_lane_command_refuses_a_root_it_cannot_use[watch-once-...]`), so the persistent
+      case keeps its existing exit code without depending on `scan_new` to independently rediscover it.
+    * ``stat_nolink`` on the switch's own name REFUSES rather than answers (``EIO``, ``EACCES``, ...),
+      with the root otherwise open. This used to fail CLOSED (return ``True``) on the reasoning that
+      `dispatch_once` treats ``True`` exactly like an explicit mute — no notify, no launch, cursor
+      untouched — which does stop every side effect, but it also reports a genuine unknown as a
+      confirmed, SUCCESSFUL mute (`watch --once` exits 0), hiding the fault instead of surfacing it.
+      Raising here keeps the same before-any-side-effect stop and additionally reports it as the
+      refusal it is.
 
     Asked through the root's own descriptor with ``follow_symlinks=False``. ``Path.exists()`` resolves
     the root again and follows the switch itself, so a name that is a symlink answered a question about
@@ -207,15 +234,35 @@ def is_muted(root: Path | str | None = None) -> bool:
     """
     try:
         root_fd = inbox._open_root_dir(inbox_root(root))
-    except (FileNotFoundError, PacketError):
-        return False        # an unreadable root is not a mute; `scan_new` reports the refusal instead
+    except FileNotFoundError:
+        return False        # confirmed: nothing has ever been published here, so no switch either
+    except PacketError as exc:
+        # A refused root open cannot be retried here to see if it is transient — `scan_new`'s own,
+        # later, independent open is where that would have to happen, and by then the answer this
+        # function gave is already final. Unknown, not "not muted": see `MuteUnknown`.
+        raise MuteUnknown(f"the inbox root could not be opened to check the mute switch: {exc}") from exc
     try:
         return _safefs.stat_nolink(root_fd, SWITCH_NAME) is not None
     except PacketError as exc:
-        log.warning("twoperson.watch_switch_unreadable", error=str(exc))
-        return True         # could not be examined: unknown state fails CLOSED (muted), not unmuted
+        raise MuteUnknown(f"the mute switch could not be examined: {exc}") from exc
     finally:
         _safefs.close_quietly(root_fd)
+
+
+def _is_muted_or_fail_closed(root: Path | str | None) -> bool:
+    """`is_muted`, degraded for a caller that must return a plain bool and never raise.
+
+    Used only by `set_muted`'s own read-back, after its write already succeeded or already failed —
+    either way `set_muted` has done everything it can about the WRITE, and this is just reporting the
+    resulting state as best it can. Failing closed (``True``) on `MuteUnknown` matches the same
+    fail-closed choice `set_muted`'s write path already makes, and keeps `set_muted`'s promise that a
+    filesystem error degrades to a logged answer, never a raise.
+    """
+    try:
+        return is_muted(root)
+    except MuteUnknown as exc:
+        log.warning("twoperson.watch_switch_unreadable", error=str(exc))
+        return True
 
 
 def set_muted(muted: bool, root: Path | str | None = None) -> bool:
@@ -231,7 +278,7 @@ def set_muted(muted: bool, root: Path | str | None = None) -> bool:
     """
     root_fd = _writable_root_fd(root)
     if root_fd is None:
-        return is_muted(root)
+        return _is_muted_or_fail_closed(root)
     what = f"the mute switch {SWITCH_NAME!r}"
     try:
         if muted:
@@ -247,7 +294,7 @@ def set_muted(muted: bool, root: Path | str | None = None) -> bool:
         log.warning("twoperson.watch_switch_failed", muted=muted, error=str(exc))
     finally:
         _safefs.close_quietly(root_fd)
-    return is_muted(root)
+    return _is_muted_or_fail_closed(root)
 
 
 @dataclass(frozen=True)
@@ -678,8 +725,21 @@ def dispatch_once(
     Mute is a *pause*, not a *skip*. The switch is checked twice: once as a cheap fast-path before the
     lock, and again **inside** the lock, so a mute flipped on while this pass was blocked waiting for the
     lock still wins — the re-check pins mute's precedence against an off-toggle racing an in-flight pass.
+
+    **An unknown mute state stops the tick exactly like a confirmed mute, but is reported, not hidden.**
+    `is_muted` raises `MuteUnknown` rather than answering when it cannot tell — a mute probe that failed
+    must never be treated as "confirmed not muted" just because the lanes turn out to be readable a
+    moment later (see `MuteUnknown`). Either check catching it bails with no scan, no notify, no launch,
+    no cursor change, exactly like a confirmed mute — but as a `lane_unreadable` refusal, at error level,
+    never as `report.muted`: `watch --once` maps a confirmed mute to exit 0 ("paused") and a refusal to
+    exit 2 ("could not tell"), and collapsing those would report a real fault as a successful pause.
     """
-    if is_muted(root):
+    try:
+        muted = is_muted(root)
+    except MuteUnknown as exc:
+        log.error("twoperson.watch_mute_unknown", error=str(exc))
+        return DispatchReport(lane_unreadable=(f"mute switch: {exc}",))
+    if muted:
         return DispatchReport(muted=True)  # no scan, no notify, no launch, no cursor change
 
     audit_cmd = os.environ.get(AUDIT_CMD_ENV, "") if audit_cmd is None else audit_cmd
@@ -694,7 +754,12 @@ def dispatch_once(
     with _dispatch_lock(root):
         # Re-check under the lock: a mute toggled on while we were blocked acquiring the lock must
         # still win. Bail with the cursor untouched, exactly as the pre-lock fast-path does.
-        if is_muted(root):
+        try:
+            muted = is_muted(root)
+        except MuteUnknown as exc:
+            log.error("twoperson.watch_mute_unknown", error=str(exc))
+            return DispatchReport(lane_unreadable=(f"mute switch: {exc}",))
+        if muted:
             return DispatchReport(muted=True)
         # A refusal costs its own lane and no other. `scan_new` reports which lanes it could not read
         # and carries each of their cursor slices forward untouched, so nothing in a refused lane is

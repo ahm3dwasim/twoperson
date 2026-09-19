@@ -740,10 +740,11 @@ def test_the_mute_switch_is_never_stamped_through_a_symlink(root):
     assert not (root / watch.SWITCH_NAME).is_symlink()
 
 
-def test_switch_unreadable_fails_closed_not_open(root, monkeypatch):
-    """A transient fault reading the mute switch itself (`EIO`, `EACCES`, ...) must read as MUTED, not
-    as un-muted. The switch's whole job is to STOP a launch; an "I could not tell" answer read as
-    "not muted" is exactly how a fail-open bug lets a launch through with the pause state unknown."""
+def test_switch_unreadable_raises_mute_unknown_not_a_boolean(root, monkeypatch):
+    """A transient fault reading the mute switch itself (`EIO`, `EACCES`, ...) must not be spellable as
+    either boolean: `is_muted` used to answer this with ``True`` (fail closed), which stopped every
+    side effect but reported a genuine unknown as a confirmed, successful mute. It now raises
+    `MuteUnknown` instead, so a caller cannot mistake "I don't know" for "confirmed" either way."""
     inbox._ensure_tree(root)
 
     def boom(_dir_fd, _name, **_k):
@@ -751,17 +752,23 @@ def test_switch_unreadable_fails_closed_not_open(root, monkeypatch):
 
     monkeypatch.setattr(watch._safefs, "stat_nolink", boom)
 
-    assert is_muted(root) is True, "an unreadable switch must fail CLOSED (muted), not open"
+    with pytest.raises(watch.MuteUnknown):
+        is_muted(root)
 
 
-def test_a_refused_root_open_reads_as_not_muted_not_unknown(root, monkeypatch):
-    """The root's own open can refuse too (a hostile or unreadable root) — and here, unlike the
-    switch's own stat, ``False`` is still the right answer, deliberately NOT fail-closed: a root that
-    cannot be opened cannot be scanned for lanes either, so nothing can launch on this pass regardless
-    of what `is_muted` answers, and the refusal must still surface as `dispatch_once`'s
-    `lane_unreadable` (which the CLI maps to a hard rejection) rather than being swallowed here as a
-    silent, successful "muted" (see `test_a_refused_root_open_still_reports_lane_unreadable_not_muted`
-    and `tests/test_cli.py::test_every_lane_command_refuses_a_root_it_cannot_use[watch-once-...]`)."""
+def test_a_refused_root_open_raises_mute_unknown_not_a_confirmed_not_muted(root, monkeypatch):
+    """The root's own open can refuse too (a hostile or unreadable root). This used to answer ``False``
+    (deliberately not fail-closed) on the reasoning that a root which cannot be opened cannot be
+    scanned for lanes either, so nothing could launch regardless of what `is_muted` answered — but that
+    assumed `scan_new`'s own, separate, later root open fails the identical way. It does when the
+    refusal is persistent (see `test_a_refused_root_open_still_reports_lane_unreadable_not_muted` and
+    `tests/test_cli.py::test_every_lane_command_refuses_a_root_it_cannot_use[watch-once-...]`), but a
+    TRANSIENT fault or a directory swapped back is free to have cleared by the time `scan_new` retries
+    the open — at which point a confirmed `False` here would have already told `dispatch_once` the
+    watcher is definitely not muted, with the real answer never established (reproduced in
+    `test_mute_unknown_at_the_root_probe_still_blocks_a_transient_lane_success`). It now raises
+    `MuteUnknown` instead, so the caller cannot reach that conclusion no matter what `scan_new` finds
+    a moment later."""
     inbox._ensure_tree(root)
 
     def boom(_root, **_k):
@@ -769,14 +776,17 @@ def test_a_refused_root_open_reads_as_not_muted_not_unknown(root, monkeypatch):
 
     monkeypatch.setattr(watch.inbox, "_open_root_dir", boom)
 
-    assert is_muted(root) is False, "a refused root open must not be reported as 'muted'"
+    with pytest.raises(watch.MuteUnknown):
+        is_muted(root)
 
 
 def test_an_unreadable_switch_blocks_the_launch_and_leaves_the_cursor_untouched(root, monkeypatch):
     """The reported failure: a refused switch stat used to read as "not muted", so the configured
     audit command launched and the cursor was saved with the pause state genuinely unknown. Fixed:
-    the tick degrades exactly like an explicit mute — no notify, no launch, cursor untouched — and
-    the loop survives to try again next tick."""
+    the tick degrades exactly like an explicit mute — no notify, no launch, cursor untouched — but is
+    reported as a refusal (`lane_unreadable`), not as `report.muted` (a confirmed, successful pause),
+    because the state was never actually confirmed. `watch --once` maps `lane_unreadable` to exit 2,
+    unlike the exit-0 a confirmed `report.muted` would get."""
     inbox.publish(valid_packet())
 
     def boom(_dir_fd, _name, **_k):
@@ -787,16 +797,19 @@ def test_an_unreadable_switch_blocks_the_launch_and_leaves_the_cursor_untouched(
     rec = Recorder()
     report = dispatch_once(root, audit_cmd="x", notify_fn=rec.notify, run_fn=rec.run)
 
-    assert report.muted is True
+    assert report.muted is False, "an unknown mute state is a refusal, not a confirmed mute"
+    assert report.lane_unreadable, "an unknown mute state must surface as a reportable refusal"
     assert rec.notes == [] and rec.commands == [], "an unknown mute state must launch nothing"
     assert load_cursor(root).packets == frozenset(), "an unknown mute state must not advance the cursor"
 
 
 def test_a_refused_root_open_still_reports_lane_unreadable_not_muted(root, monkeypatch):
-    """A refused root open must still launch nothing (every lane fails to open, so nothing is ever
-    seen as "new"), but it must reach the CLI as `lane_unreadable` — a rejection — not as `muted`, a
-    reported success. Collapsing the two here is the regression this pins: `watch --once` on a root
-    it cannot use has to exit non-zero, which depends on `report.muted` staying `False`."""
+    """A refused root open must still launch nothing, but it must reach the CLI as `lane_unreadable` —
+    a rejection — not as `muted`, a reported success. Collapsing the two here is the regression this
+    pins: `watch --once` on a root it cannot use has to exit non-zero, which depends on `report.muted`
+    staying `False`. The refusal is now caught at the mute check itself (`is_muted` raises
+    `MuteUnknown` before `scan_new` ever runs), rather than rediscovered independently by every lane —
+    the CLI-visible outcome (exit 2, a `lane_unreadable` entry naming the refusal) is unchanged."""
     inbox.publish(valid_packet())
 
     def boom(_root, **_k):
@@ -813,7 +826,43 @@ def test_a_refused_root_open_still_reports_lane_unreadable_not_muted(root, monke
     assert load_cursor(root).packets == frozenset(), "a refused root open must not advance the cursor"
 
 
-def test_loop_survives_an_unreadable_switch_without_launching(root, monkeypatch):
+def test_mute_unknown_at_the_root_probe_still_blocks_a_transient_lane_success(root, monkeypatch):
+    """The exact race the finding reproduced: `is_muted`'s root open refuses ONCE, but by the time
+    `scan_new` opens the root again (moments later, its own separate call) the fault has cleared and
+    every lane reads successfully, with a real packet sitting in `pending/`. Before the fix, `is_muted`
+    answered a confirmed ``False`` on its own failed probe, so `dispatch_once` proceeded as "not muted"
+    with the pause state never actually established — notifying, launching, and advancing the cursor
+    over a packet whose mute status was unknown. The fix must never reach any of that: the mute check
+    itself has to fail the tick before `scan_new` is even called, regardless of what `scan_new` would
+    have found."""
+    inbox.publish(valid_packet())
+
+    real_open_root_dir = watch.inbox._open_root_dir
+    calls = {"n": 0}
+
+    def flaky_once(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise watch.inbox.LaneUnreadable("the inbox root could not be opened: Input/output error")
+        return real_open_root_dir(*a, **k)
+
+    monkeypatch.setattr(watch.inbox, "_open_root_dir", flaky_once)
+
+    rec = Recorder()
+    report = dispatch_once(root, audit_cmd="x", notify_fn=rec.notify, run_fn=rec.run)
+
+    assert calls["n"] == 1, (
+        "scan_new must never run once the mute probe itself has failed — a later, unrelated success "
+        "must not retroactively confirm a state this tick never established"
+    )
+    assert report.muted is False and report.lane_unreadable, "a failed mute probe must be a refusal"
+    assert rec.notes == [] and rec.commands == [], "a transient-clearing race must still launch nothing"
+    assert load_cursor(root).packets == frozenset(), (
+        "a transient-clearing race must not advance the cursor over an unconfirmed mute state"
+    )
+
+
+def test_watch_loop_continues_after_an_unknown_mute_state(root, monkeypatch):
     """The loop must survive an unknown mute state indefinitely: it must not raise, must never count
     the pass as acted-on, and must keep re-checking the switch on every subsequent tick."""
     inbox.publish(valid_packet())

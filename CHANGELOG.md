@@ -17,6 +17,21 @@ All notable changes to this project are documented here. The format follows
   change and still surfaces as a reportable lane refusal, not as "muted" — nothing can launch on such
   a pass either way, since every lane fails to list as new, but the CLI's `watch --once` still needs
   to see it as a rejection.
+- **A refused mute probe could still be read as a confirmed boolean, and a transient one could smuggle
+  a launch past it.** The fix above answered a switch-stat refusal with `True` and a root-open refusal
+  with `False`, reasoning that `scan_new`'s own, separate, later root open would fail the identical way
+  and be caught downstream — but that assumed the SAME failure recurs on a DIFFERENT syscall moments
+  apart. A transient fault (`EIO`, `EACCES`, a directory swapped back into place) can clear between
+  `is_muted`'s own root open and `scan_new`'s, so a real pass could hit the refusal at the mute check,
+  then read every lane successfully a moment later, and proceed to notify, launch, and advance the
+  cursor with the pause state never actually established. `is_muted` now raises `MuteUnknown` for both
+  unknowable cases instead of answering either boolean, and `dispatch_once` catches it *before* calling
+  `scan_new` at all, so a transient-clearing race can no longer reach a side effect. The outcome is also
+  now reported as a `lane_unreadable` refusal (logged at error level — `watch --once` exits 2) rather
+  than as a confirmed `report.muted` (exit 0): reading a genuine unknown as a successful pause was
+  itself part of the gap, since it hid the fault from an operator instead of surfacing it. A root that
+  does not exist at all (`FileNotFoundError`) is unaffected — that is still a confirmed "not muted",
+  not an unknown one.
 - The structural `_safefs` guard (the test suite's own enforcement that every file operation in the
   package routes through the primitive) no longer misses a guarded operation reached through an
   import alias: `import os as fs; fs.open(...)`, `from os import open as raw_open; raw_open(...)`,
@@ -294,8 +309,9 @@ All notable changes to this project are documented here. The format follows
   than answering) when the mute switch's occupancy cannot be determined at all — `EIO`, `EACCES`, an
   unsupported filesystem — and that refusal was left uncaught, so it propagated out of `is_muted`,
   through `dispatch_once`, and killed `watch_loop`'s `while` on the first bad tick instead of costing
-  that one tick, in violation of `is_muted`'s own "never raises" contract. A switch that cannot be
-  examined is now treated the same as one that is not there, logged and reported `False`.
+  that one tick, in violation of `is_muted`'s own "never raises" contract at the time. A switch that
+  cannot be examined is now caught and reported rather than crashing the tick — the reported outcome
+  for that state has changed twice since (see the mute-probe entries under `[Unreleased]` above).
 - **The syscall sweep only ever faulted the *first* matching call**, so it could never drive a
   driver past an earlier occurrence of a syscall to reach a later one — which is exactly how the two
   findings above (the lock release, called *second* per publish after the acquire; the mute-switch

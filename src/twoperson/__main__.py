@@ -62,7 +62,7 @@ from .packet import (
     render_for_review,
     template_packet,
 )
-from .watch import DEFAULT_INTERVAL_SECONDS, dispatch_once, is_muted, set_muted, watch_loop
+from .watch import DEFAULT_INTERVAL_SECONDS, MuteUnknown, dispatch_once, is_muted, set_muted, watch_loop
 from .watchagent import WatchInstallError, install_watch_agent, watch_script_path
 from .signal import (
     MAX_HOOK_PAYLOAD_BYTES,
@@ -355,7 +355,11 @@ def _watch(args) -> int:
             print(f"watch: catch-up could not read a lane — {lane}", file=sys.stderr)
         return EXIT_REJECTED if report.lane_unreadable else EXIT_OK
     if args.status:
-        print(f"watch: {'OFF (muted)' if is_muted() else 'ON'}")
+        try:
+            print(f"watch: {'OFF (muted)' if is_muted() else 'ON'}")
+        except MuteUnknown as exc:
+            print(f"watch: could not determine mute state — {exc}", file=sys.stderr)
+            return EXIT_REJECTED
         return EXIT_OK
     if args.once:
         report = dispatch_once()
