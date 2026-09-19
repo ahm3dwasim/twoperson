@@ -545,18 +545,29 @@ def test_the_lane_is_opened_once_and_every_entry_is_stated_against_that_descript
     through ONE descriptor opened with `O_NOFOLLOW | O_DIRECTORY`, so nothing it returns depends on
     the path resolving the same way twice. The descriptor now comes from the chain — root first,
     then the lane relative to it — so the root cannot be re-resolved behind the listing's back
-    either; `_lane_dir_fd` is where both hops and both flags live.
+    either. `_lane_dir_fd` is the chain (both hops, in order); the lane hop's own flags live in
+    `_open_lane_at`, which is the one place a lane is opened, so `_ensure_tree` gets the same
+    refusal for the same syscall instead of a second, hand-copied `os.open`.
     """
     import inspect
 
     chain = inspect.getsource(inbox._lane_dir_fd)
-    assert "O_NOFOLLOW" in chain and "O_DIRECTORY" in chain, (
-        "the lane is not opened with the flags that refuse a symlink atomically"
-    )
-    assert "dir_fd=root_fd" in chain and "_open_root_dir" in chain, (
+    assert chain.count("_open_root_dir(") == 1, "the root is resolved more than once, or not at all"
+    assert "_open_lane_at(" in chain, (
         "the lane is opened by path, so the root above it is resolved by the kernel again"
     )
-    assert chain.count("os.open(") == 1, "the lane is resolved more than once"
+    assert chain.index("_open_root_dir(") < chain.index("_open_lane_at("), (
+        "the lane hop must be relative to a root descriptor that was opened FIRST"
+    )
+
+    lane_hop = inspect.getsource(inbox._open_lane_at)
+    assert "O_NOFOLLOW" in lane_hop and "O_DIRECTORY" in lane_hop, (
+        "the lane is not opened with the flags that refuse a symlink atomically"
+    )
+    assert "dir_fd=root_fd" in lane_hop, (
+        "the lane is named by path rather than addressed through the held root descriptor"
+    )
+    assert lane_hop.count("os.open(") == 1, "the lane is resolved more than once"
 
     source = inspect.getsource(inbox._lane_scan)
     assert source.count("_lane_dir_fd(") == 1, "the lane is resolved more than once"
@@ -565,14 +576,19 @@ def test_the_lane_is_opened_once_and_every_entry_is_stated_against_that_descript
 
 def test_ensure_tree_never_chmods_through_a_symlink(root, tmp_path):
     """`mkdir(exist_ok=True)` SUCCEEDS on a symlink to a directory, and `os.chmod` then followed it —
-    an ordinary `publish` rewrote the permissions of a directory outside the inbox."""
+    an ordinary `publish` rewrote the permissions of a directory outside the inbox.
+
+    The refusal is `LaneUnreadable` — a lane the chain cannot open — rather than a raw `OSError`: a
+    per-command `except OSError` is a hand-kept list, and `LaneUnreadable` is the type the CLI
+    boundary already turns into exit 2 for every command including ones not yet written.
+    """
     outside = tmp_path / "someone-elses-directory"
     outside.mkdir(mode=0o755)
     before = oct(outside.stat().st_mode)[-3:]
     root.mkdir(parents=True, exist_ok=True)
     (root / "pending").symlink_to(outside)
 
-    with pytest.raises(OSError):
+    with pytest.raises(inbox.LaneUnreadable):
         inbox._ensure_tree(root)
     assert oct(outside.stat().st_mode)[-3:] == before, (
         f"an outside directory's permissions were rewritten to {oct(outside.stat().st_mode)[-3:]}"
@@ -656,7 +672,7 @@ def test_a_lane_file_swapped_for_a_symlink_after_the_scan_is_refused_at_the_read
     published.unlink()                      # the exact swap the scan cannot prevent
     published.symlink_to(secret)
 
-    with pytest.raises(OSError):
+    with pytest.raises(inbox.LaneUnreadable):
         inbox._read_lane_file(published)
     assert secret.exists(), "the outside file must be untouched"
 
@@ -746,14 +762,14 @@ def test_a_symlinked_root_is_refused_by_the_read(root, tmp_path):
     through_the_link = root / "pending" / inbox._lane_scan(real, "pending").files[0].name
     assert through_the_link.exists(), "the probe path does not resolve; it would prove nothing"
 
-    with pytest.raises(OSError):
+    with pytest.raises(inbox.LaneUnreadable):
         inbox._read_lane_file(through_the_link)
 
 
 def test_a_symlinked_root_is_refused_by_the_claim(root, tmp_path):
     """`claim_next` is a listing plus a move; neither may be answered by an outside directory."""
     _symlinked_root(root, tmp_path)
-    with pytest.raises((OSError, inbox.LaneUnreadable)):
+    with pytest.raises(inbox.LaneUnreadable):
         inbox.claim_next(root)
 
 
@@ -762,7 +778,7 @@ def test_a_symlinked_root_is_refused_by_the_publish(root, tmp_path):
     real = _symlinked_root(root, tmp_path)
     before = sorted(p.name for p in (real / "pending").iterdir())
 
-    with pytest.raises(OSError):
+    with pytest.raises(inbox.LaneUnreadable):
         inbox.publish(valid_packet(packet_id="through-the-link"), root=root)
 
     assert sorted(p.name for p in (real / "pending").iterdir()) == before, (
@@ -778,7 +794,7 @@ def test_ensure_tree_refuses_a_symlinked_root(root, tmp_path):
     before = oct(real.stat().st_mode)[-3:]
     root.symlink_to(real)
 
-    with pytest.raises(OSError):
+    with pytest.raises(inbox.LaneUnreadable):
         inbox._ensure_tree(root)
     assert oct(real.stat().st_mode)[-3:] == before, "an outside directory's mode was rewritten"
     assert list(real.iterdir()) == [], "the inbox tree was created outside the inbox root"
@@ -799,7 +815,7 @@ def test_a_lane_swapped_for_a_symlink_after_the_listing_is_refused_at_the_read(r
     shutil.rmtree(root / "pending")
     (root / "pending").symlink_to(outside)
 
-    with pytest.raises(OSError):
+    with pytest.raises(inbox.LaneUnreadable):
         inbox._read_lane_file(published)
     assert json.loads(smuggled.read_text(encoding="utf-8"))["packet_id"] == "smuggled", (
         "content from outside the inbox reached the reader"
@@ -818,7 +834,7 @@ def test_a_lane_swapped_for_a_symlink_after_the_listing_is_refused_at_the_move(r
     shutil.rmtree(root / "pending")
     (root / "pending").symlink_to(outside)
 
-    with pytest.raises(OSError):
+    with pytest.raises(inbox.LaneUnreadable):
         inbox._move_lane_entry(published, "claimed")
 
     assert smuggled.exists(), "a file from outside the inbox was moved into the claimed lane"
@@ -850,7 +866,7 @@ def test_a_lane_swapped_for_a_symlink_between_the_scan_and_the_claim_is_refused(
         return packet
 
     monkeypatch.setattr(inbox, "_load", swap_the_lane_then_load)
-    with pytest.raises(OSError):
+    with pytest.raises(inbox.LaneUnreadable):
         inbox.claim_next(root)
 
     assert smuggled.exists(), "a file from outside the inbox was claimed"

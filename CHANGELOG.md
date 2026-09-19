@@ -40,6 +40,22 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The refusal for a lane that cannot be *opened* is raised where it happens, so no command turns
+  it into a stack trace.** The entry above made a lane that cannot be *listed* fail closed, but a
+  lane the descriptor chain cannot *open* — a symlinked `claimed/`, a symlinked root — was answered
+  by `os.open` with a raw `OSError`, which is neither a `PacketError` nor what the boundary net
+  catches. `twoperson next` therefore died with `NotADirectoryError` and exit `1`, the code that
+  means "nothing to do": the refusal delivered as the empty answer it exists to be told apart from.
+  The chain now raises `LaneUnreadable` itself, at the root hop, the lane hop, and the entry hop
+  (read and create), so every command — including ones not yet written — gets the refusal with exit
+  `2`. `FileNotFoundError` is deliberately left unconverted: it is the documented answer for the two
+  non-hostile cases, a tree `_ensure_tree` has not created yet (provably empty) and an entry another
+  process already moved (a lost race). This is also a behaviour change for callers that caught
+  `OSError` around a lane operation: they now see `LaneUnreadable`, which several readers had to
+  distinguish from a *bad file* — `_next`, `read_signals`, `read_verdicts`, `read_advice` and
+  `_next_consult` would otherwise have quarantined a good packet because the lane it sat in could not
+  be opened, and `find_packet`, `_all_verdicts`, `verdicted_packet_ids` and `answered_consult_ids`
+  would have silently under-reported, which for the latter two means re-auditing resolved work.
 - **An inbox lane that cannot be listed is refused, not answered as an empty one.** Listing a lane
   returned `[]` identically for a lane that was empty and for a lane that could not be read, so a
   permission wall or a hand-dropped symlink made `has_pending()` report "no work waiting" and

@@ -304,3 +304,224 @@ def test_watch_once_reports_a_refused_lane_and_exits_nonzero(root, capsys):
     assert code != 0, "watch --once reported success on a lane it was refused"
     assert "lane refused" in captured.err
     assert "nothing new" not in captured.out or "COULD READ" in captured.out
+
+
+# --------------------------------------------------------------------------------------------
+# ...and the refusal is RAISED at the source, so it is not a hand-kept list either
+#
+# The net above only helps the commands that reach a reader which fails closed. A lane the chain
+# cannot OPEN is a different hop: `os.open` answers with a raw `OSError`, which no per-command
+# `except OSError` covers and the boundary net does not catch. So a symlinked lane — or a symlinked
+# ROOT — arrived as a stack trace with exit 1, the code that means "nothing to do": the refusal
+# reported as the empty answer it exists to be told apart from, one level below where the readers
+# were fixed for it. The fix is that the chain raises `LaneUnreadable` itself, which is what makes
+# this list exhaustive rather than remembered.
+# --------------------------------------------------------------------------------------------
+
+# Every subcommand that reaches a lane, with the lane it reaches FIRST. `verify` (for a packet that
+# shipped nothing), `template`, `consult-template`, `consult-verify` and `install-hook` read no lane
+# at all and are deliberately absent — parametrizing them would assert a refusal that is not due.
+# `install-watch` is absent for a different reason: its writing path does call `_ensure_tree`, but it
+# then installs a launchd agent on the machine running the test.
+_LANE_COMMANDS = (
+    pytest.param(["check"], "pending", id="check"),
+    pytest.param(["list"], "pending", id="list"),
+    pytest.param(["next"], "pending", id="next"),
+    pytest.param(["next", "--peek"], "pending", id="next-peek"),
+    pytest.param(["tier"], "pending", id="tier"),
+    pytest.param(["watch", "--once"], "pending", id="watch-once"),
+    pytest.param(["publish", "--from", "@packet"], "pending", id="publish"),
+    pytest.param(["verdict", "--packet", "any-id", "--decision", "Approve"], "pending",
+                 id="verdict"),
+    pytest.param(["verdicts"], "verdicts", id="verdicts"),
+    pytest.param(["consult-check"], "consult", id="consult-check"),
+    pytest.param(["consult-list"], "consult", id="consult-list"),
+    pytest.param(["consult-next"], "consult", id="consult-next"),
+    pytest.param(["consult-publish", "--from", "@consult"], "consult", id="consult-publish"),
+    pytest.param(["consult-advice"], "advice", id="consult-advice"),
+    pytest.param(["consult-advise", "--consult", "any-id", "--recommendation", "advise me"],
+                 "advice", id="consult-advise"),
+)
+
+#: The chain's own wording for a hop it could not make (`inbox._refusal`). Asserted rather than the
+#: per-command wrapper text, which differs: `check` prints "cannot determine whether work is
+#: waiting", `publish` prints "publish failed", `verdict` prints "verdict rejected". A command that
+#: refused for an unrelated reason (a schema failure, a bad argument) would satisfy "exit 2" on its
+#: own and the test would pass while proving nothing about the lane.
+_CHAIN_REFUSAL = "could not be opened"
+
+
+def _materialize(argv, tmp_path):
+    """Replace the ``@packet`` / ``@consult`` placeholders with files holding valid documents.
+
+    They must be VALID: a packet the schema rejects would exit 2 for the wrong reason.
+    """
+    from twoperson.consult import build_consult, dumps_consult
+
+    out = []
+    for token in argv:
+        if token == "@packet":
+            out.append(str(_write(tmp_path, valid_packet())))
+        elif token == "@consult":
+            path = tmp_path / "consult.json"
+            path.write_text(dumps_consult(build_consult(question="is this reachable?")),
+                            encoding="utf-8")
+            out.append(str(path))
+        else:
+            out.append(token)
+    return out
+
+
+def _real_inbox(root):
+    """A REAL, populated inbox for ``root`` to be a symlink TO.
+
+    It must hold real work: an inbox with nothing in it also answers 0 or 1, so a command that
+    silently followed the link would be indistinguishable from one that refused.
+    """
+    real = root.parent / "a-real-inbox"
+    real.mkdir()
+    inbox._ensure_tree(real)
+    inbox.publish(valid_packet(), root=real)
+    return real
+
+
+@pytest.mark.parametrize("placement", ["a symlinked root", "a symlinked lane"])
+@pytest.mark.parametrize("argv,lane", _LANE_COMMANDS)
+def test_every_lane_command_refuses_a_symlinked_root_or_lane(root, tmp_path, capsys, argv, lane,
+                                                             placement):
+    """The property, over every command that reaches a lane: exit 2 and no stack trace.
+
+    Both placements are the same defect at two heights. A symlinked ROOT is refused by the chain's
+    first hop; a symlinked LANE by the second. The second is also the case a per-command guard
+    misses in the other direction: for the writing commands the lane is not one they came to READ —
+    `_ensure_tree` holds every lane it walks past — so `publish` refuses a broken `claimed/` that no
+    reader of its own ever asked for.
+    """
+    if placement == "a symlinked root":
+        root.symlink_to(_real_inbox(root))
+    else:
+        inbox._ensure_tree(root)
+        inbox.publish(valid_packet(), root=root)
+        outside = root.parent / "outside"       # must EXIST: a dangling link is not a refusal
+        outside.mkdir()
+        (outside / "smuggled.json").write_text(json.dumps(valid_packet(packet_id="smuggled")),
+                                               encoding="utf-8")
+        (root / lane).rename(root / f"{lane}-real")
+        (root / lane).symlink_to(outside)
+
+    code = main(_materialize(argv, tmp_path))
+    captured = capsys.readouterr()
+    assert code == 2, (
+        f"{' '.join(argv)}: {placement} must be a rejection (2), got {code} with "
+        f"stderr={captured.err!r}"
+    )
+    assert "Traceback" not in captured.err, f"{' '.join(argv)}: a refusal arrived as a stack trace"
+    assert _CHAIN_REFUSAL in captured.err, (
+        f"{' '.join(argv)}: refused for something other than the lane, or said nothing about it; "
+        f"got {captured.err!r}"
+    )
+
+
+# The commands that WRITE. Each one ends in `_ensure_tree`, which opens and holds EVERY lane in
+# `_SUBDIRS` — so these are the commands that reach a lane they never came to read at all.
+#
+# This is the reported defect, and the two placements above do NOT cover it: a symlinked `pending/`
+# is refused by the reader these commands call FIRST, so they exit 2 for a reason that has nothing
+# to do with the hop that was broken. Symlinking a lane further down the list is what isolates it —
+# `next` finds a perfectly good packet in `pending/`, claims it, and only then walks into `claimed/`.
+_WRITING_COMMANDS = (
+    pytest.param(["publish", "--from", "@packet"], id="publish"),
+    pytest.param(["next"], id="next"),
+    pytest.param(["verdict", "--packet", "@packet_id", "--decision", "Approve"], id="verdict"),
+    pytest.param(["consult-publish", "--from", "@consult"], id="consult-publish"),
+    pytest.param(["consult-next"], id="consult-next"),
+    pytest.param(["consult-advise", "--consult", "@consult_id", "--recommendation", "advise me"],
+                 id="consult-advise"),
+    pytest.param(["signals", "--ack"], id="signals-ack"),
+    pytest.param(["verdicts", "--ack"], id="verdicts-ack"),
+    pytest.param(["consult-advice", "--ack"], id="consult-advice-ack"),
+)
+
+
+def _populate(root):
+    """One of everything, published BEFORE any lane is tampered with.
+
+    The `--ack` commands read their lane and return early when it is empty, so an empty inbox would
+    exit 1 and prove nothing: they have to have something to acknowledge before they reach the
+    `_ensure_tree` that holds `claimed/`. Returns the ids the argv placeholders need.
+    """
+    from twoperson.advice import build_advice
+    from twoperson.consult import build_consult
+    from twoperson.signal import build_signal
+    from twoperson.verdict import build_verdict
+
+    inbox._ensure_tree(root)
+    packet = valid_packet()
+    inbox.publish(packet, root=root)
+    inbox.publish_signal(build_signal(session_id="sess-populated"), root=root)
+    consult = build_consult(question="is this reachable?")
+    inbox.publish_consult(consult, root=root)
+    inbox.publish_advice(build_advice(consult_id=consult["consult_id"],
+                                      recommendation="advise me"), root=root)
+    inbox.publish_verdict(build_verdict(packet_id=packet["packet_id"], decision="Approve",
+                                        head_sha=packet["git"]["head_sha"]), root=root)
+    return packet["packet_id"], consult["consult_id"]
+
+
+@pytest.mark.parametrize("argv", _WRITING_COMMANDS)
+def test_a_writing_command_refuses_a_lane_it_only_walks_past(root, tmp_path, capsys, argv):
+    """`claimed/` is a lane none of these commands came to READ.
+
+    `publish` writes to `staging/` then `pending/`; `next` reads `pending/` and moves to `claimed/`;
+    the `--ack` commands move out of `signals/`, `verdicts/` and `advice/`. None of them opens
+    `claimed/` on purpose — `_ensure_tree` holds it only because a lane that cannot be opened is a
+    lane whose emptiness nobody can vouch for, and the lane it is about to be handed has to be one
+    of a set that is wholly readable. Before the chain raised at the source, this hop answered with
+    a raw `NotADirectoryError` and `next` reported the refusal as a stack trace with exit 1.
+    """
+    packet_id, consult_id = _populate(root)
+    outside = root.parent / "outside"           # must EXIST: a dangling link is not a refusal
+    outside.mkdir()
+    (root / "claimed").rmdir()
+    (root / "claimed").symlink_to(outside)
+
+    resolved = [t.replace("@packet_id", packet_id).replace("@consult_id", consult_id)
+                for t in _materialize(argv, tmp_path)]
+    code = main(resolved)
+    captured = capsys.readouterr()
+    assert code == 2, (
+        f"{' '.join(argv)}: a broken lane it only walks past must be a rejection (2), got {code} "
+        f"with stderr={captured.err!r}"
+    )
+    assert "Traceback" not in captured.err, f"{' '.join(argv)}: a refusal arrived as a stack trace"
+    assert _CHAIN_REFUSAL in captured.err and "'claimed'" in captured.err, (
+        f"{' '.join(argv)}: expected a refusal naming the 'claimed' lane, got {captured.err!r}"
+    )
+    assert list(outside.iterdir()) == [], "work was moved into a lane that pointed outside the inbox"
+
+
+@pytest.mark.parametrize("placement", ["a symlinked root", "a symlinked lane"])
+def test_the_signal_lane_opts_out_of_the_refusal_without_tracebacking(root, tmp_path, capsys,
+                                                                      placement):
+    """The two commands the property deliberately does NOT give exit 2 to, pinned so that is a
+    decision and not an oversight.
+
+    `signal` runs from the Stop hook, where a 2 means "block stopping" — it degrades to 1 by design.
+    `signals` reads the one lane that opts out of fail-closed (a signal gates nothing), so it
+    under-reports rather than refusing. Neither may traceback, and both were exit 1 before this
+    change too: what changed is that the exit is now reached by an answer rather than by a crash.
+    """
+    if placement == "a symlinked root":
+        root.symlink_to(_real_inbox(root))
+    else:
+        inbox._ensure_tree(root)
+        outside = root.parent / "outside"       # must EXIST: a dangling link is not a refusal
+        outside.mkdir()
+        (root / "pending").rmdir()
+        (root / "pending").symlink_to(outside)
+
+    for argv in (["signal"], ["signals"]):
+        code = main(argv)
+        captured = capsys.readouterr()
+        assert code == 1, f"{' '.join(argv)}: expected the documented 1, got {code}"
+        assert "Traceback" not in captured.err, f"{' '.join(argv)}: arrived as a stack trace"

@@ -56,6 +56,11 @@ Safety properties this module owns:
   :class:`~twoperson.packet.LaneUnreadable` rather than answering "nothing here" — a poller that
   cannot tell those apart goes quiet on exactly the tampering the refusal exists to catch. The one
   lane that opts out is `signals/`, which gates nothing; it says so in its own docstring.
+* **A refusal is raised where it happens, not where it is remembered.** The descriptor chain itself
+  raises ``LaneUnreadable`` for any hop it cannot make, so a command reaches the refusal through the
+  operations it already calls rather than through a per-command `except` clause somebody has to
+  remember to add. The single exception is `FileNotFoundError`, which is the documented "not created
+  yet" / "already moved" answer and stays the caller's to interpret.
 
 See `docs/PROTOCOL.md` for the runbook.
 """
@@ -309,7 +314,11 @@ def _ensure_tree(root: Path) -> Path:
                 os.mkdir(name, dir_fd=root_fd)
             except FileExistsError:
                 pass                    # already there; the open below decides whether it is usable
-            lane_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=root_fd)
+            # `mkdir(exist_ok=True)`-style success above is NOT the check: it is an "already exists"
+            # answer that a lane replaced by a symlink also gives. The open is what refuses, and it
+            # refuses as `LaneUnreadable` — this is the hop every writing command takes, so leaving
+            # it raw is how `next` came to report a refusal as a traceback and exit 1.
+            lane_fd = _open_lane_at(root_fd, name)
             try:
                 _fchmod_dir(lane_fd)
             finally:
@@ -371,11 +380,55 @@ def _assert_inside(root: Path, target: Path) -> Path:
 # root are the operator's own layout and are deliberately out of scope: the inbox does not own
 # them, cannot know what they are for, and refusing a checkout reached through a symlinked parent
 # would refuse ordinary setups.
+#
+# ONE EXCEPTION TYPE ESCAPES, and it escapes as a refusal. A hop this chain cannot make is a
+# refusal, not a lost race and not a crash, so it surfaces as `LaneUnreadable` — the type the CLI
+# boundary net and every lane reader already handle. Guarding each command separately would be a
+# hand-kept list, and the commands that had guards would be the ones somebody remembered; raising
+# the refusal HERE is what covers the commands not yet written. `FileNotFoundError` is deliberately
+# NOT converted: it is the documented answer for the two ordinary, non-hostile cases — a tree
+# `_ensure_tree` has not created yet (provably empty), and an entry another process already moved
+# (a lost race) — and both are the caller's to interpret. Everything else the kernel can answer
+# here (a symlinked lane, a lane that is a regular file, a permission wall) is a refusal.
 # --------------------------------------------------------------------------------------------
 
+def _refusal(what: str, exc: OSError) -> LaneUnreadable:
+    """One refusal, spelled the same way at every hop of the chain.
+
+    ``what`` is built from the module's own lane names and the caller's root — never from a
+    dropped entry's name — so the message cannot be forged by whoever dropped it. It reaches a
+    terminal through `LaneScan.reason` and the CLI, so the errno's own `strerror` is carried rather
+    than the exception's `repr`, which would drag a path and a traceback into one line.
+    """
+    return LaneUnreadable(f"{what} could not be opened: {exc.strerror or type(exc).__name__}")
+
+
+def _open_lane_at(root_fd: int, name: str) -> int:
+    """Open one lane relative to a root descriptor ALREADY HELD, or refuse.
+
+    `O_NOFOLLOW | O_DIRECTORY` rejects a symlink (`ELOOP` on Linux, `ENOTDIR` on macOS), a regular
+    file, a FIFO and a device in the one syscall that would otherwise have followed it, so no
+    enumeration of the ways a lane can fail to be a directory has to be complete. Taking the parent
+    descriptor rather than a path is what lets `_ensure_tree` create every lane from ONE root
+    resolution: handing it `root / name` would re-resolve the root per lane, and a root swapped
+    part-way through that loop would have had the remaining lanes created somewhere else.
+    """
+    try:
+        return os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=root_fd)
+    except FileNotFoundError:
+        raise               # never created here: the caller decides, and `_lane_scan` reads it empty
+    except OSError as exc:
+        raise _refusal(f"the lane {name!r}", exc) from exc
+
+
 def _open_root_dir(root: Path) -> int:
-    """The inbox root's own descriptor, or `OSError` if the root is not a real directory."""
-    return os.open(root, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    """The inbox root's own descriptor, or `LaneUnreadable` when the root is not a real directory."""
+    try:
+        return os.open(root, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    except FileNotFoundError:
+        raise               # nothing has ever been published here — a provably empty inbox
+    except OSError as exc:
+        raise _refusal(f"the inbox root {root}", exc) from exc
 
 
 def _lane_dir_fd(root: Path, lane: str) -> int:
@@ -385,10 +438,14 @@ def _lane_dir_fd(root: Path, lane: str) -> int:
     opens it, and opening it relative to the root's descriptor means the root is held for that hop
     too. Every read, rename and write below is addressed RELATIVE to the descriptor this returns,
     so no operation depends on a path meaning the same thing twice.
+
+    :raises LaneUnreadable: the root or the lane is not a real, openable directory.
+    :raises FileNotFoundError: the root or the lane does not exist — the caller's own "not created
+        yet" / "already gone" answer, which this layer deliberately does not reinterpret.
     """
     root_fd = _open_root_dir(root)
     try:
-        return os.open(lane, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=root_fd)
+        return _open_lane_at(root_fd, lane)
     finally:
         os.close(root_fd)
 
@@ -412,11 +469,20 @@ def _open_lane_entry(path: Path) -> int:
     safely and then read from outside the inbox once the *lane* above it was swapped for a symlink
     in the window between the listing and the read. The chain is root -> lane -> entry, and each hop
     is refused in the syscall that would have followed it.
+
+    :raises LaneUnreadable: any hop refused — including an ENTRY that `O_NOFOLLOW` refuses, which is
+        the same refusal one level down rather than a different kind of event.
+    :raises FileNotFoundError: some hop is already gone; the caller decides what that means.
     """
     root, lane, name = _split_lane_path(path)
     lane_fd = _lane_dir_fd(root, lane)
     try:
-        return os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=lane_fd)
+        try:
+            return os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=lane_fd)
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise _refusal(f"the entry {_safe_name(name)!r} in lane {lane!r}", exc) from exc
     finally:
         os.close(lane_fd)
 
@@ -518,13 +584,24 @@ def _write_lane_file(path: Path, body: bytes) -> None:
     Used for the `.reason.txt` recorded beside a quarantined packet. `Path.write_text` resolves the
     lane again, so a lane swapped for a symlink would have had the reason — and only the reason —
     written outside the inbox.
+
+    The create is refused the same way the read side is: a `.reason.txt` name pre-created as a
+    symlink is refused by `O_NOFOLLOW`, and that refusal is a `LaneUnreadable` rather than a raw
+    `ELOOP`. It is reachable from an ordinary `next` — a malformed packet is quarantined on the way
+    past, and the quarantine writes this file — so leaving it raw hands the operator a traceback for
+    a lane that was tampered with, which is the one thing a refusal exists to report legibly.
     """
     root, lane, name = _split_lane_path(path)
     _assert_plain_name(name)
     lane_fd = _lane_dir_fd(root, lane)
     try:
-        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600,
-                     dir_fd=lane_fd)
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600,
+                         dir_fd=lane_fd)
+        except FileNotFoundError:
+            raise            # O_CREAT makes this unreachable; kept so the rule has no exception
+        except OSError as exc:
+            raise _refusal(f"the entry {_safe_name(name)!r} in lane {lane!r}", exc) from exc
         try:
             _write_all(fd, body)
         finally:
@@ -660,6 +737,12 @@ def find_packet(packet_id: str, root: Path | str | None = None) -> tuple[str, Pa
         for path in _lane_files(root, lane):
             try:
                 packet = _load(path)
+            except LaneUnreadable:
+                # Per-FILE tolerance must not become per-LANE tolerance. "Skip a file I cannot
+                # parse" is safe; "answer None because a lane refused me" makes this function state
+                # that a packet nobody can see does not exist — and its answer is what makes a
+                # verdict *about something*, so a silent None here is a verdict bound to nothing.
+                raise
             except (PacketError, OSError):
                 continue
             if packet["packet_id"] == packet_id:
@@ -676,6 +759,11 @@ def _all_verdicts(root: Path | str | None) -> list[dict]:
                 if _lane_entry_size(path) > MAX_VERDICT_BYTES:
                     continue
                 out.append(loads_verdict(_read_lane_file(path)))
+            except LaneUnreadable:
+                # Same line as `find_packet`: the consumer here is `assert_review_ref_resolves`,
+                # which answers "no verdict by that id exists" — under-reporting a SHIP GATE. A lane
+                # that refused must decline to answer, never answer short.
+                raise
             except (PacketError, OSError):
                 continue
     return out
@@ -898,10 +986,13 @@ def _lane_scan(root: Path | str | None, lane: str) -> LaneScan:
         fd = _lane_dir_fd(directory, lane)
     except FileNotFoundError:
         return LaneScan(files=(), refused=(), complete=True)   # never created: provably empty
-    except OSError as exc:
-        return LaneScan(files=(), refused=(f"<the lane could not be opened: "
-                                           f"{exc.strerror or type(exc).__name__}>",),
-                        complete=False)
+    except (LaneUnreadable, OSError) as exc:
+        # This function is the layer whose JOB is to report a refusal rather than raise one, so it
+        # catches the refusal `_lane_dir_fd` now raises and turns it back into an incomplete scan.
+        # Catching only `OSError` here would let `LaneUnreadable` — which is a `PacketError`, not an
+        # `OSError` — sail past this handler and out of every caller that reads a scan instead of a
+        # lane, turning the one lane that must stay tolerant (`signals/`) into a raising one.
+        return LaneScan(files=(), refused=(f"<{exc}>",), complete=False)
 
     files: list[Path] = []
     refused: list[str] = []
@@ -988,6 +1079,13 @@ def _next(root: Path | str | None, *, claim: bool) -> Claimed | None:
     for path in pending(directory):
         try:
             packet = _load(path)
+        except LaneUnreadable:
+            # `_load` reads through the descriptor chain, so a lane refused mid-read arrives as a
+            # `LaneUnreadable` — which IS a `PacketError`. Without this branch the handler below
+            # would catch it and QUARANTINE a good packet because the lane it sat in could not be
+            # opened: a refusal turned into a verdict on the packet. Re-raised, the packet stays
+            # where it is and the operator gets the refusal.
+            raise
         except PacketError as exc:
             quarantine(path, str(exc), root=directory)
             continue
@@ -1106,6 +1204,8 @@ def read_signals(root: Path | str | None = None) -> list[tuple[Path, dict]]:
             if size > MAX_SIGNAL_BYTES:
                 raise PacketError(f"signal: size {size} exceeds the {MAX_SIGNAL_BYTES}-byte limit")
             out.append((path, loads_signal(_read_lane_file(path))))
+        except LaneUnreadable:
+            raise       # a refused lane is not a bad file: never quarantine over it (see `_next`)
         except PacketError as exc:
             quarantine(path, str(exc), root=directory)
         except OSError:  # vanished or unreadable between listing and load — nothing to report
@@ -1181,6 +1281,8 @@ def read_verdicts(root: Path | str | None = None) -> list[tuple[Path, dict]]:
             if size > MAX_VERDICT_BYTES:
                 raise PacketError(f"verdict: size {size} exceeds the {MAX_VERDICT_BYTES}-byte limit")
             out.append((path, loads_verdict(_read_lane_file(path))))
+        except LaneUnreadable:
+            raise       # a refused lane is not a bad file: never quarantine over it (see `_next`)
         except PacketError as exc:
             quarantine(path, str(exc), root=directory)
         except OSError:  # vanished or unreadable between listing and load — nothing to report
@@ -1261,6 +1363,8 @@ def verdicted_packet_ids(root: Path | str | None = None) -> frozenset[str]:
             if size > MAX_VERDICT_BYTES:
                 continue
             verdict = loads_verdict(_read_lane_file(path))
+        except LaneUnreadable:
+            raise       # a refused lane must not shrink this set: short reads back as "unresolved"
         except (PacketError, OSError):
             continue
         packet_id = verdict.get("packet_id")
@@ -1299,6 +1403,8 @@ def _next_consult(root: Path | str | None, *, claim: bool) -> Claimed | None:
     for path in pending_consults(directory):
         try:
             consult = _load_consult(path)
+        except LaneUnreadable:
+            raise       # a refused lane is not a bad file: never quarantine over it (see `_next`)
         except PacketError as exc:
             quarantine(path, str(exc), root=directory)
             continue
@@ -1390,6 +1496,8 @@ def read_advice(root: Path | str | None = None) -> list[tuple[Path, dict]]:
             if size > MAX_ADVICE_BYTES:
                 raise PacketError(f"advice: size {size} exceeds the {MAX_ADVICE_BYTES}-byte limit")
             out.append((path, loads_advice(_read_lane_file(path))))
+        except LaneUnreadable:
+            raise       # a refused lane is not a bad file: never quarantine over it (see `_next`)
         except PacketError as exc:
             quarantine(path, str(exc), root=directory)
         except OSError:  # vanished or unreadable between listing and load — nothing to report
@@ -1444,6 +1552,8 @@ def answered_consult_ids(root: Path | str | None = None) -> frozenset[str]:
             if size > MAX_ADVICE_BYTES:
                 continue
             advice = loads_advice(_read_lane_file(path))
+        except LaneUnreadable:
+            raise       # a refused lane must not shrink this set: short reads back as "unanswered"
         except (PacketError, OSError):
             continue
         consult_id = advice.get("consult_id")
