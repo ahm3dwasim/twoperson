@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.fixtures import packet_for, valid_packet
+from tests.fixtures import packet_for, publish_derived, valid_packet
 from twoperson import inbox
 from twoperson.__main__ import main
 from twoperson.packet import PacketError
@@ -40,7 +40,7 @@ def test_the_cli_refuses_an_approval_for_a_nonexistent_packet(root, capsys):
 
 
 def test_an_approval_must_name_the_packets_own_head(root):
-    packet_for("pkt-1", head_sha="0900128")
+    packet_for("pkt-1", head_sha="0900128", derived=True)
     with pytest.raises(PacketError) as excinfo:
         inbox.publish_verdict(build_verdict(packet_id="pkt-1", decision="Approve", head_sha="abcdef0"))
     assert "binds to the packet's own head" in str(excinfo.value)
@@ -48,20 +48,20 @@ def test_an_approval_must_name_the_packets_own_head(root):
 
 def test_a_request_changes_verdict_does_not_need_a_matching_head(root):
     """Only a ship-unlocking decision binds to a sha; a rejection may be recorded against `unknown`."""
-    packet_for("pkt-2", head_sha="0900128")
+    packet_for("pkt-2", head_sha="0900128", derived=True)
     path = inbox.publish_verdict(build_verdict(packet_id="pkt-2", decision="Request changes"))
     assert path.exists()
 
 
 def test_the_cli_defaults_head_to_the_packets_head(root, capsys):
-    packet_for("pkt-3", head_sha="0900128")
+    packet_for("pkt-3", head_sha="0900128", derived=True)
     assert main(["verdict", "--packet", "pkt-3", "--decision", "Approve"]) == 0
     (_, verdict), = inbox.read_verdicts()
     assert verdict["head_sha"] == "0900128"
 
 
 def test_a_verdict_may_answer_a_claimed_or_audited_packet(root):
-    packet_for("pkt-4", head_sha="0900128")
+    packet_for("pkt-4", head_sha="0900128", derived=True)
     claimed = inbox.claim_next()
     assert inbox.publish_verdict(build_verdict(packet_id="pkt-4", decision="Approve", head_sha="0900128"))
     inbox.archive_claimed(claimed.path)
@@ -82,40 +82,40 @@ def _pushed(review_ref: str, head: str = "0900128", **flags) -> dict:
 
 def test_a_push_citing_a_verdict_that_does_not_exist_is_refused(root):
     with pytest.raises(PacketError) as excinfo:
-        inbox.publish(_pushed("vdt-20260101T000000Z-00000000"))
+        publish_derived(_pushed("vdt-20260101T000000Z-00000000"))
     assert "not the id of any verdict" in str(excinfo.value)
     assert not inbox.pending()
 
 
 def test_a_push_citing_a_request_changes_verdict_is_refused(root):
-    packet_for("pkt-5", head_sha="0900128")
+    packet_for("pkt-5", head_sha="0900128", derived=True)
     path = inbox.publish_verdict(build_verdict(packet_id="pkt-5", decision="Request changes"))
     ref = path.stem
     with pytest.raises(PacketError) as excinfo:
-        inbox.publish(_pushed(ref))
+        publish_derived(_pushed(ref))
     assert "does not unlock a ship" in str(excinfo.value)
 
 
 def test_a_push_citing_an_approval_for_a_different_head_is_refused(root):
-    packet_for("pkt-6", head_sha="0900128")
+    packet_for("pkt-6", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(build_verdict(packet_id="pkt-6", decision="Approve", head_sha="0900128")).stem
     with pytest.raises(PacketError) as excinfo:
-        inbox.publish(_pushed(ref, head="abcdef0"))
+        publish_derived(_pushed(ref, head="abcdef0"))
     assert "different commit" in str(excinfo.value)
 
 
 def test_a_push_citing_a_real_approval_for_the_same_head_is_accepted(root):
-    packet_for("pkt-7", head_sha="0900128")
+    packet_for("pkt-7", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(build_verdict(packet_id="pkt-7", decision="Approve", head_sha="0900128")).stem
-    assert inbox.publish(_pushed(ref)).exists()
+    assert publish_derived(_pushed(ref)).exists()
 
 
 def test_an_acknowledged_verdict_still_resolves(root):
     """Acking moves a verdict to verdicts_seen/; a later ship report must still be able to cite it."""
-    packet_for("pkt-8", head_sha="0900128")
+    packet_for("pkt-8", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(build_verdict(packet_id="pkt-8", decision="Approve", head_sha="0900128")).stem
     inbox.ack_verdicts([p for p, _ in inbox.read_verdicts()])
-    assert inbox.publish(_pushed(ref)).exists()
+    assert publish_derived(_pushed(ref)).exists()
 
 
 def test_verify_also_resolves_the_reference_without_writing(root, tmp_path, capsys):
@@ -133,21 +133,21 @@ def test_verify_also_resolves_the_reference_without_writing(root, tmp_path, caps
 def test_a_deploy_or_restart_citing_no_real_verdict_is_refused(root, effect):
     """Reviewer r2 P0: gating only `pushed` let `deployed=true` through with review_ref=unknown."""
     with pytest.raises(PacketError):
-        inbox.publish(_pushed("vdt-20260101T000000Z-00000000", **{effect: True}))
+        publish_derived(_pushed("vdt-20260101T000000Z-00000000", **{effect: True}))
     assert not inbox.pending()
 
 
 @pytest.mark.parametrize("effect", ["deployed", "restarted"])
 def test_a_deploy_or_restart_citing_an_approval_for_a_different_head_is_refused(root, effect):
-    packet_for("pkt-9", head_sha="0900128")
+    packet_for("pkt-9", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(build_verdict(packet_id="pkt-9", decision="Approve", head_sha="0900128")).stem
     with pytest.raises(PacketError) as excinfo:
-        inbox.publish(_pushed(ref, head="abcdef0", **{effect: True}))
+        publish_derived(_pushed(ref, head="abcdef0", **{effect: True}))
     assert "different commit" in str(excinfo.value)
 
 
 @pytest.mark.parametrize("effect", ["deployed", "restarted"])
 def test_a_deploy_or_restart_citing_a_real_approval_is_accepted(root, effect):
-    packet_for("pkt-10", head_sha="0900128")
+    packet_for("pkt-10", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(build_verdict(packet_id="pkt-10", decision="Approve", head_sha="0900128")).stem
-    assert inbox.publish(_pushed(ref, **{effect: True})).exists()
+    assert publish_derived(_pushed(ref, **{effect: True})).exists()

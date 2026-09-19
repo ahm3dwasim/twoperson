@@ -437,6 +437,17 @@ def validate_packet(packet: Any) -> dict:
             "push_status.review_ref: a packet may not report pushed/deployed/restarted=true without "
             "a recorded Reviewer audit reference — nothing ships before a Reviewer audit"
         )
+    # The sibling of the check above: a shipped report must name the concrete commit that shipped.
+    # Without this, `head_sha: "unknown"` plus a real review_ref reads as "shipped, audited" to any
+    # caller that only runs schema validation — the inbox-level gate (`assert_review_ref_resolves`)
+    # happens to also catch it today (a real approval's head can never equal "unknown"), but that is
+    # a property of two OTHER checks lining up, not a statement this schema itself makes. A structural
+    # invariant belongs where every packet is validated, not only where a verdict happens to exist.
+    if shipped and out["git"]["head_sha"] == UNKNOWN:
+        raise SchemaError(
+            "git.head_sha: a packet may not report pushed/deployed/restarted=true without naming "
+            "the concrete head that shipped — a push/deploy/restart of 'unknown' cannot be audited"
+        )
     if shipped and push["statement"].strip() == DEFAULT_PUSH_STATEMENT:
         raise SchemaError(
             "push_status.statement: the packet reports a push/deploy/restart but still carries the "

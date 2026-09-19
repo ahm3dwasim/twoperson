@@ -16,7 +16,7 @@ import json
 
 import pytest
 
-from tests.fixtures import packet_for, valid_packet
+from tests.fixtures import packet_for, publish_derived, valid_packet
 from twoperson import inbox
 from twoperson.__main__ import main
 from twoperson.packet import PacketError
@@ -45,7 +45,7 @@ def _pushed_with_files(packet_id: str, changed_files: list[dict], head: str = "0
 # ---- the gate --------------------------------------------------------------------------------
 
 def test_a_modified_test_file_without_ack_is_refused(root):
-    packet_for("pkt-tc-1", head_sha="0900128")
+    packet_for("pkt-tc-1", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-1", decision="Approve", head_sha="0900128")
     ).stem
@@ -56,7 +56,7 @@ def test_a_modified_test_file_without_ack_is_refused(root):
     )
     packet["push_status"]["review_ref"] = ref
     with pytest.raises(PacketError) as excinfo:
-        inbox.publish(packet)
+        publish_derived(packet)
     msg = str(excinfo.value)
     assert "altered tests" in msg
     assert "tests/test_gate.py" in msg
@@ -65,7 +65,7 @@ def test_a_modified_test_file_without_ack_is_refused(root):
 
 
 def test_a_modified_test_file_with_ack_is_accepted(root):
-    packet_for("pkt-tc-2", head_sha="0900128", changed_files=[
+    packet_for("pkt-tc-2", head_sha="0900128", derived=True, changed_files=[
         {"path": "tests/test_gate.py", "status": "modified", "insertions": 1, "deletions": 3},
     ])
     ref = inbox.publish_verdict(
@@ -78,12 +78,12 @@ def test_a_modified_test_file_with_ack_is_accepted(root):
         head="0900128",
     )
     packet["push_status"]["review_ref"] = ref
-    assert inbox.publish(packet).exists()
+    assert publish_derived(packet).exists()
 
 
 def test_adding_a_new_test_file_does_not_require_ack(root):
     """Reviewer intent: writing MORE tests must never trip the same gate as weakening one."""
-    packet_for("pkt-tc-3", head_sha="0900128")
+    packet_for("pkt-tc-3", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-3", decision="Approve", head_sha="0900128")
     ).stem
@@ -93,13 +93,13 @@ def test_adding_a_new_test_file_does_not_require_ack(root):
         head="0900128",
     )
     packet["push_status"]["review_ref"] = ref
-    assert inbox.publish(packet).exists()
+    assert publish_derived(packet).exists()
 
 
 def test_a_packet_with_no_test_changes_does_not_require_ack(root):
     """The default fixture packet's own test file is status "added" — unrelated ship reports with
     no test edits at all must keep working exactly as before this feature existed."""
-    packet_for("pkt-tc-4", head_sha="0900128")
+    packet_for("pkt-tc-4", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-4", decision="Approve", head_sha="0900128")
     ).stem
@@ -109,12 +109,12 @@ def test_a_packet_with_no_test_changes_does_not_require_ack(root):
         head="0900128",
     )
     packet["push_status"]["review_ref"] = ref
-    assert inbox.publish(packet).exists()
+    assert publish_derived(packet).exists()
 
 
 @pytest.mark.parametrize("status", ["deleted", "renamed"])
 def test_deleted_or_renamed_test_files_also_require_ack(root, status):
-    packet_for(f"pkt-tc-status-{status}", head_sha="0900128")
+    packet_for(f"pkt-tc-status-{status}", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(
         build_verdict(packet_id=f"pkt-tc-status-{status}", decision="Approve", head_sha="0900128")
     ).stem
@@ -125,13 +125,13 @@ def test_deleted_or_renamed_test_files_also_require_ack(root, status):
     )
     packet["push_status"]["review_ref"] = ref
     with pytest.raises(PacketError) as excinfo:
-        inbox.publish(packet)
+        publish_derived(packet)
     assert "altered tests" in str(excinfo.value)
 
 
 def test_a_copied_test_file_does_not_require_ack(root):
     """"copied" introduces nothing new either — excluded alongside "added"."""
-    packet_for("pkt-tc-copied", head_sha="0900128")
+    packet_for("pkt-tc-copied", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-copied", decision="Approve", head_sha="0900128")
     ).stem
@@ -141,14 +141,14 @@ def test_a_copied_test_file_does_not_require_ack(root):
         head="0900128",
     )
     packet["push_status"]["review_ref"] = ref
-    assert inbox.publish(packet).exists()
+    assert publish_derived(packet).exists()
 
 
 # ---- renames: old_path closes the renamed-away-test bypass -----------------------------------
 
 def test_a_test_renamed_to_a_nontest_path_with_old_path_is_refused(root):
     """The bypass: `path` alone (tests/test_auth.py -> src/auth.py) would read as "not a test"."""
-    packet_for("pkt-tc-rename-1", head_sha="0900128")
+    packet_for("pkt-tc-rename-1", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-rename-1", decision="Approve", head_sha="0900128")
     ).stem
@@ -160,14 +160,14 @@ def test_a_test_renamed_to_a_nontest_path_with_old_path_is_refused(root):
     )
     packet["push_status"]["review_ref"] = ref
     with pytest.raises(PacketError) as excinfo:
-        inbox.publish(packet)
+        publish_derived(packet)
     msg = str(excinfo.value)
     assert "altered tests" in msg and "src/auth.py" in msg
     assert inbox.find_packet("ship-tc-rename-1") is None
 
 
 def test_a_test_renamed_to_a_nontest_path_with_old_path_is_accepted_when_acked(root):
-    packet_for("pkt-tc-rename-1b", head_sha="0900128", changed_files=[
+    packet_for("pkt-tc-rename-1b", head_sha="0900128", derived=True, changed_files=[
         {"path": "src/auth.py", "status": "renamed", "old_path": "tests/test_auth.py",
          "insertions": 2, "deletions": 40},
     ])
@@ -182,12 +182,12 @@ def test_a_test_renamed_to_a_nontest_path_with_old_path_is_accepted_when_acked(r
         head="0900128",
     )
     packet["push_status"]["review_ref"] = ref
-    assert inbox.publish(packet).exists()
+    assert publish_derived(packet).exists()
 
 
 def test_a_rename_without_old_path_is_conservatively_refused(root):
     """No recorded source: could have been a test moved out of the tree, so it is not waved through."""
-    packet_for("pkt-tc-rename-2", head_sha="0900128")
+    packet_for("pkt-tc-rename-2", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-rename-2", decision="Approve", head_sha="0900128")
     ).stem
@@ -198,13 +198,13 @@ def test_a_rename_without_old_path_is_conservatively_refused(root):
     )
     packet["push_status"]["review_ref"] = ref
     with pytest.raises(PacketError) as excinfo:
-        inbox.publish(packet)
+        publish_derived(packet)
     assert "altered tests" in str(excinfo.value)
 
 
 def test_a_nontest_renamed_to_a_nontest_with_old_path_does_not_require_ack(root):
     """No over-flagging: both ends declared and neither is a test file."""
-    packet_for("pkt-tc-rename-3", head_sha="0900128")
+    packet_for("pkt-tc-rename-3", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-rename-3", decision="Approve", head_sha="0900128")
     ).stem
@@ -215,12 +215,12 @@ def test_a_nontest_renamed_to_a_nontest_with_old_path_does_not_require_ack(root)
         head="0900128",
     )
     packet["push_status"]["review_ref"] = ref
-    assert inbox.publish(packet).exists()
+    assert publish_derived(packet).exists()
 
 
 def test_a_test_renamed_to_a_test_is_refused_without_ack(root):
     """Both ends under tests/ — the destination alone already trips it, unchanged from before."""
-    packet_for("pkt-tc-rename-4", head_sha="0900128")
+    packet_for("pkt-tc-rename-4", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-rename-4", decision="Approve", head_sha="0900128")
     ).stem
@@ -232,12 +232,12 @@ def test_a_test_renamed_to_a_test_is_refused_without_ack(root):
     )
     packet["push_status"]["review_ref"] = ref
     with pytest.raises(PacketError):
-        inbox.publish(packet)
+        publish_derived(packet)
 
 
 def test_a_nontest_renamed_to_a_test_is_also_refused(root):
     """The destination alone already covers this direction, old_path or not."""
-    packet_for("pkt-tc-rename-5", head_sha="0900128")
+    packet_for("pkt-tc-rename-5", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-rename-5", decision="Approve", head_sha="0900128")
     ).stem
@@ -249,11 +249,11 @@ def test_a_nontest_renamed_to_a_test_is_also_refused(root):
     )
     packet["push_status"]["review_ref"] = ref
     with pytest.raises(PacketError):
-        inbox.publish(packet)
+        publish_derived(packet)
 
 
 def test_verify_also_refuses_an_unacknowledged_test_change(root, tmp_path, capsys):
-    packet_for("pkt-tc-verify", head_sha="0900128")
+    packet_for("pkt-tc-verify", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-verify", decision="Approve", head_sha="0900128")
     ).stem
@@ -273,7 +273,7 @@ def test_verify_also_refuses_an_unacknowledged_test_change(root, tmp_path, capsy
 def test_ack_test_changes_flag_derives_paths_from_the_reviewed_packet(root, capsys):
     """The flag never takes a hand-typed list — it reads the REVIEWED packet's own `changed_files`,
     so a verdict can only ever acknowledge tests this reviewer actually had in front of them."""
-    packet_for("pkt-cli", head_sha="0900128", changed_files=[
+    packet_for("pkt-cli", head_sha="0900128", derived=True, changed_files=[
         {"path": "tests/test_thing.py", "status": "modified", "insertions": 1, "deletions": 2},
     ])
     rc = main(["verdict", "--packet", "pkt-cli", "--decision", "Approve",
@@ -286,7 +286,7 @@ def test_ack_test_changes_flag_derives_paths_from_the_reviewed_packet(root, caps
 def test_ack_test_changes_flag_on_a_packet_with_no_test_changes_writes_nothing(root):
     """The default fixture packet's own test file is status "added" — the flag derives an empty
     list from it, and `build_verdict` never writes the key for an empty list."""
-    packet_for("pkt-cli-noop", head_sha="0900128")
+    packet_for("pkt-cli-noop", head_sha="0900128", derived=True)
     rc = main(["verdict", "--packet", "pkt-cli-noop", "--decision", "Approve",
                "--head", "0900128", "--ack-test-changes"])
     assert rc == 0
@@ -347,7 +347,7 @@ def test_the_field_is_a_list_of_strings_not_a_bare_string(root):
 def test_a_verdict_acknowledging_other_tests_does_not_unlock_this_ship_report(root):
     """The exact r4 finding, now closed: a verdict acknowledging test changes for ONE packet must
     not silently unlock a DIFFERENT ship report at the same head whose altered tests differ."""
-    packet_for("pkt-tc-other", head_sha="0900128", changed_files=[
+    packet_for("pkt-tc-other", head_sha="0900128", derived=True, changed_files=[
         {"path": "tests/test_other.py", "status": "modified", "insertions": 1, "deletions": 1},
     ])
     ref = inbox.publish_verdict(
@@ -361,7 +361,7 @@ def test_a_verdict_acknowledging_other_tests_does_not_unlock_this_ship_report(ro
     )
     packet["push_status"]["review_ref"] = ref
     with pytest.raises(PacketError) as excinfo:
-        inbox.publish(packet)
+        publish_derived(packet)
     msg = str(excinfo.value)
     assert "altered tests" in msg
     assert "tests/test_gate.py" in msg
@@ -371,7 +371,7 @@ def test_a_verdict_acknowledging_other_tests_does_not_unlock_this_ship_report(ro
 def test_a_subset_of_acknowledged_tests_is_accepted(root):
     """A verdict that acknowledges a SUPERSET of the ship report's altered tests still unlocks it —
     only the exact-match replay is what the gate closes."""
-    packet_for("pkt-tc-superset", head_sha="0900128", changed_files=[
+    packet_for("pkt-tc-superset", head_sha="0900128", derived=True, changed_files=[
         {"path": "tests/test_gate.py", "status": "modified", "insertions": 1, "deletions": 1},
         {"path": "tests/test_extra.py", "status": "modified", "insertions": 1, "deletions": 1},
     ])
@@ -385,7 +385,7 @@ def test_a_subset_of_acknowledged_tests_is_accepted(root):
         head="0900128",
     )
     packet["push_status"]["review_ref"] = ref
-    assert inbox.publish(packet).exists()
+    assert publish_derived(packet).exists()
 
 
 # ---- publish_verdict itself refuses an acknowledgment for paths outside the reviewed packet ----
@@ -393,7 +393,7 @@ def test_a_subset_of_acknowledged_tests_is_accepted(root):
 def test_publish_verdict_refuses_acknowledging_a_test_the_reviewed_packet_does_not_alter(root):
     """The write-time binding: a verdict may only acknowledge test changes the packet it reviews
     actually altered — not an arbitrary path an API caller hand-typed."""
-    packet_for("pkt-mint", head_sha="0900128", changed_files=[
+    packet_for("pkt-mint", head_sha="0900128", derived=True, changed_files=[
         {"path": "tests/test_a.py", "status": "modified", "insertions": 1, "deletions": 1},
     ])
     with pytest.raises(PacketError) as excinfo:
@@ -405,7 +405,7 @@ def test_publish_verdict_refuses_acknowledging_a_test_the_reviewed_packet_does_n
 
 
 def test_publish_verdict_accepts_acknowledging_a_test_the_reviewed_packet_alters(root):
-    packet_for("pkt-mint-ok", head_sha="0900128", changed_files=[
+    packet_for("pkt-mint-ok", head_sha="0900128", derived=True, changed_files=[
         {"path": "tests/test_a.py", "status": "modified", "insertions": 1, "deletions": 1},
     ])
     written = inbox.publish_verdict(
@@ -513,7 +513,7 @@ def test_env_globs_cannot_switch_off_default_detection(root, monkeypatch):
     built-in detection, or `TWOPERSON_TEST_GLOBS=nomatch` would be a one-line bypass (r2 finding)."""
     monkeypatch.setenv("TWOPERSON_TEST_GLOBS", "does/not/match/anything/**")
     assert is_test_path("tests/test_gate.py") is True
-    packet_for("pkt-tc-envoff", head_sha="0900128")
+    packet_for("pkt-tc-envoff", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-envoff", decision="Approve", head_sha="0900128")
     ).stem
@@ -524,7 +524,7 @@ def test_env_globs_cannot_switch_off_default_detection(root, monkeypatch):
     )
     packet["push_status"]["review_ref"] = ref
     with pytest.raises(PacketError):
-        inbox.publish(packet)
+        publish_derived(packet)
 
 
 def test_env_globs_are_comma_separated_and_trim_whitespace(monkeypatch):
@@ -536,7 +536,7 @@ def test_env_globs_are_comma_separated_and_trim_whitespace(monkeypatch):
 def test_env_globs_add_paths_to_the_gate_while_defaults_still_bite(root, monkeypatch):
     """Both the added glob AND the built-in rule must flow through to the gate."""
     monkeypatch.setenv("TWOPERSON_TEST_GLOBS", "qa/**")
-    packet_for("pkt-tc-env", head_sha="0900128")
+    packet_for("pkt-tc-env", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-env", decision="Approve", head_sha="0900128")
     ).stem
@@ -548,7 +548,7 @@ def test_env_globs_add_paths_to_the_gate_while_defaults_still_bite(root, monkeyp
     )
     packet["push_status"]["review_ref"] = ref
     with pytest.raises(PacketError):
-        inbox.publish(packet)
+        publish_derived(packet)
 
     ref2 = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-env", decision="Approve", head_sha="0900128")
@@ -561,7 +561,7 @@ def test_env_globs_add_paths_to_the_gate_while_defaults_still_bite(root, monkeyp
     )
     packet2["push_status"]["review_ref"] = ref2
     with pytest.raises(PacketError):
-        inbox.publish(packet2)
+        publish_derived(packet2)
 
 
 # ---- fail-closed on ambiguous / builder-chosen inputs (r2 audit findings) ---------------------
@@ -589,7 +589,7 @@ def test_only_added_and_copied_are_safe_statuses():
 
 
 def test_unknown_status_test_file_needs_ack_at_the_gate(root):
-    packet_for("pkt-tc-unk", head_sha="0900128")
+    packet_for("pkt-tc-unk", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-unk", decision="Approve", head_sha="0900128")
     ).stem
@@ -600,7 +600,7 @@ def test_unknown_status_test_file_needs_ack_at_the_gate(root):
     )
     packet["push_status"]["review_ref"] = ref
     with pytest.raises(PacketError):
-        inbox.publish(packet)
+        publish_derived(packet)
 
 
 # ---- old_path is honored regardless of status (r3 audit finding) ------------------------------
@@ -631,7 +631,7 @@ def test_non_test_to_non_test_rename_with_old_path_is_not_over_flagged():
 
 def test_inconsistent_status_old_path_test_source_needs_ack_at_the_gate(root):
     # The exact r3 bypass, exercised through the real gate.
-    packet_for("pkt-tc-src", head_sha="0900128")
+    packet_for("pkt-tc-src", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-src", decision="Approve", head_sha="0900128")
     ).stem
@@ -643,7 +643,7 @@ def test_inconsistent_status_old_path_test_source_needs_ack_at_the_gate(root):
     )
     packet["push_status"]["review_ref"] = ref
     with pytest.raises(PacketError):
-        inbox.publish(packet)
+        publish_derived(packet)
 
 
 # ---- a declared test source is honored even under a "safe" status (r3 fix, completed) ---------
@@ -663,7 +663,7 @@ def test_added_or_copied_test_with_no_source_still_does_not_require_ack():
 
 
 def test_added_with_test_old_path_needs_ack_at_the_gate(root):
-    packet_for("pkt-tc-addsrc", head_sha="0900128")
+    packet_for("pkt-tc-addsrc", head_sha="0900128", derived=True)
     ref = inbox.publish_verdict(
         build_verdict(packet_id="pkt-tc-addsrc", decision="Approve", head_sha="0900128")
     ).stem
@@ -675,7 +675,7 @@ def test_added_with_test_old_path_needs_ack_at_the_gate(root):
     )
     packet["push_status"]["review_ref"] = ref
     with pytest.raises(PacketError):
-        inbox.publish(packet)
+        publish_derived(packet)
 
 
 # ---- acknowledged_tests cap matches the packet's changed_files cap (r5 audit finding) ---------
@@ -704,7 +704,7 @@ def test_a_verdict_acknowledging_max_changed_files_paths_publishes(root):
     # of objects those paths came from, so any acknowledgment a valid packet can produce publishes.
     assert MAX_VERDICT_BYTES == MAX_PACKET_BYTES
     paths = [f"tests/{'sub/' * 15}test_module_{i:04d}.py" for i in range(500)]
-    packet_for("pkt-big-ack", head_sha="0900128", changed_files=[
+    packet_for("pkt-big-ack", head_sha="0900128", derived=True, changed_files=[
         {"path": p, "status": "modified", "insertions": 1, "deletions": 1} for p in paths
     ])
     v = build_verdict(packet_id="pkt-big-ack", decision="Approve", head_sha="0900128",

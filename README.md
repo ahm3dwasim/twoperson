@@ -148,7 +148,14 @@ would let a shipped report carry a self-typed `changed_files` — including one 
 altered test off the list, so the test-change acknowledgment check above never sees it. A claimed
 diff can never be the basis for a ship; `--no-derive` stays available for what it's actually for —
 drafts, and checkouts that genuinely don't hold the commits — neither of which ships a concrete head
-in the first place.
+in the first place. The same rule applies to the packet a cited approval *reviewed*: a ship report
+citing a real, ship-unlocking verdict for a packet that was itself only ever `claimed` is refused
+too, so an honest-looking ship report can't launder a dishonest review. And it isn't a CLI
+convention — `diff_provenance` is decided and stamped by the library itself, at the one place a
+packet enters the inbox, never taken from the packet's own claim, so a caller that skips the CLI
+and calls `twoperson.inbox` directly gets exactly the same guarantee. A packet reporting a push with
+`git.head_sha: "unknown"` is refused before any of this even runs — the schema itself requires a
+shipped report to name the concrete commit that shipped.
 
 `publish` (never `verify` — it may run anywhere, without the commit checked out) also checks every
 `tests[]` row's `command` for a path or a bare symbol that does not exist at the head being

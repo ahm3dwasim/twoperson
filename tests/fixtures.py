@@ -5,6 +5,7 @@ rule that broke rather than "the schema".
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import os
 import pathlib
@@ -130,17 +131,87 @@ def without(field: str) -> dict:
     return packet
 
 
-def packet_for(packet_id: str, head_sha: str = "0900128", **overrides: Any) -> dict:
+def packet_for(packet_id: str, head_sha: str = "0900128", *, derived: bool = False,
+              **overrides: Any) -> dict:
     """Publish a valid packet with ``packet_id`` at ``head_sha`` and return it.
 
     Verdicts bind to a real packet in the inbox, so a test that records a verdict publishes the
     packet it answers first. ``head_sha`` defaults to the short sha the verdict tests approve.
+
+    Published `"claimed"` by default (the library's own default when `derive` is not requested) —
+    most callers of this helper are testing inbox mechanics unrelated to diff provenance. Pass
+    ``derived=True`` for a test whose ship report must cite an approval of a packet the library
+    actually verified — this publishes through `publish_derived` instead (see its docstring).
     """
-    from twoperson import inbox
     packet = valid_packet(packet_id=packet_id, **overrides)
     packet["git"]["head_sha"] = head_sha
-    inbox.publish(packet)
+    if derived:
+        publish_derived(packet)
+    else:
+        from twoperson import inbox
+        inbox.publish(packet)
     return packet
+
+
+# --------------------------------------------------------------------------------------------
+# publish_derived — the test-only seam for a genuinely "derived" packet without a real repository.
+#
+# `twoperson.inbox.publish`'s `derive=True` path shells out to `gitfacts.derive`, which reads a
+# REAL repository at two REAL commits. Most of this suite's packets use synthetic, unresolvable
+# shas ("0900128", "abcdef0", ...) on purpose, to keep the ship-gate/ack-content logic under test
+# decoupled from git plumbing — `test_derived_diffs_cli.py` is what exercises the real, end-to-end
+# git integration, including scenarios (a rename git actually detects, a real disagreement) real
+# derivation is needed to prove. Reconstructing every one of those synthetic-sha scenarios against
+# a real repository would mean testing git's own diff engine instead of the gate, and some of them
+# (a `"copied"` status, an `"unknown"` status) cannot be produced by real derivation at all — git's
+# default `--name-status -M` never emits `C`, and never emits the `"unknown"` sentinel.
+#
+# `publish_derived` runs the REAL `inbox.publish` pipeline — real `validate_packet`, real
+# `gitfacts.disagreement` comparison, real ship-gate/provenance stamping and refusal logic — and
+# fakes out only the ONE external dependency inside it: the git subprocess call in
+# `gitfacts.derive`. The fake answers with exactly what the packet being published already states,
+# so `disagreement()` finds nothing and the packet is legitimately, unforgeably stamped `"derived"`
+# by the same code `publish` always runs — never by writing the field into the packet's JSON before
+# calling `publish` (which is exactly the bypass this suite's `PacketError`-raising tests exist to
+# prove closed). It is reachable only from Python test code holding this module — never from a
+# packet's own JSON, a CLI flag, or any path a real caller of the library can drive.
+# --------------------------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _agreeing_gitfacts_derive():
+    """Patch `gitfacts.derive` in-process, for the duration of the block, to answer with whatever
+    the caller sets via the yielded holder's ``"facts"`` key. Restores the real function on exit,
+    including on an exception — a refusal raised INSIDE the block must not leave the patch in place
+    for an unrelated later call."""
+    import twoperson.gitfacts as gitfacts_mod
+
+    real_derive = gitfacts_mod.derive
+    holder: dict[str, Any] = {}
+
+    def fake_derive(repo, base_sha, head_sha, base_ref=None):
+        assert "facts" in holder, "_agreeing_gitfacts_derive: set holder['facts'] before publishing"
+        return holder["facts"]
+
+    gitfacts_mod.derive = fake_derive
+    try:
+        yield holder
+    finally:
+        gitfacts_mod.derive = real_derive
+
+
+def publish_derived(packet: dict, **kwargs: Any) -> "pathlib.Path":
+    """`inbox.publish(packet, derive=True, **kwargs)`, with `gitfacts.derive` stubbed to agree with
+    exactly what `packet` already states (see the module comment above). Use this wherever a test
+    needs the ship gate to see a genuinely `"derived"` packet without standing up a real repository.
+    """
+    from twoperson import inbox
+
+    with _agreeing_gitfacts_derive() as holder:
+        holder["facts"] = {
+            "changed_files": copy.deepcopy(packet.get("changed_files") or []),
+            "diff_summary": copy.deepcopy(packet.get("diff_summary") or {}),
+        }
+        return inbox.publish(packet, derive=True, **kwargs)
 
 
 # --------------------------------------------------------------------------------------------

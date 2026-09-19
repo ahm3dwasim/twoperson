@@ -30,9 +30,9 @@ All notable changes to this project are documented here. The format follows
   prove `base_ref` is the project's current upstream default branch, and the check is skipped
   outright when the ref does not resolve locally (an unfetched remote-tracking ref).
 - A packet that reports `push_status.pushed`/`deployed`/`restarted` for a CONCRETE head is now
-  refused at `verify`/`publish` unless its diff was actually derived (`diff_provenance: "derived"`).
-  `--no-derive` publishes an unverified, self-reported `changed_files` — exactly the shape a builder
-  could previously ship with a test change quietly left off the list, since the test-change
+  refused unless its diff was actually derived (`diff_provenance: "derived"`). `--no-derive`
+  publishes an unverified, self-reported `changed_files` — exactly the shape a builder could
+  previously ship with a test change quietly left off the list, since the test-change
   acknowledgment gate reasons over whatever `changed_files` a shipped packet arrives with. A claimed
   diff for a concrete head can no longer be the basis for a ship; `--no-derive` remains available
   for drafts and for a checkout that genuinely does not hold the commits, neither of which reports a
@@ -44,6 +44,30 @@ All notable changes to this project are documented here. The format follows
   (not a whole dotted name) is not extracted; an uncommitted scratch path is passed over; a pytest
   node id contributes only its file. `--no-derive` skips this check too, for the same reason it
   skips the diff derivation.
+
+### Fixed
+
+- The diff-provenance and ship-gate rules above were enforced only in the CLI dispatcher
+  (`twoperson.__main__`), which meant a caller of the **library** — `twoperson.inbox.publish`,
+  `assert_review_ref_resolves`, or `publish_verdict`, called directly instead of through
+  `twoperson verify`/`publish` — bypassed all of it, and `diff_provenance` was itself accepted
+  verbatim from the packet's own JSON, so a packet could simply claim `"derived"`. Both are now
+  library invariants: `diff_provenance` is stamped by `twoperson.inbox` at the one place a packet
+  enters the durable inbox (`inbox.publish`, via the new `inbox.prepare_packet`) and is never read
+  from the packet's input — an incoming `"derived"` claim is silently overwritten by whatever the
+  library actually established. The ship gate (`assert_review_ref_resolves`) now also refuses when
+  the packet a cited approval **reviewed** is not itself library-stamped `"derived"` for a concrete
+  head, closing the case where an honest-looking ship report cites a real approval of a dishonest,
+  self-reported review. `twoperson verify`/`publish` are unchanged callers of this same pipeline —
+  the CLI's behavior is identical, but the guarantee no longer depends on going through it.
+- A packet reporting `push_status.pushed`/`deployed`/`restarted=true` with `git.head_sha: "unknown"`
+  is now refused by the **schema itself** (`packet.validate_packet`), not only by the inbox gate.
+  Previously this relied on the coincidence that a real approving verdict's head can never equal
+  `"unknown"` (`assert_review_ref_resolves`'s head-match check would catch a *cited* mismatch, but
+  said nothing about a shipped report with no citation binding at all, or about any future caller
+  that validates a packet without also running the inbox gate); a shipped report must now name the
+  concrete commit that shipped everywhere a packet is validated, independent of whether a verdict
+  happens to exist to check it against.
 
 ## [0.1.3] - 2026-09-19
 

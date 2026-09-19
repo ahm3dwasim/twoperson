@@ -257,13 +257,15 @@ def test_a_renamed_test_needs_acknowledgment_at_the_derived_path(root, tmp_path,
                                      statement="Shipped after the recorded approval.")
         return packet
 
-    # A prior packet for the reviewer to have actually looked at.
+    # A prior packet for the reviewer to have actually looked at — published `derive=True` so its
+    # own diff evidence is library-verified, which the ship gate now requires of the packet a cited
+    # approval reviewed (not only of the ship report itself).
     inbox.publish(valid_packet(
         packet_id="reviewed-1",
         git={"branch": "b", "base_ref": "origin/main", "base_sha": base, "head_sha": head},
         changed_files=[rename_entry],
         diff_summary={"files_changed": 1, "insertions": 0, "deletions": 0},
-    ))
+    ), derive=True)
 
     unacked = inbox.publish_verdict(
         build_verdict(packet_id="reviewed-1", decision="Approve", head_sha=head)).stem
@@ -363,8 +365,11 @@ def test_no_derive_ship_report_with_an_omitted_test_is_refused(root, tmp_path, m
     head = repo.commit("head")
     monkeypatch.chdir(repo.path)
 
-    # A prior, honestly-derived reviewed packet and an approval of it — the reviewer never
-    # acknowledged the test change because nothing (yet) told it a test changed.
+    # A prior reviewed packet whose OWN self-report omits the test change too (published `claimed`,
+    # the default when `derive` is not requested) — the reviewer never acknowledged the test change
+    # because nothing (yet, self-reported OR derived) told it a test changed. The ship report below
+    # is still refused even before its own `--no-derive` claim is reached, because the packet its
+    # citation approved was itself never verified — see the assertions below.
     inbox.publish(valid_packet(
         packet_id="reviewed-1",
         git={"branch": "b", "base_ref": "origin/main", "base_sha": base, "head_sha": head},
@@ -451,21 +456,33 @@ def test_a_verdict_for_a_properly_derived_packet_cannot_be_reused_by_a_claimed_s
     assert not any("ship-reuse" in str(p) for p in inbox.pending())
 
 
-def test_verify_also_refuses_a_no_derive_ship_for_a_concrete_head(root, tmp_path, capsys):
+def test_verify_also_refuses_a_no_derive_ship_for_a_concrete_head(root, tmp_path, monkeypatch, capsys):
     """`verify` mirrors `publish`'s refusal here too — it must fail for every reason publish would,
-    including one that only exists because a flag was passed, not because of a git-shaped defect."""
+    including one that only exists because a flag was passed, not because of a git-shaped defect.
+    The REVIEWED packet is published `derive=True` against a real repo, so the only reason left for
+    the refusal is the ship report's own `--no-derive` claim, not the (also-checked) provenance of
+    the packet the cited approval reviewed."""
     from twoperson.verdict import build_verdict
+
+    repo = git_repo(tmp_path)
+    repo.write("a.txt", "one\n")
+    base = repo.commit("base")
+    repo.write("a.txt", "one\ntwo\n")
+    head = repo.commit("head")
+    monkeypatch.chdir(repo.path)
 
     inbox.publish(valid_packet(
         packet_id="reviewed-x",
-        git={"branch": "b", "base_ref": "origin/main", "base_sha": "a" * 40, "head_sha": "b" * 40},
-    ))
+        git={"branch": "b", "base_ref": "origin/main", "base_sha": base, "head_sha": head},
+        changed_files=[{"path": "a.txt", "status": "modified", "insertions": 1, "deletions": 0}],
+        diff_summary={"files_changed": 1, "insertions": 1, "deletions": 0},
+    ), derive=True)
     verdict_id = inbox.publish_verdict(
-        build_verdict(packet_id="reviewed-x", decision="Approve", head_sha="b" * 40)).stem
+        build_verdict(packet_id="reviewed-x", decision="Approve", head_sha=head)).stem
 
     packet = valid_packet(
         packet_id="ship-x",
-        git={"branch": "b", "base_ref": "origin/main", "base_sha": "a" * 40, "head_sha": "b" * 40},
+        git={"branch": "b", "base_ref": "origin/main", "base_sha": base, "head_sha": head},
     )
     packet["push_status"].update(pushed=True, review_ref=verdict_id,
                                  statement="Shipped after the recorded approval.")

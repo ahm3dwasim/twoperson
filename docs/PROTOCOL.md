@@ -136,15 +136,32 @@ or `"claimed"` — so a reader of a published packet never has to guess; a packe
 this field existed reads as `"claimed"`, the unfavourable default, never upgraded to `"derived"`
 for free.
 
-**A claimed diff can never be the basis for a ship.** `--no-derive` publishes `changed_files`
-exactly as the builder typed it, unchecked — which means the test-change acknowledgment gate (rule
-5) would otherwise reason over a list a builder could shape at will, including by simply omitting an
-altered test. `verify`/`publish` therefore refuse a packet outright when it reports
-`push_status.pushed`/`deployed`/`restarted` for a **concrete** head while `diff_provenance` is
-anything other than `"derived"` — before that packet's `changed_files` is ever trusted for the
-acknowledgment check or handed to `inbox.publish`. `--no-derive` remains exactly what it says it is
-for: a draft, or a checkout that genuinely does not hold the commits — neither of which reports a
-push for a concrete head in the first place, so nothing legitimate is blocked by this.
+**A claimed diff can never be the basis for a ship, and this is a LIBRARY guarantee, not a CLI
+one.** `--no-derive` publishes `changed_files` exactly as the builder typed it, unchecked — which
+means the test-change acknowledgment gate (rule 5) would otherwise reason over a list a builder
+could shape at will, including by simply omitting an altered test. `diff_provenance` is decided by
+`twoperson.inbox` itself, at the one place a packet enters the durable inbox (`inbox.publish`, via
+`inbox.prepare_packet`), and is **never accepted from the packet's own input** — a packet that
+arrives already claiming `"derived"` is restamped with whatever the library actually established.
+The ship gate (`inbox.assert_review_ref_resolves`) refuses a packet outright when it reports
+`push_status.pushed`/`deployed`/`restarted` for a **concrete** head while its OWN `diff_provenance`
+is anything other than `"derived"` — before `changed_files` is ever trusted for the acknowledgment
+check or written to disk. It refuses equally when the packet a cited approval **reviewed** is not
+itself library-stamped `"derived"` for a concrete head: an honest ship report citing a real approval
+of a dishonest, self-reported review is exactly as unverified as a dishonest ship report, and both
+are refused the same way. This holds for `twoperson verify`/`publish` and for any other caller of
+`twoperson.inbox` directly — `--no-derive` remains exactly what it says it is for: a draft, or a
+checkout that genuinely does not hold the commits — neither of which reports a push for a concrete
+head in the first place, so nothing legitimate is blocked by this.
+
+**A shipped report must name a concrete head — enforced by the schema itself.** A packet reporting
+`push_status.pushed`/`deployed`/`restarted=true` with `git.head_sha: "unknown"` is refused by
+`packet.validate_packet` before any inbox check ever runs. This does not rely on the ship gate: a
+real approving verdict's head can never literally equal `"unknown"` either (so a *cited* mismatch is
+still caught by `assert_review_ref_resolves`), but that says nothing about a shipped report with no
+citation at all, or about a future caller that validates a packet without also running the inbox
+gate — a structural invariant belongs in the schema every packet passes through, not only in the
+one gate that happens to catch it as a side effect.
 
 **A `tests[]` row's `command` is checked at `publish` (never `verify`) against the head being
 published.** A row is a claim that a run can be repeated; `twoperson.citations` resolves the paths

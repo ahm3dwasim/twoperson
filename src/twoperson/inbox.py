@@ -82,7 +82,7 @@ from typing import Any, Iterable, Mapping
 
 import structlog
 
-from . import _safefs
+from . import _safefs, gitfacts
 from .packet import (
     MAX_PACKET_BYTES,
     LaneUnreadable,
@@ -113,10 +113,10 @@ __all__ = [
     "claim_next", "claimed", "claimed_consults", "has_pending", "has_pending_advice",
     "has_pending_consults", "has_pending_signals", "has_pending_verdicts", "inbox_root",
     "peek_consult", "peek_next", "pending", "pending_advice", "pending_consults",
-    "pending_signals", "pending_verdicts", "publish", "publish_advice", "publish_consult",
-    "publish_signal", "publish_verdict", "quarantine", "read_advice", "read_signals",
-    "read_verdicts", "requeue_claimed", "find_packet", "assert_review_ref_resolves", "requeue_claimed_consult", "shared_repo_root",
-    "verdicted_packet_ids",
+    "pending_signals", "pending_verdicts", "prepare_packet", "publish", "publish_advice",
+    "publish_consult", "publish_signal", "publish_verdict", "quarantine", "read_advice",
+    "read_signals", "read_verdicts", "requeue_claimed", "find_packet", "assert_review_ref_resolves",
+    "requeue_claimed_consult", "shared_repo_root", "verdicted_packet_ids",
 ]
 
 INBOX_ENV = "TWOPERSON_INBOX"
@@ -649,13 +649,140 @@ def _atomic_publish(directory: Path, lane: str, name: str, body: str) -> Path:
     return directory / lane / final
 
 
-def publish(packet: Mapping[str, Any], *, root: Path | str | None = None) -> Path:
-    """Validate ``packet`` and atomically publish it to ``pending/``. Returns the published path.
+def _bind_diff_evidence(packet: dict, *, repo: Path | str | None,
+                        derive: bool) -> tuple[dict, list[str]]:
+    """Replace the packet's *claimed* `changed_files`/`diff_summary` with the head's derived truth,
+    and STAMP `diff_provenance` accordingly. Returns ``(packet, notes)`` — ``packet`` mutated in
+    place and also returned, ``notes`` the human-readable lines a caller may want to show.
 
-    Validation happens BEFORE the tree is touched, so a rejected packet leaves no trace on disk.
+    **This is the one place `diff_provenance` is ever decided, and it is never read from the
+    packet's own input.** Every branch below sets the field outright rather than trusting whatever
+    the caller's JSON already said — a packet that arrives already claiming ``"derived"`` gets
+    exactly the provenance THIS function actually established (`"claimed"` unless a repo and a
+    concrete head let it genuinely re-derive and agree), never its own unverified claim. That is
+    what closes the gap where a caller of the library — `publish`, `prepare_packet`, anything that
+    is not the CLI — could otherwise mint a packet that simply SAYS "derived".
+
+    Raises `PacketError` when the packet describes a change the named head does not — closing the
+    gap where `changed_files` was otherwise only the builder's self-report, and where the
+    test-change acknowledgment gate (`twoperson.testset`) reasoned over that same self-report rather
+    than over what actually changed.
+    """
+    notes: list[str] = []
+    base, head = packet["git"]["base_sha"], packet["git"]["head_sha"]
+    if not derive:
+        packet["diff_provenance"] = "claimed"
+        notes.append("diff evidence NOT derived (--no-derive): the numbers below are the "
+                     "builder's claim, and nothing has checked them against the named head. "
+                     "This packet can NEVER unlock a ship for a concrete head while it stays "
+                     "'claimed' — see docs/PROTOCOL.md §2a")
+        return packet, notes
+    if not gitfacts.concrete(base) or not gitfacts.concrete(head):
+        # A packet may legitimately not name a head yet — a draft, a round proposing nothing to
+        # merge. Deriving is impossible there, and refusing would break a flow this has no business
+        # touching, so this says what it did not check instead of implying it was checked.
+        packet["diff_provenance"] = "claimed"
+        notes.append("diff evidence NOT derived: the packet does not name a concrete base/head "
+                     "sha, so nothing has checked its numbers against a commit")
+        return packet, notes
+    repo_path = Path(repo) if repo is not None else Path.cwd()
+    facts = gitfacts.derive(repo_path, base, head, base_ref=packet["git"]["base_ref"])
+    problems = gitfacts.disagreement(packet, facts)
+    if problems:
+        raise PacketError(
+            "the packet's diff evidence does not describe the head it names:\n  - "
+            + "\n  - ".join(problems)
+            + "\nThe values above were derived from the head; correct the packet, or pass "
+              "--no-derive to publish an explicitly unverified claim instead."
+        )
+    packet["changed_files"] = facts["changed_files"]
+    packet["diff_summary"] = facts["diff_summary"]
+    packet["diff_provenance"] = "derived"
+    notes.append(f"diff evidence derived from {base[:7]}...{head[:7]}: "
+                f"{facts['diff_summary']['files_changed']} file(s), "
+                f"+{facts['diff_summary']['insertions']}/-{facts['diff_summary']['deletions']}")
+    return packet, notes
+
+
+def _refuse_unverified_ship(packet: Mapping) -> None:
+    """Refuse a shipped, concrete-head packet whose OWN diff evidence is not library-stamped
+    'derived'. Raises :class:`PacketError`, or returns when this is not this kind of refusal.
+
+    A CLAIMED (underived) `changed_files` can never be the basis for unlocking a ship. Without this,
+    `--no-derive` for a real, concrete head would publish the builder's self-report unchecked, and
+    `assert_review_ref_resolves`'s test-change acknowledgment gate reasons over exactly that
+    self-report: a builder who simply omits an altered test file from `changed_files` gets an
+    approval that never acknowledged it, then ships the same head with `diff_provenance: "claimed"`
+    — the gate closed by `twoperson.gitfacts` for `verify`/`publish` is reopened by the one flag
+    that skips it. `--no-derive` remains for what it says it is for — a draft, or a checkout that
+    genuinely does not hold the commits — but neither of those ever reports pushed/deployed/restarted
+    for a CONCRETE head (`git.head_sha == "unknown"` on a shipped packet is refused by the schema
+    itself; see `packet.validate_packet`), so this refuses exactly the one combination that would
+    otherwise reopen the gap: a concrete head, actually shipped, whose diff was never checked
+    against it.
+    """
+    push = packet["push_status"]
+    if not (push["pushed"] or push["deployed"] or push["restarted"]):
+        return
+    head = packet["git"]["head_sha"]
+    if not gitfacts.concrete(head) or packet["diff_provenance"] == "derived":
+        return
+    raise PacketError(
+        f"push_status reports a push/deploy/restart for concrete head {head!r}, but "
+        f"diff_provenance is {packet['diff_provenance']!r}, not 'derived' — an unverified "
+        "(--no-derive) diff claim can never be the basis for a ship. Publish from a checkout that "
+        "holds the commits so changed_files can be derived and checked against the head (see "
+        "docs/PROTOCOL.md §2a)."
+    )
+
+
+def prepare_packet(packet: Any, *, root: Path | str | None = None, repo: Path | str | None = None,
+                   derive: bool = False) -> tuple[dict, list[str]]:
+    """Validate, derive diff evidence, and run every ship-gate check `publish` runs — WITHOUT
+    writing anything. Returns ``(validated_packet, notes)``.
+
+    This is the single pipeline both `publish` and the CLI's `verify` run — a caller of either sees
+    exactly the checks the other would apply, and a caller of the LIBRARY directly (bypassing the
+    CLI entirely) gets them too. That is the property this function exists to hold: `diff_provenance`
+    is decided here (`_bind_diff_evidence`), never accepted from the packet's own input, and a
+    shipped report — this one, or the one it cites an approval for — can never ride on unverified
+    diff evidence, however it was published.
+
+    ``derive`` defaults to **False** here, unlike the CLI's own default (`publish`/`verify` default
+    `--derive` to on, `--no-derive` opts out). A generic library caller may not even be running from
+    inside the repository a packet names — publishing is legitimate from anywhere, and forcing a
+    git-verification attempt by default would turn an ordinary, unrelated call into a hard failure
+    whenever the shas it names are not resolvable here. What `derive=False` does NOT do is loosen
+    the ship gate: an unverified (`"claimed"`) packet still can never unlock a ship for a concrete
+    head (`_refuse_unverified_ship`) — the safe default is simply "verify nothing", never "trust the
+    packet's own claim of having been verified", which `_bind_diff_evidence` never allows regardless
+    of this flag.
     """
     validated = validate_packet(packet)
+    # The packet's OWN gates run before anything is derived from git: an unresolvable review_ref,
+    # or a REVIEWED packet whose diff evidence was never verified, is wrong however accurate this
+    # packet's own diffstat turns out to be — deriving first would mask them.
     assert_review_ref_resolves(validated, root=root)
+    validated, notes = _bind_diff_evidence(validated, repo=repo, derive=derive)
+    _refuse_unverified_ship(validated)
+    # Re-run after derivation: the ack-content check must reason over the DERIVED changed_files (a
+    # git-verified rename, an omitted test file), not the builder's self-report that just got
+    # replaced.
+    assert_review_ref_resolves(validated, root=root)
+    return validated, notes
+
+
+def publish(packet: Mapping[str, Any], *, root: Path | str | None = None,
+           repo: Path | str | None = None, derive: bool = False) -> Path:
+    """Validate ``packet``, derive+stamp its diff evidence, and atomically publish it to
+    ``pending/``. Returns the published path.
+
+    Validation happens BEFORE the tree is touched, so a rejected packet leaves no trace on disk.
+    ``repo`` is the checkout to derive diff evidence from when ``derive=True`` (default: the
+    process's current working directory). ``derive`` defaults to **False** — see `prepare_packet`
+    for why, and note that this never lets a `"claimed"` packet unlock a ship for a concrete head.
+    """
+    validated, _notes = prepare_packet(packet, root=root, repo=repo, derive=derive)
     directory = _ensure_tree(inbox_root(root))
     name = f"{_stamp(validated['created_at'])}-{validated['packet_id']}.json"
     target = _atomic_publish(directory, "pending", name, dumps_packet(validated))
@@ -733,13 +860,17 @@ def assert_review_ref_resolves(packet: Mapping[str, Any], *, root: Path | str | 
     head — `changed_files` is self-reported per packet, and a bare boolean acknowledgment could be
     replayed across reports.
 
-    This function reasons over whatever `changed_files` the packet ARRIVES with, self-reported or
-    derived — it has no way to tell the two apart, and that is deliberate: it is also the function
-    every synthetic-sha test in this suite calls directly, with a `changed_files` that was never put
-    through `twoperson.gitfacts` at all. The property that a CLAIMED (underived) diff can never be
-    the basis for a ship is enforced one layer up, at the CLI (`twoperson.__main__._dispatch`),
-    which is the one caller that knows whether `--no-derive` was used and can refuse before this
-    function — and `inbox.publish` — are ever reached. See docs/PROTOCOL.md §2a.
+    This function reasons over whatever `changed_files` this packet ARRIVES with, self-reported or
+    derived — it has no way to tell the two apart on its own, which is deliberate: it is also the
+    function every synthetic-sha test in this suite calls directly, with a `changed_files` that was
+    never put through `twoperson.gitfacts` at all. What it does NOT leave to the caller any more is
+    the REVIEWED packet's own provenance (below): a verdict's `acknowledged_tests` is only as
+    trustworthy as the `changed_files` the reviewer actually saw, and a reviewed packet published
+    `"claimed"` (self-reported, never checked against its head) could have simply omitted the test it
+    weakened. `prepare_packet`/`publish` are the ones that decide THIS packet's own `diff_provenance`
+    (see `_bind_diff_evidence`) and refuse an unverified one for a concrete, shipped head (see
+    `_refuse_unverified_ship`) — this function refuses on the OTHER packet's behalf, so the check
+    holds regardless of which library entry point a caller used to get here. See docs/PROTOCOL.md §2a.
     """
     push = packet["push_status"]
     if not (push["pushed"] or push["deployed"] or push["restarted"]):
@@ -761,6 +892,20 @@ def assert_review_ref_resolves(packet: Mapping[str, Any], *, root: Path | str | 
         raise PacketError(
             f"push_status.review_ref: verdict {ref!r} approved head {match['head_sha']!r}, but this "
             f"packet shipped {head!r} — an approval does not carry over to a different commit"
+        )
+    reviewed = find_packet(match["packet_id"], root)
+    if reviewed is None:
+        raise PacketError(
+            f"push_status.review_ref: verdict {ref!r} approved packet {match['packet_id']!r}, which "
+            "no longer exists in this inbox — its diff evidence cannot be re-verified for this ship"
+        )
+    _, _, reviewed_packet = reviewed
+    if reviewed_packet.get("diff_provenance") != "derived":
+        raise PacketError(
+            f"push_status.review_ref: verdict {ref!r} approved packet {match['packet_id']!r}, whose "
+            f"diff_provenance is {reviewed_packet.get('diff_provenance')!r}, not 'derived' — an "
+            "approval of a self-reported, unverified changed_files cannot unlock a ship: the "
+            "reviewer must approve a packet published without --no-derive (see docs/PROTOCOL.md §2a)"
         )
     altered = altered_test_files(packet["changed_files"])
     if altered:

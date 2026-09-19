@@ -52,7 +52,6 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Mapping
 
 import structlog
 
@@ -405,79 +404,6 @@ def _watch(args) -> int:
     return EXIT_OK
 
 
-def _bind_diff_evidence(packet: dict, *, derive: bool) -> tuple[dict, list[str]]:
-    """Replace the packet's *claimed* `changed_files`/`diff_summary` with the head's derived truth.
-
-    Returns the packet (mutated in place and also returned, for the caller's convenience) and the
-    notes to print. Raises `PacketError` when the packet describes a change the named head does
-    not — closing the gap where `changed_files` was otherwise only the builder's self-report, and
-    where the test-change acknowledgment gate (`twoperson.testset`) reasoned over that same
-    self-report rather than over what actually changed.
-    """
-    notes: list[str] = []
-    base, head = packet["git"]["base_sha"], packet["git"]["head_sha"]
-    if not derive:
-        packet["diff_provenance"] = "claimed"
-        notes.append("diff evidence NOT derived (--no-derive): the numbers below are the "
-                     "builder's claim, and nothing has checked them against the named head. "
-                     "This packet can NEVER unlock a ship for a concrete head while it stays "
-                     "'claimed' — see docs/PROTOCOL.md §2a")
-        return packet, notes
-    if not gitfacts.concrete(base) or not gitfacts.concrete(head):
-        # A packet may legitimately not name a head yet — a draft, a round proposing nothing to
-        # merge. Deriving is impossible there, and refusing would break a flow this has no business
-        # touching, so this says what it did not check instead of implying it was checked.
-        packet["diff_provenance"] = "claimed"
-        notes.append("diff evidence NOT derived: the packet does not name a concrete base/head "
-                     "sha, so nothing has checked its numbers against a commit")
-        return packet, notes
-    facts = gitfacts.derive(Path.cwd(), base, head, base_ref=packet["git"]["base_ref"])
-    problems = gitfacts.disagreement(packet, facts)
-    if problems:
-        raise PacketError(
-            "the packet's diff evidence does not describe the head it names:\n  - "
-            + "\n  - ".join(problems)
-            + "\nThe values above were derived from the head; correct the packet, or pass "
-              "--no-derive to publish an explicitly unverified claim instead."
-        )
-    packet["changed_files"] = facts["changed_files"]
-    packet["diff_summary"] = facts["diff_summary"]
-    packet["diff_provenance"] = "derived"
-    notes.append(f"diff evidence derived from {base[:7]}...{head[:7]}: "
-                f"{facts['diff_summary']['files_changed']} file(s), "
-                f"+{facts['diff_summary']['insertions']}/-{facts['diff_summary']['deletions']}")
-    return packet, notes
-
-
-def _refuses_unverified_ship(packet: Mapping) -> str | None:
-    """The reason a shipped packet must be refused, or ``None`` when it is not this kind of refusal.
-
-    A CLAIMED (underived) `changed_files` can never be the basis for unlocking a ship. Without this,
-    `--no-derive` for a real, concrete head would publish the builder's self-report unchecked, and
-    `inbox.assert_review_ref_resolves`'s test-change acknowledgment gate reasons over exactly that
-    self-report: a builder who simply omits an altered test file from `changed_files` gets an
-    approval that never acknowledged it, then ships the same head with `diff_provenance: "claimed"`
-    — the gate closed by `twoperson.gitfacts` for `verify`/`publish` is reopened by the one flag
-    that skips it. `--no-derive` remains for what it says it is for — a draft, or a checkout that
-    genuinely does not hold the commits — but neither of those ever reports pushed/deployed/restarted
-    for a CONCRETE head, so this refuses exactly the one combination that would otherwise reopen the
-    gap: a concrete head, actually shipped, whose diff was never checked against it.
-    """
-    push = packet["push_status"]
-    if not (push["pushed"] or push["deployed"] or push["restarted"]):
-        return None
-    head = packet["git"]["head_sha"]
-    if not gitfacts.concrete(head) or packet["diff_provenance"] == "derived":
-        return None
-    return (
-        f"push_status reports a push/deploy/restart for concrete head {head!r}, but "
-        f"diff_provenance is {packet['diff_provenance']!r}, not 'derived' — an unverified "
-        "(--no-derive) diff claim can never be the basis for a ship. Publish from a checkout that "
-        "holds the commits so changed_files can be derived and checked against the head (see "
-        "docs/PROTOCOL.md §2a)."
-    )
-
-
 def _install_watch(args) -> int:
     """`install-watch`: install the launchd agent that fires the watcher on every inbox change."""
     script = watch_script_path()
@@ -659,40 +585,23 @@ def _dispatch(args) -> int:
             packet = loads_packet(raw)
         except PacketError as exc:
             return _fail(f"packet rejected — {exc}")
-        # The packet's OWN gates run before anything is derived from git. They are cheaper, and an
-        # unresolvable review_ref or an unacknowledged test change is wrong however accurate the
-        # diffstat turns out to be — deriving first would mask them: a packet with both problems
-        # would report only the git one, get republished, and meet the real objection a round later.
+        # `inbox.prepare_packet` is the ONE pipeline both `verify` and `publish` run: it validates,
+        # derives+stamps diff evidence, and applies every ship-gate check — the same checks a caller
+        # of the library directly (bypassing this CLI entirely) gets from `inbox.publish` itself.
+        # This command prints its notes and, for `verify`, stops here without writing anything.
         try:
-            inbox.assert_review_ref_resolves(packet)
-        except PacketError as exc:
-            return _fail(f"packet rejected — {exc}")
-        try:
-            packet, notes = _bind_diff_evidence(packet, derive=args.derive)
+            validated, notes = inbox.prepare_packet(packet, derive=args.derive)
         except PacketError as exc:
             return _fail(f"packet rejected — {exc}")
         for note in notes:
             print(note, file=sys.stderr)
-        # Runs for BOTH verify and publish, and BEFORE either's own gate checks: a packet this
-        # refuses can never ship regardless of what `assert_review_ref_resolves` would say about its
-        # (self-reported, unverified) `changed_files` — see `_refuses_unverified_ship`.
-        unverified_ship = _refuses_unverified_ship(packet)
-        if unverified_ship is not None:
-            return _fail(f"packet rejected — {unverified_ship}")
         if args.cmd == "verify":
-            # `verify` is the dry run of `publish`, so it must fail for every reason `publish`
-            # would — including a gate that only becomes visible once the DERIVED changed_files (a
-            # git-verified rename, an omitted test file) has replaced the builder's self-report.
-            try:
-                inbox.assert_review_ref_resolves(packet)
-            except PacketError as exc:
-                return _fail(f"packet rejected — {exc}")
-            print(f"ok: packet {packet['packet_id']} is valid (nothing was written)")
+            print(f"ok: packet {validated['packet_id']} is valid (nothing was written)")
             return EXIT_OK
         # `tests[]` citations are checked at publish only, never at verify: the check reads the
         # repository at the head being published, and `verify` is allowed to run anywhere.
-        if args.derive and gitfacts.concrete(packet["git"]["head_sha"]):
-            cites = check_citations(Path.cwd(), packet)
+        if args.derive and gitfacts.concrete(validated["git"]["head_sha"]):
+            cites = check_citations(Path.cwd(), validated)
             if cites.state == CITATIONS_MISSING:
                 for finding in citation_findings(cites):
                     print(f"error: {finding}", file=sys.stderr)
@@ -706,7 +615,7 @@ def _dispatch(args) -> int:
             print("test citations NOT verified: no concrete head to check them against "
                  "(a draft, or --no-derive)", file=sys.stderr)
         try:
-            path = inbox.publish(packet)
+            path = inbox.publish(packet, derive=args.derive)
         # Named, not `OSError` — see `_emit_signal`: the refusal is a `PacketError`, and the only
         # `OSError` the primitive still lets past is the documented lost race.
         except (PacketError, FileNotFoundError) as exc:
