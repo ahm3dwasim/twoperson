@@ -60,17 +60,18 @@ All notable changes to this project are documented here. The format follows
   added outside that conversion point.
 - A hard link or FIFO planted at any writable name (a lane entry, the publish or watch lock, the
   cursor, or the mute switch) can no longer truncate a file outside the inbox, write through a link,
-  or block the process forever: every write goes to a fresh temp file revealed by `os.replace`,
-  nothing is ever opened for writing by an existing name, and a non-regular file is refused before
-  use in either read or write direction.
+  or block the process forever: every content write goes to a fresh temp file revealed by
+  `os.replace`, so no content is ever written or truncated through an existing name (lock files are
+  opened without truncation and must be a regular file with a single link), and a non-regular file is
+  refused before use in either read or write direction.
 - The publish lock no longer leaks a file descriptor on every acquisition, and a failed lock release
   can no longer crash an already-successful publish or dispatch pass.
 - The watcher's cursor is read with a bounded size; malformed, non-UTF-8, deeply nested, or
   numerically oversized content recovers as "no cursor" (logged) instead of crashing the watcher.
 - A permission error or an I/O fault reading a lane entry or the mute switch is now reported as a
-  refusal, never silently read as "that name is free" or "not muted" — one bad entry can no longer
-  suppress notification for the rest of a lane, or a transient fault let a launch through with the
-  pause state unknown.
+  refusal, never silently read as "that name is free" or "not muted". One bad entry makes its own
+  lane report as unreadable (and hold its notifications) but can no longer suppress any other lane,
+  and a transient fault can no longer let a launch through with the pause state unknown.
 
 ## [0.1.1] - 2026-09-03
 
