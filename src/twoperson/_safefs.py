@@ -58,7 +58,6 @@ import contextlib
 import fcntl
 import os
 import stat as _stat
-from pathlib import Path
 from typing import IO
 
 from .packet import LaneUnreadable, PacketError
@@ -242,6 +241,33 @@ def _create(dir_fd: int | None, name: str, flags: int, *, label: str, kind: type
         return os.open(name, flags, mode, **_args(dir_fd))
 
 
+def _mkdir_parents(name: str, label: str, kind: type[PacketError]) -> None:
+    """``os.mkdir`` with parents, without ever asking an existence question that can swallow a fault.
+
+    ``Path.mkdir(parents=True, exist_ok=True)`` decides whether a failed create was harmless by
+    calling ``is_dir()`` — which as of Python 3.14 answers via ``os.path.isdir``, mapping ANY
+    ``OSError`` (a failing disk included, not only "does not exist") to ``False``. A create that
+    fails because the directory is already there is indistinguishable, at that call, from one that
+    fails because the disk answered ``EIO`` on the very check meant to tell them apart: 3.14 reads
+    both as "not a directory", so ``mkdir`` re-raises its own already-caught ``FileExistsError`` and
+    the fault that should have been a refusal is gone before ``open_dir`` ever sees it. This asks
+    the question the ``dir_fd`` branch already avoids asking: a bare ``os.mkdir`` either succeeds,
+    finds a MISSING PARENT (``FileNotFoundError``, so make that first), or finds the name already
+    occupied (``FileExistsError``, for the open that follows to decide whether it is usable) —
+    never "what does this OSError mean about the name".
+    """
+    try:
+        with _converting(label, "created", kind, passthrough=(FileExistsError, FileNotFoundError)):
+            os.mkdir(name)
+    except FileNotFoundError:
+        parent = os.path.dirname(name.rstrip(os.sep))
+        if not parent or parent == name:
+            raise
+        _mkdir_parents(parent, label, kind)
+        with _converting(label, "created", kind, passthrough=(FileExistsError,)):
+            os.mkdir(name)
+
+
 def open_dir(parent_fd: int | None, name: str, *, create: bool = False,
              what: str | None = None) -> int:
     """Open one directory, or refuse. ``parent_fd`` is a HELD descriptor; ``None`` means a path.
@@ -260,7 +286,9 @@ def open_dir(parent_fd: int | None, name: str, *, create: bool = False,
     failures (a full disk, a permission wall), and a raw ``OSError`` out of either is a traceback
     where the operator needs a refusal. ``FileExistsError`` from ``mkdir`` is deliberately passed
     through to the open rather than converted — it means something already occupies the name, which
-    is exactly the question the open asks and answers in one syscall.
+    is exactly the question the open asks and answers in one syscall. The root (``parent_fd is
+    None``) goes through `_mkdir_parents` rather than ``Path.mkdir(parents=True, exist_ok=True)`` —
+    see that function for why the two are not the same call.
 
     :raises LaneUnreadable: this hop is not a real, openable directory.
     :raises FileNotFoundError: it is not there and ``create`` is false — the caller's own
@@ -269,10 +297,10 @@ def open_dir(parent_fd: int | None, name: str, *, create: bool = False,
     label = what or f"the directory {name!r}"
     if create:
         try:
-            with _converting(label, "created", LaneUnreadable, passthrough=(FileExistsError,)):
-                if parent_fd is None:
-                    Path(name).mkdir(parents=True, exist_ok=True)
-                else:
+            if parent_fd is None:
+                _mkdir_parents(name, label, LaneUnreadable)
+            else:
+                with _converting(label, "created", LaneUnreadable, passthrough=(FileExistsError,)):
                     os.mkdir(name, dir_fd=parent_fd)
         except FileExistsError:
             pass            # occupied; the open below decides whether what occupies it is usable

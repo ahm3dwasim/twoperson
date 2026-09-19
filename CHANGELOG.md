@@ -6,7 +6,22 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-19
+
+### Fixed
+
+- The inbox root's directory creation no longer relies on `Path.mkdir(exist_ok=True)`'s internal
+  "is this already a directory?" check, which as of Python 3.14 maps *any* failure of that check
+  (a failing disk, not only "does not exist") to "no" — so a transient I/O fault at exactly that
+  moment used to be silently discarded instead of refused, on 3.14 only. Root creation now asks the
+  filesystem only "did the create succeed, or is a name already there" and lets the directory open
+  that follows decide whether what is there is usable, the same way every other directory in the
+  tree already does.
+
 ## [0.1.2] - 2026-09-19
+
+Tagged but never published to PyPI: the release gate stopped it on a Python 3.14 test failure.
+Its changes ship in 0.1.3.
 
 ### Added
 

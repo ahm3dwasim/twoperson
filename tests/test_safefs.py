@@ -346,7 +346,18 @@ def _enospc(*_args, **_kwargs):
 
 
 def _enospc_root_mkdir(monkeypatch):
-    monkeypatch.setattr(pathlib.Path, "mkdir", _enospc)
+    # The root (no held `dir_fd` yet) goes through `_safefs._mkdir_parents`'s bare `os.mkdir(name)`,
+    # not `Path.mkdir` — see that function for why a plain `os.mkdir` replaced the pathlib call. The
+    # lane mkdir below is `dir_fd`-addressed, so the two are told apart the same way
+    # `_enospc_lane_mkdir` already tells them apart, and by the same signature.
+    real = os.mkdir
+
+    def only_the_root(name, *args, **kwargs):
+        if "dir_fd" not in kwargs:
+            _enospc()
+        return real(name, *args, **kwargs)
+
+    monkeypatch.setattr(inbox.os, "mkdir", only_the_root)
 
 
 def _enospc_lane_mkdir(monkeypatch):
