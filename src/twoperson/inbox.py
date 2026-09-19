@@ -304,8 +304,24 @@ def _ensure_tree(root: Path) -> Path:
     the same as holding it once. Creating `root / name` by path instead would re-resolve the root
     once per lane, so a root swapped for a symlink part-way through the loop would have had the
     remaining lanes created somewhere else.
+
+    CREATION IS A REFUSAL SURFACE TOO, and it is answered by the same open. A root that is an
+    existing regular file, a root that is a dangling symlink, and a parent this process may not
+    write to all used to leave here as raw `FileExistsError` / `PermissionError` — a traceback out
+    of `next`, which is the one thing `LaneUnreadable` exists to prevent, raised one hop *above* the
+    open that would have reported it. `FileExistsError` is deliberately passed through instead of
+    converted: it means something already occupies the name, which is exactly the question
+    `_open_root_dir` asks and answers in one syscall, with the refusal's own wording. Every other
+    `OSError` here (a permission wall, a parent that is not a directory) is a refusal and is raised
+    as one — and `FileNotFoundError` is not exempted: this is the CREATING path, so "there is
+    nothing there" is not an answer it can return as success.
     """
-    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        pass                # occupied; the open below decides whether what occupies it is usable
+    except OSError as exc:
+        raise _refusal(f"the inbox root {root}", exc, verb="created") from exc
     root_fd = _open_root_dir(root)      # refuses a root that is a symlink, not a real directory
     try:
         _fchmod_dir(root_fd)
@@ -340,7 +356,7 @@ def _publish_lock(root: Path):
     root_fd = _open_root_dir(root)
     try:
         handle = os.fdopen(
-            os.open(".lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=root_fd),
+            _create_at(root_fd, ".lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW),
             "w",
         )
     finally:
@@ -392,15 +408,19 @@ def _assert_inside(root: Path, target: Path) -> Path:
 # here (a symlinked lane, a lane that is a regular file, a permission wall) is a refusal.
 # --------------------------------------------------------------------------------------------
 
-def _refusal(what: str, exc: OSError) -> LaneUnreadable:
+def _refusal(what: str, exc: OSError, *, verb: str = "opened") -> LaneUnreadable:
     """One refusal, spelled the same way at every hop of the chain.
 
     ``what`` is built from the module's own lane names and the caller's root — never from a
     dropped entry's name — so the message cannot be forged by whoever dropped it. It reaches a
     terminal through `LaneScan.reason` and the CLI, so the errno's own `strerror` is carried rather
     than the exception's `repr`, which would drag a path and a traceback into one line.
+
+    ``verb`` is the one thing that differs by hop, and it is a statement of fact rather than
+    decoration: a root this module had to CREATE cannot be said to have failed to open. The type —
+    which is what every caller and the CLI boundary net switch on — is identical either way.
     """
-    return LaneUnreadable(f"{what} could not be opened: {exc.strerror or type(exc).__name__}")
+    return LaneUnreadable(f"{what} could not be {verb}: {exc.strerror or type(exc).__name__}")
 
 
 def _open_lane_at(root_fd: int, name: str) -> int:
@@ -421,11 +441,32 @@ def _open_lane_at(root_fd: int, name: str) -> int:
         raise _refusal(f"the lane {name!r}", exc) from exc
 
 
+def _refuse_a_root_that_cannot_be_created(root: Path) -> None:
+    """A missing root is "provably empty" only where it COULD have existed.
+
+    `_lane_scan` reads a root that is not there as an empty inbox, which is right for a fresh
+    checkout whose `state/` has not been made yet, and wrong for an inbox whose parent refuses this
+    process: there, "nothing is waiting" is a refusal reported as the empty answer it exists to be
+    told apart from, and a poller goes quiet on exactly the misconfiguration it should surface. So
+    the question is asked of the PARENT — and only when the parent is itself there: a path whose
+    whole tree is absent is the documented "never created" case and stays one, because `_ensure_tree`
+    would create every level of it on the next write.
+
+    :raises LaneUnreadable: the root does not exist and cannot be made to.
+    """
+    parent = root.parent
+    if parent.is_dir() and not os.access(parent, os.W_OK | os.X_OK):
+        raise LaneUnreadable(
+            f"the inbox root {root} could not be created: {parent} is not writable"
+        )
+
+
 def _open_root_dir(root: Path) -> int:
     """The inbox root's own descriptor, or `LaneUnreadable` when the root is not a real directory."""
     try:
         return os.open(root, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
     except FileNotFoundError:
+        _refuse_a_root_that_cannot_be_created(root)
         raise               # nothing has ever been published here — a provably empty inbox
     except OSError as exc:
         raise _refusal(f"the inbox root {root}", exc) from exc
@@ -470,7 +511,18 @@ def _open_lane_entry(path: Path) -> int:
     in the window between the listing and the read. The chain is root -> lane -> entry, and each hop
     is refused in the syscall that would have followed it.
 
-    :raises LaneUnreadable: any hop refused — including an ENTRY that `O_NOFOLLOW` refuses, which is
+    `O_NOFOLLOW` IS NOT ENOUGH ON ITS OWN: it refuses a symlink and permits everything else, and
+    "everything else" includes a FIFO. `O_RDONLY` on a FIFO with no writer BLOCKS until one appears,
+    so an entry listed as a name and swapped for a FIFO between the listing and the open hangs the
+    reader forever — with the size check itself (an `fstat` that never gets a descriptor to stat)
+    behind the block. Three things close it, in this order: `O_NONBLOCK` makes the open return
+    immediately whatever the entry is, `fstat` on the DESCRIPTOR asks what was actually opened, and
+    anything that is not `S_ISREG` is refused before a byte is read or a size is trusted. The
+    descriptor is what is checked, so the check and the read cannot be answered by two different
+    objects. `O_NONBLOCK` is cleared on the way out: it is opened with for the refusal's sake, not to
+    change how the caller reads the bytes.
+
+    :raises LaneUnreadable: any hop refused — including an ENTRY that is not a regular file, which is
         the same refusal one level down rather than a different kind of event.
     :raises FileNotFoundError: some hop is already gone; the caller decides what that means.
     """
@@ -478,13 +530,36 @@ def _open_lane_entry(path: Path) -> int:
     lane_fd = _lane_dir_fd(root, lane)
     try:
         try:
-            return os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=lane_fd)
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=lane_fd)
         except FileNotFoundError:
             raise
         except OSError as exc:
             raise _refusal(f"the entry {_safe_name(name)!r} in lane {lane!r}", exc) from exc
+        try:
+            if not _stat.S_ISREG(os.fstat(fd).st_mode):
+                raise LaneUnreadable(
+                    f"the entry {_safe_name(name)!r} in lane {lane!r} could not be opened: "
+                    f"not a regular file"
+                )
+            _set_blocking(fd)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
     finally:
         os.close(lane_fd)
+
+
+def _set_blocking(fd: int) -> None:
+    """Clear `O_NONBLOCK` on a descriptor already opened for reading.
+
+    `_open_lane_entry` sets it so the OPEN cannot block on a hostile entry; a regular file never
+    blocks on the open either way, so leaving it set would only decide how the read behaves. The
+    caller gets the ordinary blocking descriptor it expects, and the refusal above never depended on
+    this step succeeding.
+    """
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
 
 
 def _read_lane_file(path: Path) -> bytes:
@@ -562,6 +637,29 @@ def _free_name_in(lane_fd: int, name: str) -> str:
     raise PacketError(f"cannot find a free filename for {name}")
 
 
+def _create_at(dir_fd: int, name: str, flags: int, mode: int = 0o600) -> int:
+    """``os.open`` a name in a directory we HOLD, retrying a concurrent create once.
+
+    macOS intermittently answers a create that another thread is performing at the same instant with
+    ``ENOENT`` — neither creating the file nor reporting ``EEXIST``. Measured on this platform: 62
+    failures in 320 concurrent ``openat(dir_fd, name, O_CREAT…)`` attempts, and 0 in 320 with the
+    single retry below. The answer cannot mean what it says, because the directory is open and the
+    create is unconditional, so it is not a refusal; treating it as one made a lock, a switch, a
+    cursor and a staging file all fail for no reason at all — the failures `_publish_lock`,
+    `_write_lane_file`, `_atomic_publish` and the whole watcher would otherwise inherit.
+
+    ONE retry, deliberately not a loop: by the time the loser asks again the winner's create has
+    landed, so the second call finds the name — ``O_CREAT`` opens it, and ``O_EXCL`` reports
+    ``EEXIST``, which IS the answer that caller asked for. Every other answer the kernel can give is
+    the caller's own and is returned unchanged. This is only for CREATING opens: a read that says
+    ``ENOENT`` means the entry is gone, and it keeps meaning that.
+    """
+    try:
+        return os.open(name, flags, mode, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return os.open(name, flags, mode, dir_fd=dir_fd)
+
+
 def _write_all(fd: int, body: bytes) -> None:
     """Write the WHOLE buffer, in as many calls as the kernel needs.
 
@@ -578,12 +676,17 @@ def _write_all(fd: int, body: bytes) -> None:
         view = view[written:]
 
 
-def _write_lane_file(path: Path, body: bytes) -> None:
-    """Create or replace one file IN a lane, through the descriptor chain.
+def _write_lane_file(root: Path, lane: str, name: str, body: bytes) -> None:
+    """Create or replace one file IN a lane of ``root``, through the descriptor chain.
 
     Used for the `.reason.txt` recorded beside a quarantined packet. `Path.write_text` resolves the
     lane again, so a lane swapped for a symlink would have had the reason — and only the reason —
     written outside the inbox.
+
+    The lane is named, not derived from the target path, for the same reason a move's is (see
+    `_lane_member`): a write's inbox is the caller's to name, and reading it back out of the path
+    would discard the one the caller gave. The entry NAME is checked as one component here, so this
+    hop carries its own authority rather than inheriting it from the move that produced the path.
 
     The create is refused the same way the read side is: a `.reason.txt` name pre-created as a
     symlink is refused by `O_NOFOLLOW`, and that refusal is a `LaneUnreadable` rather than a raw
@@ -591,13 +694,11 @@ def _write_lane_file(path: Path, body: bytes) -> None:
     past, and the quarantine writes this file — so leaving it raw hands the operator a traceback for
     a lane that was tampered with, which is the one thing a refusal exists to report legibly.
     """
-    root, lane, name = _split_lane_path(path)
     _assert_plain_name(name)
     lane_fd = _lane_dir_fd(root, lane)
     try:
         try:
-            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600,
-                         dir_fd=lane_fd)
+            fd = _create_at(lane_fd, name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW)
         except FileNotFoundError:
             raise            # O_CREAT makes this unreachable; kept so the rule has no exception
         except OSError as exc:
@@ -610,8 +711,32 @@ def _write_lane_file(path: Path, body: bytes) -> None:
         os.close(lane_fd)
 
 
-def _move_lane_entry(src: Path, dst_lane: str) -> Path:
-    """Move one lane entry into another lane of the SAME inbox, both ends by descriptor.
+def _lane_member(root: Path, lane: str, path: Path) -> str:
+    """The entry NAME ``path`` must have inside ``root/lane`` — or a refusal.
+
+    A move names its source as a PATH and its inbox as an explicit ``root``, and those are two
+    claims that can disagree. Deriving the root back out of the source threw the explicit one away:
+    ``archive_claimed('/outside/claimed/x.json', root='/intended')`` resolved both lanes under
+    ``/outside`` and moved the file THERE, so a caller that named an inbox did not get the move it
+    asked for and had no way to know — the return value is a path, and it looked like a success. The
+    root the caller names is the only authority for where an entry may be, so the source is required
+    to BE an entry of ``root/lane`` and is refused, not followed, when it is not.
+
+    The comparison is on the path as given, deliberately: resolving it first would ask a question
+    about where the path POINTS, which is the answer an attacker supplies. A caller that built the
+    path the way this module hands paths out — ``root / lane / name``, exactly what `_lane_scan`
+    returns — always matches, and a caller holding a path to some other inbox is told so.
+    """
+    if path.parent != root / lane:
+        raise PacketError(
+            f"refusing to move {_safe_name(path.name)!r}: it is not an entry in the {lane!r} lane "
+            f"of the inbox root {root}"
+        )
+    return _assert_plain_name(path.name)
+
+
+def _move_lane_entry(src: Path, *, root: Path, src_lane: str, dst_lane: str) -> Path:
+    """Move one lane entry into another lane of the inbox named by ``root``, both ends by descriptor.
 
     `os.rename(src, dst)` resolves both paths again, so a lane swapped for a symlink after the
     listing redirected the move — and the file it moved — outside the inbox. `os.rename` with
@@ -620,12 +745,18 @@ def _move_lane_entry(src: Path, dst_lane: str) -> Path:
     one), so neither end can be redirected. The free-name choice is made against the destination
     lane's descriptor for the same reason.
 
+    BOTH lanes are resolved from ``root`` — the source lane by the name the caller gives (never by
+    reading it back out of ``src``), after `_lane_member` has confirmed the source is an entry of
+    that very lane. So the source that is validated and the source that is renamed are the same
+    claim, and the destination is derived from the inbox the caller named rather than from wherever
+    the source happened to sit.
+
     `FileNotFoundError` is left to the caller: it is what "the source is already gone" looks like,
     which every caller here treats as a lost race and not as a failure. A lane that cannot be
-    opened is a different answer and is allowed to propagate.
+    opened, and a source outside the inbox the caller named, are different answers and are allowed
+    to propagate.
     """
-    root, src_lane, name = _split_lane_path(src)
-    _assert_plain_name(name)
+    name = _lane_member(root, src_lane, src)
     src_fd = _lane_dir_fd(root, src_lane)
     try:
         dst_fd = _lane_dir_fd(root, dst_lane)
@@ -685,8 +816,8 @@ def _atomic_publish(directory: Path, lane: str, name: str, body: str) -> Path:
             try:
                 # O_EXCL so an attacker cannot pre-create the staging name as a symlink and have us
                 # write through it; O_NOFOLLOW so an existing symlink is refused, not followed.
-                handle = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                                 0o600, dir_fd=staging_fd)
+                handle = _create_at(staging_fd, name,
+                                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW)
                 # Everything from the create to the replace is inside this block on purpose: each of
                 # those steps can fail, and each of them leaves the staging name behind if it does.
                 try:
@@ -1060,12 +1191,20 @@ def _load(path: Path) -> dict:
     return loads_packet(_read_lane_file(path))
 
 
-def quarantine(path: Path, reason: str, *, root: Path | str | None = None) -> Path:
-    """Move a bad packet to ``rejected/`` and record why beside it. Returns the new path."""
-    _ensure_tree(inbox_root(root))
-    target = _move_lane_entry(path, "rejected")
+def quarantine(path: Path, reason: str, *, root: Path | str | None = None,
+               lane: str = "pending") -> Path:
+    """Move a bad entry out of ``lane`` into ``rejected/`` and record why beside it.
+
+    Returns the new path. ``lane`` is the lane the caller listed the entry from and defaults to the
+    packet lane, which is the only one that quarantines on its own; the consult lane passes its own
+    name rather than having it read back out of ``path`` (see `_lane_member` for why a caller's
+    inbox is never inferred from a path). The reason file is written to ``rejected/`` of that same
+    explicit root, by name, so both halves of the quarantine are anchored to one inbox.
+    """
+    directory = _ensure_tree(inbox_root(root))
+    target = _move_lane_entry(path, root=directory, src_lane=lane, dst_lane="rejected")
     _write_lane_file(
-        target.parent / f"{target.stem}.reason.txt",
+        directory, "rejected", f"{target.stem}.reason.txt",
         f"{datetime.now(timezone.utc).isoformat(timespec='seconds')}\n{reason}\n".encode("utf-8"),
     )
     log.warning("twoperson.quarantined", path=str(target), reason=reason)
@@ -1095,7 +1234,7 @@ def _next(root: Path | str | None, *, claim: bool) -> Claimed | None:
             return Claimed(path=path, packet=packet)
         _ensure_tree(directory)
         try:
-            target = _move_lane_entry(path, "claimed")
+            target = _move_lane_entry(path, root=directory, src_lane="pending", dst_lane="claimed")
         except FileNotFoundError:
             continue  # another auditor claimed it first; there is no duplicate to hand back
         # Only "the source is already gone" is absorbed above. A lane that cannot be OPENED is a
@@ -1133,9 +1272,11 @@ def requeue_claimed(path: Path, *, root: Path | str | None = None) -> Path:
     Exclusive via `os.rename`: if another process already requeued or re-claimed this exact path, the
     rename raises `FileNotFoundError` — the caller should treat that as "someone else already
     recovered it", not as a failure to surface, exactly like a lost `claim_next` race is not an
-    error. A lane that cannot be opened raises instead: that is a refusal, not a lost race."""
-    _ensure_tree(inbox_root(root))
-    target = _move_lane_entry(path, "pending")
+    error. A lane that cannot be opened raises instead: that is a refusal, not a lost race. A source
+    that is not an entry of ``root/claimed`` is refused too, and nothing is moved: the inbox named
+    here is the only one whose lanes this call may touch."""
+    directory = _ensure_tree(inbox_root(root))
+    target = _move_lane_entry(path, root=directory, src_lane="claimed", dst_lane="pending")
     log.warning("twoperson.requeued", path=str(target))
     return target
 
@@ -1153,9 +1294,13 @@ def archive_claimed(path: Path, *, root: Path | str | None = None) -> Path:
     timeout, so a completed review that stayed behind would eventually be mistaken for an orphan and
     audited again for no reason. Best-effort by design — call this AFTER `publish_verdict` succeeds;
     if archiving itself fails, the verdict (the actual audit record) is already safe, so a caller
-    should log and move on rather than treat it as a review failure."""
-    _ensure_tree(inbox_root(root))
-    target = _move_lane_entry(path, "audited")
+    should log and move on rather than treat it as a review failure.
+
+    The archive lands in the inbox the caller names, not in whatever inbox the claimed path happens
+    to sit in: a source that is not an entry of ``root/claimed`` is refused (`PacketError`) and
+    nothing is moved."""
+    directory = _ensure_tree(inbox_root(root))
+    target = _move_lane_entry(path, root=directory, src_lane="claimed", dst_lane="audited")
     log.info("twoperson.archived", path=str(target))
     return target
 
@@ -1207,7 +1352,7 @@ def read_signals(root: Path | str | None = None) -> list[tuple[Path, dict]]:
         except LaneUnreadable:
             raise       # a refused lane is not a bad file: never quarantine over it (see `_next`)
         except PacketError as exc:
-            quarantine(path, str(exc), root=directory)
+            quarantine(path, str(exc), root=directory, lane="signals")
         except OSError:  # vanished or unreadable between listing and load — nothing to report
             continue
     return out
@@ -1236,14 +1381,21 @@ def ack_signals(paths: Iterable[Path] | None = None, *, root: Path | str | None 
             raise TypeError("ack_signals: give the root positionally or as root=, not both")
         root, paths = paths, None
     directory = _ensure_tree(inbox_root(root))
-    signals_dir = (directory / "signals").resolve()
     candidates = pending_signals(directory) if paths is None else [Path(p) for p in paths]
     acked: list[Path] = []
     for path in candidates:
-        if path.resolve().parent != signals_dir:
+        try:
+            # The same rule the move itself enforces (`_lane_member`), so what this skips and what
+            # the move would refuse are one answer rather than two. It replaced a `.resolve()`
+            # comparison, which asked where the path POINTS — resolving the lane and following a
+            # symlink out of the inbox to decide whether to touch it, the exact re-resolution the
+            # descriptor chain exists to remove.
+            _lane_member(directory, "signals", path)
+        except PacketError:
             continue  # only ack a file that is actually a signal in THIS inbox's signals/ lane
         try:
-            target = _move_lane_entry(path, "signals_seen")
+            target = _move_lane_entry(path, root=directory, src_lane="signals",
+                                      dst_lane="signals_seen")
         except FileNotFoundError:
             continue  # another auditor took it first, or it vanished — nothing to hand back
         acked.append(target)
@@ -1284,7 +1436,7 @@ def read_verdicts(root: Path | str | None = None) -> list[tuple[Path, dict]]:
         except LaneUnreadable:
             raise       # a refused lane is not a bad file: never quarantine over it (see `_next`)
         except PacketError as exc:
-            quarantine(path, str(exc), root=directory)
+            quarantine(path, str(exc), root=directory, lane="verdicts")
         except OSError:  # vanished or unreadable between listing and load — nothing to report
             continue
     return out
@@ -1311,15 +1463,18 @@ def ack_verdicts(paths: Iterable[Path], *, root: Path | str | None = None) -> li
     if isinstance(paths, (str, Path)):
         raise TypeError("ack_verdicts: paths must be an iterable of verdict paths, not a single path/str")
     directory = _ensure_tree(inbox_root(root))
-    verdicts_dir = (directory / "verdicts").resolve()
     acked: list[Path] = []
     for path in paths:
         path = Path(path)
-        # Only ack a file that is actually a verdict in THIS inbox's verdicts/ lane.
-        if path.resolve().parent != verdicts_dir:
-            continue
         try:
-            target = _move_lane_entry(path, "verdicts_seen")
+            # One containment rule for the skip and the move: see `ack_signals` for why the
+            # `.resolve()` comparison this replaced was the wrong question (it follows the link).
+            _lane_member(directory, "verdicts", path)
+        except PacketError:
+            continue  # only ack a file that is actually a verdict in THIS inbox's verdicts/ lane
+        try:
+            target = _move_lane_entry(path, root=directory, src_lane="verdicts",
+                                      dst_lane="verdicts_seen")
         except FileNotFoundError:
             continue  # another reader took it first, or it vanished — nothing to hand back
         acked.append(target)
@@ -1406,7 +1561,7 @@ def _next_consult(root: Path | str | None, *, claim: bool) -> Claimed | None:
         except LaneUnreadable:
             raise       # a refused lane is not a bad file: never quarantine over it (see `_next`)
         except PacketError as exc:
-            quarantine(path, str(exc), root=directory)
+            quarantine(path, str(exc), root=directory, lane="consult")
             continue
         except OSError:  # vanished or unreadable between listing and load — nothing to answer
             continue
@@ -1414,7 +1569,8 @@ def _next_consult(root: Path | str | None, *, claim: bool) -> Claimed | None:
             return Claimed(path=path, packet=consult)
         _ensure_tree(directory)
         try:
-            target = _move_lane_entry(path, "consult_claimed")
+            target = _move_lane_entry(path, root=directory, src_lane="consult",
+                                      dst_lane="consult_claimed")
         except FileNotFoundError:
             continue  # another auditor claimed it first; there is no duplicate to hand back
         log.info("twoperson.consult_claimed", consult_id=consult["consult_id"], path=str(target))
@@ -1444,9 +1600,10 @@ def claimed_consults(root: Path | str | None = None) -> list[Path]:
 def requeue_claimed_consult(path: Path, *, root: Path | str | None = None) -> Path:
     """Move a claimed consult back to ``consult/`` — the consult-lane sibling of `requeue_claimed`,
     for the same reason: a crash between `claim_consult` and `publish_advice` must not lose the
-    question forever. Exclusive via `os.rename`, same race handling as `requeue_claimed`."""
-    _ensure_tree(inbox_root(root))
-    target = _move_lane_entry(path, "consult")
+    question forever. Exclusive via `os.rename`, same race handling as `requeue_claimed` — including
+    its refusal of a source that is not an entry of ``root/consult_claimed``."""
+    directory = _ensure_tree(inbox_root(root))
+    target = _move_lane_entry(path, root=directory, src_lane="consult_claimed", dst_lane="consult")
     log.warning("twoperson.consult_requeued", path=str(target))
     return target
 
@@ -1460,9 +1617,12 @@ def archived_consults(root: Path | str | None = None) -> list[Path]:
 def archive_claimed_consult(path: Path, *, root: Path | str | None = None) -> Path:
     """Move a claimed consult to ``consult_answered/`` — the consult-lane sibling of
     `archive_claimed`, for the same reason: keeps `consult_claimed/` meaning "unresolved" so the
-    stale-claim sweep never mistakes a completed answer for an orphan."""
-    _ensure_tree(inbox_root(root))
-    target = _move_lane_entry(path, "consult_answered")
+    stale-claim sweep never mistakes a completed answer for an orphan. Like `archive_claimed`, the
+    archive lands in the inbox the caller names; a source outside ``root/consult_claimed`` is
+    refused rather than followed."""
+    directory = _ensure_tree(inbox_root(root))
+    target = _move_lane_entry(path, root=directory, src_lane="consult_claimed",
+                              dst_lane="consult_answered")
     log.info("twoperson.consult_archived", path=str(target))
     return target
 
@@ -1499,7 +1659,7 @@ def read_advice(root: Path | str | None = None) -> list[tuple[Path, dict]]:
         except LaneUnreadable:
             raise       # a refused lane is not a bad file: never quarantine over it (see `_next`)
         except PacketError as exc:
-            quarantine(path, str(exc), root=directory)
+            quarantine(path, str(exc), root=directory, lane="advice")
         except OSError:  # vanished or unreadable between listing and load — nothing to report
             continue
     return out
@@ -1520,15 +1680,17 @@ def ack_advice(paths: Iterable[Path], *, root: Path | str | None = None) -> list
     if isinstance(paths, (str, Path)):
         raise TypeError("ack_advice: paths must be an iterable of advice paths, not a single path/str")
     directory = _ensure_tree(inbox_root(root))
-    advice_dir = (directory / "advice").resolve()
     acked: list[Path] = []
     for path in paths:
         path = Path(path)
-        # Only ack a file that is actually an advice in THIS inbox's advice/ lane.
-        if path.resolve().parent != advice_dir:
-            continue
         try:
-            target = _move_lane_entry(path, "advice_seen")
+            # One containment rule for the skip and the move: see `ack_signals`.
+            _lane_member(directory, "advice", path)
+        except PacketError:
+            continue  # only ack a file that is actually an advice in THIS inbox's advice/ lane
+        try:
+            target = _move_lane_entry(path, root=directory, src_lane="advice",
+                                      dst_lane="advice_seen")
         except FileNotFoundError:
             continue  # another reader took it first, or it vanished — nothing to hand back
         acked.append(target)

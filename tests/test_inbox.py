@@ -824,7 +824,11 @@ def test_a_lane_swapped_for_a_symlink_after_the_listing_is_refused_at_the_read(r
 
 def test_a_lane_swapped_for_a_symlink_after_the_listing_is_refused_at_the_move(root, tmp_path):
     """A claim is a rename; the rename addressed BOTH lanes by path, so this swap moved a file from
-    outside the inbox into `claimed/` and handed it to a reviewer as an audited packet."""
+    outside the inbox into `claimed/` and handed it to a reviewer as an audited packet.
+
+    The call shape follows the helper: both lanes come from the inbox the caller names, and the
+    source lane is named rather than read back out of the path (`_lane_member`).
+    """
     import shutil
     published = inbox.publish(valid_packet(), root=root)
     outside = tmp_path / "outside"
@@ -835,7 +839,7 @@ def test_a_lane_swapped_for_a_symlink_after_the_listing_is_refused_at_the_move(r
     (root / "pending").symlink_to(outside)
 
     with pytest.raises(inbox.LaneUnreadable):
-        inbox._move_lane_entry(published, "claimed")
+        inbox._move_lane_entry(published, root=root, src_lane="pending", dst_lane="claimed")
 
     assert smuggled.exists(), "a file from outside the inbox was moved into the claimed lane"
     assert list((root / "claimed").iterdir()) == [], "the claimed lane received an outside file"
@@ -1002,3 +1006,255 @@ def test_the_move_rename_is_addressed_by_descriptor_not_by_path():
     assert "_free_name_in" in source, (
         "the destination name is chosen by path, so it can be answered by a different lane"
     )
+
+
+# --------------------------------------------------------------------------------------------
+# r3: the inbox a caller NAMES is the only one a move may touch
+#
+# Every move used to read its root back out of the source path, so the explicit `root` argument was
+# discarded the moment the move started: `archive_claimed('/outside/claimed/x.json', root='/intended')`
+# resolved BOTH lanes under `/outside` and moved the file there, returning a path that looked exactly
+# like the success the caller asked for. The source is now required to BE an entry of `root/<lane>`.
+# --------------------------------------------------------------------------------------------
+
+#: Every public operation that moves an entry OUT of a lane, with the lane it reads it from. The
+#: `ack_*` family is here too: it documents a SKIP rather than a raise for a foreign path, and a skip
+#: is still a decision that has to be made against the root the caller named.
+_FOREIGN_SOURCE_CASES = (
+    pytest.param("quarantine", "pending", id="quarantine"),
+    pytest.param("requeue_claimed", "claimed", id="requeue_claimed"),
+    pytest.param("archive_claimed", "claimed", id="archive_claimed"),
+    pytest.param("requeue_claimed_consult", "consult_claimed", id="requeue_claimed_consult"),
+    pytest.param("archive_claimed_consult", "consult_claimed", id="archive_claimed_consult"),
+    pytest.param("ack_signals", "signals", id="ack_signals"),
+    pytest.param("ack_verdicts", "verdicts", id="ack_verdicts"),
+    pytest.param("ack_advice", "advice", id="ack_advice"),
+)
+
+
+@pytest.mark.parametrize("name,lane", _FOREIGN_SOURCE_CASES)
+def test_a_move_never_follows_a_source_outside_the_root_it_was_given(name, lane, root, tmp_path):
+    """The demonstrated case, generalized to every move: nothing is moved and nothing is written.
+
+    The foreign inbox is REAL and populated — its lane holds an entry with a plausible name — so a
+    call that followed the source would succeed and look like a success, which is precisely the
+    failure the explicit root has to prevent.
+    """
+    intended = root
+    inbox._ensure_tree(intended)
+    outside = tmp_path / "outside"
+    (outside / lane).mkdir(parents=True)
+    smuggled = outside / lane / "entry.json"
+    smuggled.write_text(json.dumps(valid_packet()), encoding="utf-8")
+
+    call = getattr(inbox, name)
+    if name.startswith("ack_"):
+        assert call([smuggled], root=intended) == [], (
+            f"{name} acknowledged an entry from another inbox"
+        )
+    elif name == "quarantine":
+        with pytest.raises(PacketError):
+            call(smuggled, "malformed", root=intended)
+    else:
+        with pytest.raises(PacketError):
+            call(smuggled, root=intended)
+
+    assert smuggled.exists(), f"{name} moved an entry out of an inbox the caller never named"
+    moved = [p for p in (outside / lane).iterdir() if p != smuggled]
+    assert moved == [], f"{name} left something behind in the foreign lane: {moved}"
+    for target_lane in inbox._SUBDIRS:
+        assert list((intended / target_lane).iterdir()) == [], (
+            f"{name} wrote into {target_lane}/ of the inbox it WAS given"
+        )
+
+
+def test_the_move_destination_comes_from_the_root_not_from_the_source(root, tmp_path):
+    """The other half of the same property: the DESTINATION lane is the named root's, always.
+
+    `root/claimed/x.json` is a perfectly good source for a caller whose root is `tmp_path`'s sibling
+    inbox — and the archive must land in THAT inbox's `audited/`. Read against the foreign lane, so a
+    fix that simply refused every path outside the module's own default would fail here.
+    """
+    inbox._ensure_tree(root)
+    packet = valid_packet()
+    inbox.publish(packet)
+    claimed = inbox.claim_next().path
+    assert claimed.parent == root / "claimed"
+
+    target = inbox.archive_claimed(claimed, root=root)
+    assert target.parent == root / "audited"
+    assert target.exists() and not claimed.exists()
+
+
+def test_a_claim_refuses_a_pending_entry_that_is_not_in_this_inboxs_pending(root, tmp_path):
+    """`next` lists from the named root, so its sources are always genuine.
+
+    Pinned anyway, because the refusal is what keeps that true if a caller ever hands one over: a
+    claim that resolved the root from the source would move a foreign file INTO this inbox's
+    `claimed/` and hand it to a reviewer as work from this repository.
+    """
+    inbox._ensure_tree(root)
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "pending").mkdir(parents=True)
+    stranger = elsewhere / "pending" / "packet.json"
+    stranger.write_text(json.dumps(valid_packet()), encoding="utf-8")
+
+    with pytest.raises(PacketError):
+        inbox._move_lane_entry(stranger, root=root, src_lane="pending", dst_lane="claimed")
+
+    assert stranger.exists()
+    assert list((root / "claimed").iterdir()) == []
+
+
+# --------------------------------------------------------------------------------------------
+# r3: `O_NOFOLLOW` permits a FIFO — and a FIFO open blocks forever
+#
+# The chain refused the entry that IS a symlink and had no answer for the entry that is a FIFO: an
+# `O_RDONLY` open of a writer-less FIFO waits for a writer that never comes, and the size check that
+# would have refused it is an `fstat` behind that open. Every reader is opened `O_NONBLOCK`, fstat'ed
+# on the DESCRIPTOR, and refused unless it is a regular file.
+# --------------------------------------------------------------------------------------------
+
+#: Long enough that a slow machine is never a failure, short enough that a regression cannot hold the
+#: suite: a blocked open does not finish at all, so the timeout is not a duration to tune.
+_FIFO_GUARD_SECONDS = 20
+
+
+def _guarded(fn, *args, **kwargs):
+    """Run ``fn`` in a daemon thread and fail if it has not finished — a hang cannot pass as a pass.
+
+    The blocked open cannot be cancelled from here (that is the point: a thread stuck in `openat` is
+    not interruptible), so the thread is a daemon and the SUITE still finishes. What it buys is the
+    assertion: a regression reports "the reader blocked on a FIFO" instead of hanging CI.
+    """
+    import threading
+
+    box: dict = {}
+
+    def run():
+        try:
+            box["value"] = fn(*args, **kwargs)
+        except BaseException as exc:      # noqa: BLE001 - re-raised in the caller's thread
+            box["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(_FIFO_GUARD_SECONDS)
+    assert not thread.is_alive(), (
+        f"{getattr(fn, '__name__', fn)} blocked on a FIFO entry — the reader is uninterruptible, "
+        f"which is the defect: {_FIFO_GUARD_SECONDS}s with no answer"
+    )
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+@pytest.mark.parametrize("reader", ["_read_lane_file", "_lane_entry_size"], ids=["read", "size"])
+def test_a_lane_entry_that_is_a_fifo_is_refused_without_blocking(reader, root):
+    """A listed entry swapped for a FIFO, read through the same chain a reader uses."""
+    inbox._ensure_tree(root)
+    published = inbox.publish(valid_packet(), root=root)
+    published.unlink()
+    os.mkfifo(published)
+
+    with pytest.raises(inbox.LaneUnreadable) as caught:
+        _guarded(getattr(inbox, reader), published)
+
+    assert "could not be opened" in str(caught.value), (
+        f"refused for something other than the entry: {caught.value}"
+    )
+    assert published.exists(), "the FIFO was moved or removed rather than refused"
+
+
+def test_a_fifo_swapped_in_after_the_listing_cannot_hang_the_reader(root):
+    """The end-to-end shape: `next` lists a real packet, the swap happens, the read is refused.
+
+    This is the window the listing cannot close — the FIFO is not there when the lane is scanned —
+    so it is the reader that has to survive it. `next` must report a refusal, not wait forever and
+    not answer "nothing to audit".
+    """
+    inbox._ensure_tree(root)
+    published = inbox.publish(valid_packet(), root=root)
+
+    real_scan = inbox._lane_scan
+
+    def scan_with_swap(*args, **kwargs):
+        scan = real_scan(*args, **kwargs)
+        if str(args[1] if len(args) > 1 else kwargs.get("lane")) == "pending":
+            published.unlink()
+            os.mkfifo(published)
+        return scan
+
+    inbox._lane_scan = scan_with_swap
+    try:
+        with pytest.raises(inbox.LaneUnreadable):
+            _guarded(inbox.peek_next)
+    finally:
+        inbox._lane_scan = real_scan
+
+
+# --------------------------------------------------------------------------------------------
+# r3: creating the root is a refusal surface too
+#
+# `_ensure_tree` created the root with `Path.mkdir` BEFORE the open that converts failures into
+# `LaneUnreadable`, so a root that is an existing regular file, a root that is a dangling symlink and
+# a parent this process may not write to each left as a raw `FileExistsError` / `PermissionError` —
+# a traceback out of `next`, one hop above the open that would have reported it as a refusal.
+# --------------------------------------------------------------------------------------------
+
+def _unwritable_parent(tmp_path):
+    """A directory that exists and cannot be written to, and can be (a test runs as root in some CI).
+
+    Returns ``None`` when the process can write anyway — the same guard `test_cli`'s unwritable case
+    uses — so the parametrization can skip a placement it cannot construct meaningfully rather than
+    assert something the filesystem does not enforce.
+    """
+    parent = tmp_path / "readonly"
+    parent.mkdir()
+    parent.chmod(0o500)
+    return parent
+
+
+def test_a_root_that_is_a_regular_file_is_refused_as_a_lane(tmp_path):
+    """`mkdir(exist_ok=True)` answers `FileExistsError`; the OPEN is what says why it is unusable."""
+    blocked = tmp_path / "a-file"
+    blocked.write_text("not an inbox", encoding="utf-8")
+
+    with pytest.raises(inbox.LaneUnreadable) as caught:
+        inbox._ensure_tree(blocked)
+
+    assert "could not be opened" in str(caught.value), caught.value
+    assert blocked.read_text(encoding="utf-8") == "not an inbox", "the root file was modified"
+
+
+def test_a_root_that_is_a_dangling_symlink_is_refused_as_a_lane(tmp_path):
+    """A dangling link is the case `mkdir` cannot create THROUGH and `mkdir(exist_ok=True)` cannot
+    create EITHER — it raises `FileExistsError` for a name that does not resolve to anything."""
+    dangling = tmp_path / "gone"
+    dangling.symlink_to(tmp_path / "nowhere")
+
+    with pytest.raises(inbox.LaneUnreadable) as caught:
+        inbox._ensure_tree(dangling)
+
+    assert "could not be opened" in str(caught.value), caught.value
+    assert dangling.is_symlink(), "the dangling link was replaced rather than refused"
+
+
+def test_a_root_under_an_unwritable_parent_is_refused_as_a_lane(tmp_path):
+    """A permission wall is a refusal, not a `PermissionError` escaping the CLI net."""
+    parent = _unwritable_parent(tmp_path)
+    blocked = parent / "inbox"
+    try:
+        try:
+            blocked.mkdir()
+        except OSError:
+            pass                      # writable after all (root, or a filesystem without modes)
+        else:
+            blocked.rmdir()
+            pytest.skip("this process can write to a 0500 directory; the placement is unavailable")
+
+        with pytest.raises(inbox.LaneUnreadable) as caught:
+            inbox._ensure_tree(blocked)
+        assert "could not be created" in str(caught.value), caught.value
+    finally:
+        parent.chmod(0o700)

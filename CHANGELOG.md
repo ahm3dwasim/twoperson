@@ -114,14 +114,59 @@ All notable changes to this project are documented here. The format follows
   `O_EXCL` the next attempt at the same packet refused forever. Every step after the create is now
   inside one cleanup block: any failure removes the staging entry and re-raises, so a retry of the
   same packet succeeds.
+- **The watcher's own writes bypassed the descriptor chain the rest of the package had just moved
+  onto.** Inbox operations were addressed by descriptor, but the files the *watcher* writes in the
+  root were still opened by path: `.watch.lock` with mode `"w"`, which resolves the root again and
+  *truncates* whatever it lands on, so a `.watch.lock` pre-created as a symlink had the file it
+  pointed at emptied by an ordinary dispatch tick — no hostile command, no unusual flag. The cursor's
+  temp file and the mute switch reopened the same door through `write_text` and `touch`: the first
+  writes *through* a pre-created symlink, the second re-stamps the target's mtime. All three now go
+  through a root descriptor held `O_NOFOLLOW` (the same `_open_root_dir` the inbox uses), the names
+  are created `O_NOFOLLOW` — `O_EXCL` for the temp, so a leftover is cleared and retried rather than
+  followed or deadlocked on — and the rename is `os.replace` between two `dir_fd`s. A root that is a
+  symlink is refused: the pass degrades to un-serialized as it already documented, the cursor logs and
+  skips the save, and the switch reports what it did. Nothing the watcher writes can reach a file
+  outside the inbox root.
+- **Every lane move derived its destination from the *source* path and discarded the root it was
+  given.** `_move_lane_entry` built the destination as `src.parent.parent / dst_lane`, so
+  `archive_claimed('/outside/claimed/x.json', root='/intended')` wrote under `/outside`: the explicit
+  `root` argument was accepted and ignored, and the operation followed the caller's path out of the
+  inbox. Each operation now names both lanes, `_lane_member` refuses a source that is not an entry of
+  the expected lane *of that root* with a `PacketError` rather than following it, and both endpoints
+  are opened from the root's own descriptor — so claim, requeue, quarantine, archive and the three
+  consult equivalents all resolve inside the root they were handed.
+- **A lane entry swapped for a FIFO could block a reader forever.** `O_NOFOLLOW` refuses a symlink
+  and says nothing about the file type, so a listed entry replaced by a FIFO was opened — and
+  `O_RDONLY` on a FIFO with no writer *blocks in the open itself*, before any read or size check,
+  with no timeout and no error: a wedged watcher and a wedged CLI, neither of which reports anything.
+  Lane entries are now opened `O_NONBLOCK`, `fstat`ed, and refused unless `S_ISREG` before any read or
+  size check, then returned to blocking mode for the read. Covered both for the entry that already is
+  a FIFO and the one swapped in after the listing, under a timeout guard so a regression fails the
+  suite instead of hanging it.
+- **Root and lane creation raised its own errors past the refusal net.** `_ensure_tree` called
+  `mkdir` *before* the refusal-converting open, so a root that was an existing regular file, a
+  dangling symlink, or a root under an unwritable parent raised `FileExistsError` or
+  `PermissionError` from the create — neither a `PacketError` nor anything the command boundary
+  catches — and the command died with a traceback instead of exit `2`. Every `OSError` in root and
+  lane creation or opening is now converted to `LaneUnreadable`, the refusal the boundary answers
+  with exit `2`, and the unwritable parent is refused explicitly rather than discovered by a failing
+  `mkdir`. A missing root whose parent exists and is writable keeps its documented "provably empty"
+  answer. The CLI refusal matrix now covers every lane command against a regular-file root, a
+  dangling root symlink and an unwritable parent — 51 cases, each exiting `2` with no traceback — and
+  pins the `signals` lane's documented opt-out, which exits `1`.
 - **The docs-only score cap was decided by the directory a file sits in, not by the file.** The
   predicate was `path.startswith("docs/") or path.endswith(".md") or path.endswith(".txt")`, so
   `docs/deploy.py` — a program on the deploy path — was capped to the prose ceiling while
   `src/deploy.py` scored as the deploy change it is, and any `.txt` anywhere was treated as prose.
-  The cap now asks the file's own extension: `.md` and `.rst` are prose, `.txt` is prose unless its
-  basename is a dependency manifest (`requirements*.txt`, `constraints*.txt` — input that gets
-  installed, so changing a pin changes what runs), and no executable or source extension is ever
-  prose wherever it lives. A path with no extension is not assumed to be one.
+  The cap now asks the file's own name and answers `.txt` by ALLOWLIST: `.md`, `.rst` and `.adoc` are
+  prose anywhere in the tree, `.txt` is prose only for the conventional document stems (`README`,
+  `LICENSE`/`LICENCE`, `NOTICE`, `AUTHORS`, `CHANGELOG`, `CONTRIBUTING`, `COPYING`, case-insensitive),
+  and nothing else is prose — no executable or source extension wherever it lives, and no path
+  without an extension. The dependency-manifest deny-list this replaces was the same mistake one step
+  in: it caught the machine-read names someone thought of and handed the ceiling to `CMakeLists.txt`
+  — a build program that runs the compiler — for the crime of being a name nobody had enumerated. A
+  ceiling on how cheaply a change may be audited has to fail the other way, so naming the prose is
+  now the only way to get it.
 
 ## [0.1.1] - 2026-09-03
 

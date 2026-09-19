@@ -38,13 +38,17 @@ HEAVY_MARKERS: tuple[str, ...] = (
     "migration", "infra", "delete", "policy", "routing", "release", "kernel",
 )
 
-#: Extensions that carry PROSE. The cap asks "could this change break production", and only a
-#: document answers no — so the question is asked of the FILE and never of the directory it sits in.
-_PROSE_SUFFIXES: tuple[str, ...] = (".md", ".rst", ".txt")
+#: Extensions that carry PROSE, anywhere in the tree. The cap asks "could this change break
+#: production", and only a document answers no — so the question is asked of the FILE and never of the
+#: directory it sits in.
+_PROSE_SUFFIXES: tuple[str, ...] = (".md", ".rst", ".adoc")
 
-#: `.txt` names that are not prose: a dependency manifest is input that gets INSTALLED, so changing
-#: a pin changes what runs. Matched on the file's own basename, so `requirements-dev.txt` counts.
-_MANIFEST_PREFIXES: tuple[str, ...] = ("requirements", "constraints")
+#: `.txt` stems that are conventionally prose. `.txt` is the one extension that legitimately carries
+#: BOTH a document and machine input, so it is answered by an allowlist of the names a document
+#: actually uses rather than by a list of the machines we happened to think of.
+_PROSE_TXT_STEMS: frozenset[str] = frozenset({
+    "readme", "license", "licence", "notice", "authors", "changelog", "contributing", "copying",
+})
 
 
 def _is_prose(path: str) -> bool:
@@ -55,11 +59,20 @@ def _is_prose(path: str) -> bool:
     touches the deploy path, while `src/deploy.py` was scored as the deploy change it is. An
     extension that an interpreter or an installer acts on is never prose, wherever it lives, and a
     path with no extension at all is not assumed to be one.
+
+    `.txt` is answered by ALLOWLIST for the same reason, one step further in. A deny-list of the
+    machine-read `.txt` names we could think of (`requirements*`, `constraints*`) got the names it
+    thought of and nothing else: `CMakeLists.txt` is a build program — it runs the compiler — and it
+    collected the prose ceiling the deny-list reserved for the file we could not break. Enumerating
+    bad names asks the classifier to be complete about a set nobody can be complete about; naming the
+    good ones makes everything unlisted not-prose, which is the direction a ceiling on how cheaply a
+    change may be audited has to fail.
     """
     name = path.rsplit("/", 1)[-1].lower()
-    if not name.endswith(_PROSE_SUFFIXES):
-        return False
-    return not (name.endswith(".txt") and name[:-4].startswith(_MANIFEST_PREFIXES))
+    if name.endswith(_PROSE_SUFFIXES):
+        return True
+    stem, dot, suffix = name.rpartition(".")
+    return bool(dot) and suffix == "txt" and stem in _PROSE_TXT_STEMS
 
 
 @dataclass(frozen=True)

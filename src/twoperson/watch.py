@@ -52,7 +52,9 @@ from pathlib import Path
 import structlog
 
 from .inbox import inbox_root, pending, pending_advice, pending_consults, pending_verdicts
-from .packet import LaneUnreadable
+from .packet import LaneUnreadable, PacketError
+
+from . import inbox
 
 log = structlog.get_logger(__name__)
 
@@ -122,12 +124,103 @@ def _switch_path(root: Path | str | None) -> Path:
     return inbox_root(root) / SWITCH_NAME
 
 
-def is_muted(root: Path | str | None = None) -> bool:
-    """True when the watcher is switched OFF (the mute file exists). Never raises."""
+def _writable_root_fd(root: Path | str | None) -> int | None:
+    """An `O_NOFOLLOW` descriptor for the inbox root, created if absent — or ``None`` if unusable.
+
+    Every file this module writes lives directly in the inbox root, and each one used to be written
+    through a PATH: ``open(root / X, "w")`` resolves the root again (so a root swapped for a symlink
+    is followed), and mode ``"w"`` TRUNCATES whatever it lands on — a ``.watch.lock`` pre-created as
+    a symlink had the target's bytes destroyed by an ordinary watcher pass. ``Path.touch`` and
+    ``Path.write_text`` reopen the same door for the mute switch and the cursor. Holding ONE
+    descriptor for the root and addressing every one of those files by ``dir_fd`` means the directory
+    that was checked is the directory that gets written to, and ``O_NOFOLLOW`` on each name refuses a
+    symlink at the file instead of following it out of the inbox. A root that is itself a symlink is
+    refused by the open (see `inbox._open_root_dir`) — the refusal is the answer, and it is reported.
+
+    The watcher must never raise into its caller: a ``--loop`` tick that crashed on an odd inbox
+    would be a worse failure than a missed notification, and every caller here already documents the
+    degradation it chooses. So an unusable root is ``None`` (logged) and the caller degrades. The
+    root is CREATED, because the watcher legitimately runs before anything has published — that is
+    what the ``mkdir(parents=True, exist_ok=True)`` in each of these call sites did.
+
+    ``FileExistsError`` is passed through to the open rather than converted: something already
+    occupies the name, and `inbox._open_root_dir` answers that question — and refuses it — in the
+    single syscall that would otherwise have followed it.
+    """
+    directory = inbox_root(root)
     try:
-        return _switch_path(root).exists()
+        directory.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        pass                # occupied; the open below decides whether what occupies it is usable
+    except OSError as exc:
+        log.warning("twoperson.watch_root_unavailable", error=str(exc))
+        return None
+    try:
+        return inbox._open_root_dir(directory)
+    except (OSError, PacketError) as exc:
+        # `PacketError` is the refusal (`LaneUnreadable`) the chain raises for a root that is not a
+        # real directory; it is not an `OSError`, so catching only `OSError` would raise out of the
+        # watcher on exactly the hostile case this guards.
+        log.warning("twoperson.watch_root_unavailable", error=str(exc))
+        return None
+
+
+def _replace_in_root(root_fd: int, tmp_name: str, final_name: str, body: bytes) -> None:
+    """Write ``body`` to ``tmp_name``, then reveal it as ``final_name`` — both by descriptor.
+
+    The create is ``O_CREAT | O_EXCL | O_NOFOLLOW``: ``O_EXCL`` so a pre-created name cannot be
+    written through, ``O_NOFOLLOW`` so an existing symlink is refused rather than followed. Both
+    operations are addressed relative to ONE held root descriptor, so neither can be redirected by a
+    swap of a path it does not name; the cursor file used to be written with ``Path.write_text`` and
+    moved with ``os.replace``, each re-resolving the root.
+
+    A name that ALREADY EXISTS is cleared and the create retried once. Every production save runs
+    inside `_dispatch_lock`, so a `.tmp` sitting there is a save that did not finish, never a live
+    writer — and ``O_EXCL`` without this would let that one leftover block every future save forever,
+    which is the same defect `inbox._atomic_publish` fixes for its staging entry. Failing after the
+    create removes it for the same reason: a retry of this save has to be able to succeed.
+    """
+    inbox._assert_plain_name(tmp_name)
+    inbox._assert_plain_name(final_name)
+    try:
+        fd = inbox._create_at(root_fd, tmp_name,
+                              os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW)
+    except FileExistsError:
+        os.unlink(tmp_name, dir_fd=root_fd)     # a save that did not finish; see the docstring
+        fd = inbox._create_at(root_fd, tmp_name,
+                              os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW)
+    try:
+        inbox._write_all(fd, body)      # a short write would publish a truncated cursor
+        os.replace(tmp_name, final_name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+    except BaseException:
+        try:
+            os.unlink(tmp_name, dir_fd=root_fd)
+        except OSError as exc:
+            log.warning("twoperson.watch_temp_cleanup_failed", name=tmp_name, error=str(exc))
+        raise
+    finally:
+        os.close(fd)
+
+
+def is_muted(root: Path | str | None = None) -> bool:
+    """True when the watcher is switched OFF (the mute file exists). Never raises.
+
+    Asked through the root's own descriptor with ``follow_symlinks=False``. ``Path.exists()``
+    resolves the root again and follows the switch itself, so a name that is a symlink answered a
+    question about some other file; here the switch's PRESENCE is what is reported, which is what the
+    switch means, and it is the same rule `inbox._occupies` uses for a name that is taken.
+    """
+    try:
+        root_fd = inbox._open_root_dir(inbox_root(root))
+    except (OSError, PacketError):
+        return False        # an unreadable inbox is not a mute; the caller's own probe fails closed
+    try:
+        os.stat(SWITCH_NAME, dir_fd=root_fd, follow_symlinks=False)
+        return True
     except OSError:
-        return False  # an unreadable inbox is not a mute; the caller's own probe will fail closed
+        return False
+    finally:
+        os.close(root_fd)
 
 
 def set_muted(muted: bool, root: Path | str | None = None) -> bool:
@@ -135,16 +228,28 @@ def set_muted(muted: bool, root: Path | str | None = None) -> bool:
 
     Returns the resulting muted state. Idempotent — muting an already-muted watcher is a no-op — and
     best-effort: a filesystem error is logged, not raised, so a toggle never crashes the caller.
+
+    Both directions go through the root's descriptor. ``Path.touch`` follows a symlink (it would
+    re-stamp some other file's mtime) and neither ``Path`` call can tell a symlinked root from a real
+    one; ``O_NOFOLLOW`` on the create refuses the first, and the held descriptor refuses the second.
+    ``unlink`` never follows a link, so removing the switch removes the switch.
     """
-    path = _switch_path(root)
+    root_fd = _writable_root_fd(root)
+    if root_fd is None:
+        return is_muted(root)
     try:
         if muted:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.touch(exist_ok=True)
+            os.close(inbox._create_at(root_fd, SWITCH_NAME,
+                                      os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW))
         else:
-            path.unlink(missing_ok=True)
+            try:
+                os.unlink(SWITCH_NAME, dir_fd=root_fd)
+            except FileNotFoundError:
+                pass        # already un-muted: the switch is idempotent in both directions
     except OSError as exc:
         log.warning("twoperson.watch_switch_failed", muted=muted, error=str(exc))
+    finally:
+        os.close(root_fd)
     return is_muted(root)
 
 
@@ -281,15 +386,30 @@ def _dispatch_lock(root: Path | str | None):
     opened (an unwritable or not-yet-existing root), or (b) ``flock`` acquisition itself fails because
     locking is unsupported on the filesystem (e.g. some network mounts return ``ENOTSUP``). In both
     cases the worst case is the un-serialized behaviour we had before, never a raised exception.
+
+    The open is `O_NOFOLLOW` relative to a held root descriptor and does NOT truncate. It used to be
+    ``open(root / ".watch.lock", "w")``, which resolves the root again — following it if it is a
+    symlink — and truncates: a `.watch.lock` pre-created as a symlink had its target's bytes wiped by
+    an ordinary dispatch pass. A lock file's content is nothing, so nothing here needs truncating, and
+    the file this opens is provably the one inside the inbox root that was opened.
     """
-    try:
-        directory = inbox_root(root)
-        directory.mkdir(parents=True, exist_ok=True)
-        handle = open(directory / DISPATCH_LOCK_NAME, "w")
-    except OSError as exc:
-        log.warning("twoperson.watch_lock_unavailable", error=str(exc))
-        yield
+    root_fd = _writable_root_fd(root)
+    if root_fd is None:
+        yield               # no descriptor, no serialization: the documented degradation
         return
+    try:
+        try:
+            handle = os.fdopen(
+                inbox._create_at(root_fd, DISPATCH_LOCK_NAME,
+                                 os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW),
+                "w",
+            )
+        except OSError as exc:
+            log.warning("twoperson.watch_lock_unavailable", error=str(exc))
+            yield
+            return
+    finally:
+        os.close(root_fd)
     try:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX)
@@ -318,14 +438,24 @@ def load_cursor(root: Path | str | None = None) -> Cursor:
 
 
 def save_cursor(cursor: Cursor, root: Path | str | None = None) -> None:
-    path = _cursor_path(root)
+    """Persist the cursor through the root's descriptor — never fatal, never through a link.
+
+    The temp file is created `O_CREAT | O_EXCL | O_NOFOLLOW` and the reveal is an ``os.replace``
+    addressed by ``dir_fd``, so a pre-created ``.watch_seen.json.tmp`` symlink cannot aim the write
+    at another file and a swapped root cannot aim it at another directory. Failure is logged, not
+    raised: a cursor that cannot be saved costs one duplicate notification, which is the worst case
+    this module's design already accepts everywhere.
+    """
+    root_fd = _writable_root_fd(root)
+    if root_fd is None:
+        return
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.tmp")
-        tmp.write_text(json.dumps(cursor.to_json(), ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, path)
+        _replace_in_root(root_fd, f".{CURSOR_NAME}.tmp", CURSOR_NAME,
+                         json.dumps(cursor.to_json(), ensure_ascii=False).encode("utf-8"))
     except OSError as exc:
         log.warning("twoperson.watch_cursor_save_failed", error=str(exc))
+    finally:
+        os.close(root_fd)
 
 
 # --------------------------------------------------------------------------------------------

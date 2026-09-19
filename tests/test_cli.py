@@ -525,3 +525,130 @@ def test_the_signal_lane_opts_out_of_the_refusal_without_tracebacking(root, tmp_
         captured = capsys.readouterr()
         assert code == 1, f"{' '.join(argv)}: expected the documented 1, got {code}"
         assert "Traceback" not in captured.err, f"{' '.join(argv)}: arrived as a stack trace"
+
+
+# --------------------------------------------------------------------------------------------
+# r3: the ROOT itself is a refusal surface, at every subcommand
+#
+# `_ensure_tree` created the root with `Path.mkdir` BEFORE the open that turns failures into
+# `LaneUnreadable`, so a root that is an existing regular file, a root that is a dangling symlink and
+# a parent this process may not write to each escaped as a raw `FileExistsError` / `PermissionError`.
+# These are the three placements, over the same command list the lane placements use — each one is a
+# DIFFERENT syscall answering (an open that refuses, an open that refuses, a mkdir that refuses), so
+# one fix per placement would be a hand-kept list again.
+# --------------------------------------------------------------------------------------------
+
+#: The same commands `_LANE_COMMANDS` covers, plus the writing set, minus `signals --ack`. The signal
+#: lane's documented opt-out covers it: `signals` reads the one lane that under-reports by design, so
+#: a refused root reaches it as "no signals" and exits 1 — pinned in its own test below rather than
+#: asserted here as a 2 that would have to be wrong. Spelled out with the lane each command reaches
+#: first, because the writing set carries one placeholder shape and this list needs the lane too.
+_ROOT_REFUSAL_COMMANDS = (
+    pytest.param(["check"], "pending", id="check"),
+    pytest.param(["list"], "pending", id="list"),
+    pytest.param(["next"], "pending", id="next"),
+    pytest.param(["next", "--peek"], "pending", id="next-peek"),
+    pytest.param(["tier"], "pending", id="tier"),
+    pytest.param(["watch", "--once"], "pending", id="watch-once"),
+    pytest.param(["publish", "--from", "@packet"], "pending", id="publish"),
+    pytest.param(["verdict", "--packet", "any-id", "--decision", "Approve"], "pending", id="verdict"),
+    pytest.param(["verdicts"], "verdicts", id="verdicts"),
+    pytest.param(["verdicts", "--ack"], "verdicts", id="verdicts-ack"),
+    pytest.param(["consult-check"], "consult", id="consult-check"),
+    pytest.param(["consult-list"], "consult", id="consult-list"),
+    pytest.param(["consult-next"], "consult", id="consult-next"),
+    pytest.param(["consult-publish", "--from", "@consult"], "consult", id="consult-publish"),
+    pytest.param(["consult-advice"], "advice", id="consult-advice"),
+    pytest.param(["consult-advice", "--ack"], "advice", id="consult-advice-ack"),
+    pytest.param(["consult-advise", "--consult", "any-id", "--recommendation", "advise me"],
+                 "advice", id="consult-advise"),
+)
+
+#: The two verbs a root refusal is spelled with (`inbox._refusal`, and `_refuse_a_root_that_cannot_be
+#: _created` for the wall): a root that IS something is one that could not be OPENED, a root that
+#: cannot be MADE is one that could not be CREATED. Asserted so a command that exited 2 for an
+#: unrelated reason (a schema failure, a bad argument) cannot satisfy this test while proving nothing.
+_ROOT_REFUSAL = ("could not be opened", "could not be created")
+
+_PLACEMENTS = ("a regular-file root", "a dangling root symlink", "an unwritable parent")
+
+
+def _place_root(placement, root, tmp_path, monkeypatch):
+    """Build one of the three root placements, and return a callable that undoes it."""
+    if placement == "a regular-file root":
+        root.write_text("not an inbox", encoding="utf-8")
+        return lambda: None
+    if placement == "a dangling root symlink":
+        root.symlink_to(tmp_path / "nowhere")
+        return lambda: None
+    # An unwritable parent: the root cannot exist AND cannot be made. The parent is a directory of
+    # its own so no other path in this test depends on it, and it is restored for cleanup.
+    parent = tmp_path / "ro"
+    parent.mkdir()
+    parent.chmod(0o500)
+    monkeypatch.setenv("TWOPERSON_INBOX", str(parent / "twoperson"))
+    return lambda: parent.chmod(0o700)
+
+
+@pytest.mark.parametrize("placement", _PLACEMENTS)
+@pytest.mark.parametrize("argv,lane", _ROOT_REFUSAL_COMMANDS)
+def test_every_lane_command_refuses_a_root_it_cannot_use(root, tmp_path, monkeypatch, capsys, argv,
+                                                         lane, placement):
+    """Exit 2, no stack trace, and a refusal that names the root — for all three placements.
+
+    `publish` reaches this through `_ensure_tree`'s `mkdir`, the readers through the chain's first
+    open, and the `--ack` commands through a lane read; the exit code and the wording are the same
+    because the refusal is raised where the hop failed, not remembered per command.
+    """
+    undo = _place_root(placement, root, tmp_path, monkeypatch)
+    try:
+        # A process that can write to a 0500 directory (root, or a filesystem without modes) cannot
+        # construct this placement at all; assert only what the filesystem actually enforces.
+        if placement == "an unwritable parent":
+            probe = tmp_path / "ro" / "probe"      # inside the 0500 parent, not its parent
+            try:
+                probe.mkdir()
+            except OSError:
+                pass
+            else:
+                probe.rmdir()
+                pytest.skip("this process can write to a 0500 directory; the placement is unavailable")
+
+        code = main(_materialize(argv, tmp_path))
+        captured = capsys.readouterr()
+        assert code == 2, (
+            f"{' '.join(argv)}: {placement} must be a rejection (2), got {code} with "
+            f"stderr={captured.err!r}"
+        )
+        assert "Traceback" not in captured.err, (
+            f"{' '.join(argv)}: a refusal arrived as a stack trace: {captured.err!r}"
+        )
+        assert any(w in captured.err for w in _ROOT_REFUSAL), (
+            f"{' '.join(argv)}: refused for something other than the root, or said nothing about "
+            f"it; got {captured.err!r}"
+        )
+    finally:
+        undo()
+
+
+@pytest.mark.parametrize("placement", _PLACEMENTS)
+def test_the_signal_lane_opts_out_of_a_root_refusal_without_tracebacking(root, tmp_path, monkeypatch,
+                                                                        capsys, placement):
+    """`signal` and `signals` keep the exit 1 they document, for a root as much as for a lane.
+
+    `signal` runs from the Stop hook, where 2 means "block stopping", and `signals` reads the one lane
+    that under-reports on purpose (a signal gates nothing). What may not happen is a traceback: these
+    are the two commands whose documented answer is not 2, and an uncaught root failure would have
+    given them both a crash instead.
+    """
+    undo = _place_root(placement, root, tmp_path, monkeypatch)
+    try:
+        for argv in (["signal"], ["signals"], ["signals", "--ack"]):
+            code = main(argv)
+            captured = capsys.readouterr()
+            assert code == 1, f"{' '.join(argv)}: expected the documented 1, got {code}"
+            assert "Traceback" not in captured.err, (
+                f"{' '.join(argv)}: arrived as a stack trace: {captured.err!r}"
+            )
+    finally:
+        undo()

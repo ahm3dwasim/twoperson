@@ -237,22 +237,39 @@ def test_a_file_under_docs_is_scored_by_its_own_extension_not_its_directory():
     assert not any("docs-only" in r for r in in_docs.reasons), in_docs.reasons
 
 
-@pytest.mark.parametrize("path", ["requirements.txt", "requirements-dev.txt", "constraints.txt"])
-def test_a_dependency_manifest_is_not_prose(path):
-    """`.txt` is the prose extension; a manifest is what gets INSTALLED, so a changed pin is a
-    change to what runs. Read against a control that differs only in the basename."""
-    manifest = classify_packet(_heavy_change(_nine(path)))
-    prose = classify_packet(_heavy_change(_nine("notes.txt")))
+def _nine_named(path):
+    """Nine copies of the SAME BASENAME under nine directories.
 
-    assert prose.score == DOCS_ONLY_CEILING, "plain .txt stopped being prose"
-    assert manifest.score > DOCS_ONLY_CEILING, f"{path} was given the prose ceiling"
-    assert not any("docs-only" in r for r in manifest.reasons), manifest.reasons
+    `_nine` indexes the stem (`README.txt` -> `README-0.txt`), which is exactly the thing the `.txt`
+    allowlist reads — so for those cases the index has to move to the directory instead, or the test
+    would be measuring `_nine` rather than the predicate.
+    """
+    return [f"docs/d{i}/{path.rsplit('/', 1)[-1]}" for i in range(9)]
 
 
-@pytest.mark.parametrize("path", ["docs/guide.md", "guide.rst", "notes/TODO.txt", "README.md"])
+@pytest.mark.parametrize("path", ["requirements.txt", "requirements-dev.txt", "constraints.txt",
+                                  "CMakeLists.txt", "docs/notes.txt"])
+def test_a_dot_txt_that_is_not_conventionally_prose_is_not_prose(path):
+    """`.txt` carries BOTH documents and machine input, so it is answered by an ALLOWLIST.
+
+    A deny-list of the machine-read names we could think of got the names it thought of and nothing
+    else: `CMakeLists.txt` is a build program — it runs the compiler — and it collected the prose
+    ceiling the deny-list reserved for the file nobody had thought of. Read against a control that
+    differs only in the basename, so this cannot pass by the ceiling having moved.
+    """
+    not_prose = classify_packet(_heavy_change(_nine_named(path)))
+    prose = classify_packet(_heavy_change(_nine_named("docs/README.txt")))
+
+    assert prose.score == DOCS_ONLY_CEILING, "a conventionally-named .txt stopped being prose"
+    assert not_prose.score > DOCS_ONLY_CEILING, f"{path} was given the prose ceiling"
+    assert not any("docs-only" in r for r in not_prose.reasons), not_prose.reasons
+
+
+@pytest.mark.parametrize("path", ["docs/guide.md", "guide.rst", "notes/TODO.adoc", "README.md",
+                                  "LICENSE.txt", "docs/CHANGELOG.TXT"])
 def test_prose_is_capped_wherever_it_lives(path):
-    """The other direction, kept: a document is a document outside `docs/` too."""
-    capped = classify_packet(_heavy_change(_nine(path)))
+    """The other direction, kept: a document is a document outside `docs/` too, whatever its case."""
+    capped = classify_packet(_heavy_change(_nine_named(path)))
     assert capped.score == DOCS_ONLY_CEILING
     assert any("docs-only" in r for r in capped.reasons), capped.reasons
 

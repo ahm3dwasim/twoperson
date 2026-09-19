@@ -641,3 +641,114 @@ def test_a_refused_pending_lane_is_reported_by_the_scan_itself(root):
     delta = scan_new(root, Cursor())
     assert delta.new_packets == (), "a refused lane must announce nothing"
     assert any("pending" in lane for lane in delta.unreadable)
+
+
+# --------------------------------------------------------------------------------------------
+# r3: every file the watcher WRITES is created relative to a held, O_NOFOLLOW root descriptor
+#
+# The watcher writes three files directly in the inbox root — the dispatch lock, the cursor and its
+# temp, and the mute switch — and every one of them was written through a PATH: `open(root / X, "w")`
+# resolves the root again (following it if it is a symlink) and mode `"w"` TRUNCATES whatever it lands
+# on, so a `.watch.lock` pre-created as a symlink had its target's bytes destroyed by an ordinary
+# dispatch pass. `Path.touch` and `Path.write_text` reopened the same door for the switch and the
+# cursor. A VICTIM file is the probe below: it must be untouched, byte for byte, by every one of them.
+# --------------------------------------------------------------------------------------------
+
+def _victim(root, name: str) -> Path:
+    """A file outside the inbox that a symlink in the inbox root points at."""
+    target = root.parent / name
+    target.write_text("ORIGINAL", encoding="utf-8")
+    return target
+
+
+def test_the_dispatch_lock_is_not_truncated_through_a_symlink(root):
+    """`open(..., "w")` on a pre-created symlink truncated the file it pointed at.
+
+    The dispatch lock is opened on every pass, so this was reachable from an ordinary watcher tick —
+    no hostile command, no unusual flag. The lock is opened `O_NOFOLLOW` relative to the root's
+    descriptor now, and it does not truncate: the name is refused, the pass degrades to un-serialized
+    as it documents, and the victim keeps every byte.
+    """
+    inbox._ensure_tree(root)
+    victim = _victim(root, "victim-lock.txt")
+    (root / watch.DISPATCH_LOCK_NAME).symlink_to(victim)
+
+    report = _dispatch(root)
+
+    assert victim.read_text(encoding="utf-8") == "ORIGINAL", (
+        "the dispatch lock truncated a file outside the inbox"
+    )
+    assert (root / watch.DISPATCH_LOCK_NAME).is_symlink(), "the symlink was replaced, not refused"
+    assert report is not None, "the pass did not survive a refused lock"
+
+
+def test_the_cursor_temp_is_never_written_through_a_symlink(root):
+    """The cursor's temp name, pre-created as a symlink, aimed `write_text` at another file.
+
+    The temp is created `O_CREAT | O_EXCL | O_NOFOLLOW` now: the symlink is refused rather than
+    followed, the stale name is cleared and the save retried (a leftover must not block every future
+    save), and the cursor still lands — the victim, not the cursor, is what must not be written.
+    """
+    inbox._ensure_tree(root)
+    victim = _victim(root, "victim-cursor.txt")
+    stale = root / f".{watch.CURSOR_NAME}.tmp"
+    stale.symlink_to(victim)
+
+    save_cursor(Cursor(packets=frozenset({"a.json"})), root)
+
+    assert victim.read_text(encoding="utf-8") == "ORIGINAL", (
+        "the cursor temp wrote through a symlink out of the inbox"
+    )
+    assert load_cursor(root).packets == frozenset({"a.json"}), (
+        "the cursor was not saved after the stale temp name was cleared"
+    )
+    assert not stale.is_symlink(), "the stale temp is still in the way of the next save"
+
+
+def test_the_mute_switch_is_never_stamped_through_a_symlink(root):
+    """`Path.touch` follows a link and re-stamps the TARGET's mtime; `O_NOFOLLOW` refuses it.
+
+    Presence is what the switch means, so a symlink at its name reads as muted (the same rule
+    `inbox._occupies` uses for a taken name), and un-muting removes the LINK — never the file it
+    pointed at.
+    """
+    inbox._ensure_tree(root)
+    victim = _victim(root, "victim-switch.txt")
+    os.utime(victim, (1_000_000, 1_000_000))
+    (root / watch.SWITCH_NAME).symlink_to(victim)
+
+    assert is_muted(root) is True, "a switch that is present but a link must still read as present"
+    assert set_muted(True, root) is True
+
+    assert victim.read_text(encoding="utf-8") == "ORIGINAL"
+    assert victim.stat().st_mtime == 1_000_000, "the mute switch re-stamped a file outside the inbox"
+
+    assert set_muted(False, root) is False
+    assert victim.exists(), "un-muting removed the file the switch pointed at"
+    assert not (root / watch.SWITCH_NAME).is_symlink()
+
+
+@pytest.mark.parametrize("writer", ["_dispatch_lock", "_cursor", "_switch"], ids=str)
+def test_no_watcher_write_follows_a_symlinked_root(root, tmp_path, writer):
+    """The root itself as a symlink: every write is refused, and NOTHING lands in the target.
+
+    The target is a real, populated inbox — so a write that followed the link would be invisible to
+    an assertion that only checked for an error. What is asserted is the target's own contents.
+    """
+    real = tmp_path / "a-real-inbox"
+    real.mkdir()
+    inbox._ensure_tree(real)
+    root.symlink_to(real)
+    before = sorted(p.name for p in real.iterdir())
+
+    if writer == "_dispatch_lock":
+        with watch._dispatch_lock(root):
+            pass
+    elif writer == "_cursor":
+        save_cursor(Cursor(packets=frozenset({"a.json"})), root)
+    else:
+        set_muted(True, root)
+
+    assert sorted(p.name for p in real.iterdir()) == before, (
+        f"{writer}: a write followed a symlinked root out of the inbox"
+    )
