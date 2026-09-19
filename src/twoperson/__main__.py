@@ -333,9 +333,20 @@ def _watch(args) -> int:
     WatchPaths runs on each change); the default is a foreground poll loop for a manual/tmux run.
     Notify-only unless the launch commands are configured (TWOPERSON_ON_PACKET /
     TWOPERSON_ON_VERDICT). It never claims, audits, or ships — it wakes the side that does.
+
+    `--on`/`--off` and `--status` each report a state only when it was both written (or already
+    true) AND read back confirming it: `set_muted`/`is_muted` raise `MuteUnknown` instead of a
+    guessed boolean whenever that cannot be established, and every site here that renders the
+    switch's state prints "UNKNOWN" and exits non-zero rather than claim ON/OFF/success on a toggle
+    that was never actually confirmed.
     """
     if args.off or args.on:
-        muted = set_muted(args.off)  # --off mutes, --on un-mutes
+        try:
+            muted = set_muted(args.off)  # --off mutes, --on un-mutes
+        except MuteUnknown as exc:
+            print(f"watch: UNKNOWN — the mute switch could not be set or confirmed: {exc}",
+                  file=sys.stderr)
+            return EXIT_REJECTED
         if muted:
             print("watch: OFF (muted — no notifications or auto-audit)")
             return EXIT_OK
@@ -358,7 +369,7 @@ def _watch(args) -> int:
         try:
             print(f"watch: {'OFF (muted)' if is_muted() else 'ON'}")
         except MuteUnknown as exc:
-            print(f"watch: could not determine mute state — {exc}", file=sys.stderr)
+            print(f"watch: UNKNOWN — could not determine mute state: {exc}", file=sys.stderr)
             return EXIT_REJECTED
         return EXIT_OK
     if args.once:

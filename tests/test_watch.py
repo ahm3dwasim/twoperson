@@ -382,6 +382,51 @@ def test_unmute_runs_a_catchup_pass_in_cli_mode(root):
     assert load_cursor().packets == frozenset(names) and names, "un-mute must catch up on muted arrivals"
 
 
+def test_watch_off_reports_unknown_and_exits_nonzero_when_the_switch_cannot_be_confirmed(
+    root, monkeypatch, capsys
+):
+    """`watch --off`/`--on` must never print a success line for a toggle it cannot prove. Before the
+    fix, a write that failed here still printed "OFF (muted — no notifications or auto-audit)" and
+    exited 0, because the CLI trusted `set_muted`'s old fail-closed ``True``."""
+    from twoperson.__main__ import main
+
+    def boom(_dir_fd, _name, **_k):
+        raise watch._safefs.SafeFsRefusal("the mute switch could not be created: Input/output error")
+
+    monkeypatch.setattr(watch._safefs, "create_exclusive", boom)
+
+    rc = main(["watch", "--off"])
+    captured = capsys.readouterr()
+
+    assert rc != 0, "watch --off claimed success on a switch it could not write"
+    assert "OFF (muted" not in captured.out, "a failed toggle must not print the success line"
+    assert "UNKNOWN" in captured.err
+
+
+def test_watch_status_prints_unknown_and_exits_nonzero_when_mute_state_cannot_be_determined(
+    root, monkeypatch, capsys
+):
+    """`watch --status` on an unreadable switch must print UNKNOWN, never ON or OFF, and exit
+    non-zero — the same "unknown is not success" contract as the toggle."""
+    from twoperson.__main__ import main
+
+    inbox._ensure_tree(root)
+
+    def boom(_dir_fd, _name, **_k):
+        raise watch._safefs.SafeFsRefusal("the mute switch could not be examined: Input/output error")
+
+    monkeypatch.setattr(watch._safefs, "stat_nolink", boom)
+
+    rc = main(["watch", "--status"])
+    captured = capsys.readouterr()
+
+    assert rc != 0
+    assert "ON" not in captured.out and "OFF" not in captured.out, (
+        "an unconfirmed mute state must not be rendered as either ON or OFF"
+    )
+    assert "UNKNOWN" in captured.err
+
+
 def test_plist_watches_the_switch_file_so_launchd_wakes_on_a_toggle(root):
     pl = watchagent.render_plist()
     assert str(root / watch.SWITCH_NAME) in pl["WatchPaths"], (
@@ -740,6 +785,66 @@ def test_the_mute_switch_is_never_stamped_through_a_symlink(root):
     assert not (root / watch.SWITCH_NAME).is_symlink()
 
 
+def test_set_muted_raises_mute_unknown_when_the_write_itself_is_refused(root, monkeypatch):
+    """The reported finding: a refused WRITE must never be reported as a confirmed mute.
+
+    `set_muted` used to degrade a failed write to its read-back's best-effort answer, and that
+    read-back fails closed to ``True`` on its own `MuteUnknown` — so a write that never landed on
+    disk still came back ``True`` (a confirmed, successful mute). Fixed: a refused write raises
+    `MuteUnknown` itself, before any read-back is even attempted, and the switch is provably still
+    absent.
+    """
+    inbox._ensure_tree(root)
+
+    def boom(_dir_fd, _name, **_k):
+        raise watch._safefs.SafeFsRefusal("the mute switch could not be created: Input/output error")
+
+    monkeypatch.setattr(watch._safefs, "create_exclusive", boom)
+
+    with pytest.raises(watch.MuteUnknown):
+        set_muted(True, root)
+
+    assert not (root / watch.SWITCH_NAME).exists(), (
+        "a refused write must not be reported as a confirmed mute while nothing was actually written"
+    )
+
+
+def test_set_muted_raises_mute_unknown_when_the_write_succeeds_but_read_back_is_refused(
+    root, monkeypatch
+):
+    """The write can genuinely succeed and the READ-BACK can still fail (a transient fault a moment
+    later) — that must be reported the same way as a failed write: `MuteUnknown`, never a guessed
+    ``True``. The property is "written AND read back", not "written OR read back somehow"."""
+    inbox._ensure_tree(root)
+
+    def boom(_dir_fd, _name, **_k):
+        raise watch._safefs.SafeFsRefusal("the mute switch could not be examined: Input/output error")
+
+    monkeypatch.setattr(watch._safefs, "stat_nolink", boom)
+
+    with pytest.raises(watch.MuteUnknown):
+        set_muted(True, root)
+
+
+def test_set_muted_raises_mute_unknown_when_the_unmute_write_is_refused(root, monkeypatch):
+    """The un-mute direction gets the same proof requirement: removing the switch must not be
+    reported as a confirmed un-mute unless the unlink itself actually succeeded."""
+    inbox._ensure_tree(root)
+    set_muted(True, root)
+
+    def boom(_dir_fd, _name, **_k):
+        raise watch._safefs.SafeFsRefusal("the mute switch could not be removed: Input/output error")
+
+    monkeypatch.setattr(watch._safefs, "unlink", boom)
+
+    with pytest.raises(watch.MuteUnknown):
+        set_muted(False, root)
+
+    assert (root / watch.SWITCH_NAME).exists(), (
+        "a refused unlink must leave the switch exactly where it was, still muted"
+    )
+
+
 def test_switch_unreadable_raises_mute_unknown_not_a_boolean(root, monkeypatch):
     """A transient fault reading the mute switch itself (`EIO`, `EACCES`, ...) must not be spellable as
     either boolean: `is_muted` used to answer this with ``True`` (fail closed), which stopped every
@@ -897,7 +1002,11 @@ def test_no_watcher_write_follows_a_symlinked_root(root, tmp_path, writer):
     elif writer == "_cursor":
         save_cursor(Cursor(packets=frozenset({"a.json"})), root)
     else:
-        set_muted(True, root)
+        # A symlinked root cannot be opened writably, so the toggle cannot be proven — `set_muted`
+        # raises `MuteUnknown` rather than guessing a confirmed state, exactly like a write that
+        # failed for any other reason.
+        with pytest.raises(watch.MuteUnknown):
+            set_muted(True, root)
 
     assert sorted(p.name for p in real.iterdir()) == before, (
         f"{writer}: a write followed a symlinked root out of the inbox"

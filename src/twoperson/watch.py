@@ -249,27 +249,19 @@ def is_muted(root: Path | str | None = None) -> bool:
         _safefs.close_quietly(root_fd)
 
 
-def _is_muted_or_fail_closed(root: Path | str | None) -> bool:
-    """`is_muted`, degraded for a caller that must return a plain bool and never raise.
-
-    Used only by `set_muted`'s own read-back, after its write already succeeded or already failed —
-    either way `set_muted` has done everything it can about the WRITE, and this is just reporting the
-    resulting state as best it can. Failing closed (``True``) on `MuteUnknown` matches the same
-    fail-closed choice `set_muted`'s write path already makes, and keeps `set_muted`'s promise that a
-    filesystem error degrades to a logged answer, never a raise.
-    """
-    try:
-        return is_muted(root)
-    except MuteUnknown as exc:
-        log.warning("twoperson.watch_switch_unreadable", error=str(exc))
-        return True
-
-
 def set_muted(muted: bool, root: Path | str | None = None) -> bool:
-    """Flip the switch. ``muted=True`` mutes (creates the file); ``False`` un-mutes (removes it).
+    """Flip the switch and return the CONFIRMED resulting state. ``muted=True`` mutes (creates the
+    file); ``False`` un-mutes (removes it). Idempotent — muting an already-muted watcher is a no-op.
 
-    Returns the resulting muted state. Idempotent — muting an already-muted watcher is a no-op — and
-    best-effort: a filesystem error is logged, not raised, so a toggle never crashes the caller.
+    Raises `MuteUnknown`, the same type `is_muted` raises for its own probe, when the toggle cannot
+    be PROVEN: either the write itself was refused (an unopenable root, a refused create/unlink) or
+    the read-back afterward does not confirm the switch actually reached the requested state. A
+    prior version degraded both of those to a fail-closed ``True`` — a write that failed AND a
+    read-back that came back unknown were both reported as a successful mute, so ``watch --off`` on
+    an unwritable root printed "OFF (muted)" and exited 0 though the switch was never written, and a
+    later tick could launch once the transient fault cleared. An operator command may report a state
+    only when that state was WRITTEN and READ BACK as that state; anything short of that is
+    `MuteUnknown`, never a guessed boolean.
 
     Both directions go through the root's descriptor. ``Path.touch`` follows a symlink (it would
     re-stamp some other file's mtime) and neither ``Path`` call can tell a symlinked root from a real
@@ -278,7 +270,7 @@ def set_muted(muted: bool, root: Path | str | None = None) -> bool:
     """
     root_fd = _writable_root_fd(root)
     if root_fd is None:
-        return _is_muted_or_fail_closed(root)
+        raise MuteUnknown("the inbox root could not be opened to set the mute switch")
     what = f"the mute switch {SWITCH_NAME!r}"
     try:
         if muted:
@@ -292,9 +284,15 @@ def set_muted(muted: bool, root: Path | str | None = None) -> bool:
                            kind=_safefs.SafeFsRefusal)
     except (FileNotFoundError, PacketError) as exc:
         log.warning("twoperson.watch_switch_failed", muted=muted, error=str(exc))
+        raise MuteUnknown(f"the mute switch could not be written: {exc}") from exc
     finally:
         _safefs.close_quietly(root_fd)
-    return _is_muted_or_fail_closed(root)
+    confirmed = is_muted(root)  # may itself raise MuteUnknown — propagate, never guess past it
+    if confirmed != muted:
+        raise MuteUnknown(
+            f"the mute switch was written but read back as {confirmed!r}, not the requested {muted!r}"
+        )
+    return confirmed
 
 
 @dataclass(frozen=True)
