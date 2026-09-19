@@ -54,6 +54,17 @@ class UnsafePathError(PacketError):
     """A path field could be used to escape the repo or the inbox."""
 
 
+class LaneUnreadable(PacketError):
+    """An inbox lane could not be listed COMPLETELY, so its emptiness is not evidence of absence.
+
+    The distinction this type exists to make: a reader that answers "nothing is here" identically
+    for an empty lane and for a lane it *refused to read* hands every caller a false negative, and a
+    caller that treats absence as evidence ("no packets exist, so report a clean zero") has had its
+    guard disarmed by the refusal it never saw. Refusal is a third answer, and it must be spelled
+    differently from the empty one.
+    """
+
+
 # --------------------------------------------------------------------------------------------
 # Secret detection
 # --------------------------------------------------------------------------------------------

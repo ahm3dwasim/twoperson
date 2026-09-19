@@ -49,6 +49,10 @@ Safety properties this module owns:
   timestamp, and every write is asserted to resolve inside the inbox root.
 * **Hostile input is quarantined, not returned.** Anything in `pending/` that is oversize,
   unparseable, symlinked, a directory, or schema-invalid is moved to `rejected/` with a reason.
+* **A refusal is not an empty lane.** If a lane cannot be listed in full, its readers raise
+  :class:`~twoperson.packet.LaneUnreadable` rather than answering "nothing here" — a poller that
+  cannot tell those apart goes quiet on exactly the tampering the refusal exists to catch. The one
+  lane that opts out is `signals/`, which gates nothing; it says so in its own docstring.
 
 See `docs/PROTOCOL.md` for the runbook.
 """
@@ -56,6 +60,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import stat as _stat
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -66,6 +71,7 @@ import structlog
 
 from .packet import (
     MAX_PACKET_BYTES,
+    LaneUnreadable,
     PacketError,
     dumps_packet,
     loads_packet,
@@ -87,7 +93,8 @@ from .advice import MAX_ADVICE_BYTES, dumps_advice, loads_advice, validate_advic
 log = structlog.get_logger(__name__)
 
 __all__ = [
-    "MAX_PACKET_BYTES", "Claimed", "ack_advice", "ack_signals", "ack_verdicts", "answered_consult_ids",
+    "MAX_PACKET_BYTES", "Claimed", "LaneScan", "LaneUnreadable", "ack_advice", "ack_signals",
+    "ack_verdicts", "answered_consult_ids",
     "archive_claimed", "archive_claimed_consult", "archived", "archived_consults", "claim_consult",
     "claim_next", "claimed", "claimed_consults", "has_pending", "has_pending_advice",
     "has_pending_consults", "has_pending_signals", "has_pending_verdicts", "inbox_root",
@@ -124,6 +131,47 @@ class Claimed:
 
     path: Path
     packet: dict
+
+
+#: A refused entry's name is chosen by whoever dropped it and lands in a terminal and a log line.
+#: Anything that is not printable ASCII becomes an escape, so it can never move the cursor, start a
+#: colour run, or open a second line inside a message whose whole job is to be one legible line.
+_SAFE_NAME_CHARS = 96
+
+
+def _safe_name(name: str) -> str:
+    """One filesystem name, rendered so it cannot forge output. Bounded, printable, single-line."""
+    cleaned = "".join(ch if 32 <= ord(ch) < 127 else "\\x%02x" % min(ord(ch), 255) for ch in name)
+    if len(cleaned) > _SAFE_NAME_CHARS:
+        cleaned = cleaned[:_SAFE_NAME_CHARS] + "…"
+    return cleaned
+
+
+@dataclass(frozen=True)
+class LaneScan:
+    """One lane's listing, with the refusals kept instead of thrown away.
+
+    ``complete`` is the field that matters: when it is False, ``files`` is a LOWER BOUND and an empty
+    ``files`` proves nothing. A caller that treats absence as evidence must consult ``complete``
+    before it does — or call `_lane_files`, which fails closed on its behalf.
+    """
+
+    files: tuple[Path, ...]
+    refused: tuple[str, ...]
+    complete: bool
+
+    def reason(self, lane: str) -> str:
+        """A one-line, bounded description of why the listing is incomplete. Never echoes content.
+
+        The names come straight from the filesystem into a string that reaches a terminal and a log.
+        A filename may hold newlines, control characters and ANSI escapes, so a hand-dropped entry
+        could forge CLI output and audit-log lines — the one place a refusal is supposed to be
+        legible. Names are sanitised to printable ASCII, bounded per name, and the whole line is
+        single-line by construction.
+        """
+        shown = ", ".join(_safe_name(name) for name in sorted(self.refused)[:5])
+        more = f" (+{len(self.refused) - 5} more)" if len(self.refused) > 5 else ""
+        return f"inbox lane {lane!r} could not be listed completely; refused: {shown}{more}"
 
 
 # --------------------------------------------------------------------------------------------
@@ -227,14 +275,35 @@ def inbox_root(root: Path | str | None = None) -> Path:
     return Path(override) if override else _default_parent() / INBOX_DIRNAME
 
 
+def _chmod_own_directory(path: Path) -> None:
+    """`chmod` a directory we opened ourselves, never a path we merely named.
+
+    `mkdir(exist_ok=True)` SUCCEEDS on a symlink that points at a directory — it is an "already
+    exists" case, not an error — and `os.chmod` then follows that symlink. So a lane replaced by a
+    link to somewhere else had the *target's* permissions rewritten to 0700 by an ordinary `publish`
+    or `archive`, outside the inbox entirely. Opening with `O_NOFOLLOW` refuses the link atomically,
+    and `fchmod` acts on the descriptor, so what is created, what is checked, and what is modified
+    are all provably the same object.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    try:
+        os.fchmod(fd, _DIR_MODE)
+    finally:
+        os.close(fd)
+
+
 def _ensure_tree(root: Path) -> Path:
-    """Create the inbox tree owner-only. `mkdir(mode=...)` is umask-masked, so chmod explicitly."""
+    """Create the inbox tree owner-only. `mkdir(mode=...)` is umask-masked, so chmod explicitly.
+
+    Every directory here is created and then permission-set THROUGH ITS OWN DESCRIPTOR: see
+    `_chmod_own_directory` for why naming it twice is not the same as holding it once.
+    """
     root.mkdir(parents=True, exist_ok=True)
-    os.chmod(root, _DIR_MODE)
+    _chmod_own_directory(root)
     for name in _SUBDIRS:
         directory = root / name
         directory.mkdir(exist_ok=True)
-        os.chmod(directory, _DIR_MODE)
+        _chmod_own_directory(directory)
     return root
 
 
@@ -286,22 +355,73 @@ def _stamp(created_at: str) -> str:
 # Publish
 # --------------------------------------------------------------------------------------------
 
+def _lane_dir_fd(directory: Path, lane: str) -> int:
+    """An open descriptor for one lane, or `OSError` if it is not a real directory.
+
+    `O_NOFOLLOW | O_DIRECTORY` refuses a symlinked or non-directory lane in the same syscall that
+    opens it. Every read and write below is then addressed RELATIVE to this descriptor, so no
+    operation depends on the path meaning the same thing twice.
+    """
+    return os.open(directory / lane, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+
+
+def _read_lane_file(path: Path) -> bytes:
+    """Read one lane file, refusing a symlink AT OPEN rather than after a stat.
+
+    The lane scan stats entries safely against the lane descriptor and then hands back plain paths,
+    which every reader would otherwise re-resolve with `read_bytes()` — so swapping an entry for a
+    symlink between the scan and the read made the reader consume content from outside the inbox.
+    The check was sound and the thing it checked was not the thing that got opened.
+
+    `O_NOFOLLOW` moves the refusal into the open itself. A swap to a different REGULAR file is still
+    possible and is not claimed otherwise; that attacker already holds write access to a 0700
+    directory, and what they would gain is writing a packet, which they could do directly.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            return handle.read()
+    finally:
+        os.close(fd)
+
+
 def _atomic_publish(directory: Path, lane: str, name: str, body: str) -> Path:
     """Write ``body`` into ``staging/`` and reveal it in ``lane/`` with a single `os.replace`.
 
     Shared by packets and signals so both lanes get the same durability guarantee from the same
     code — a reader of either lane sees a whole file or no file, never a partial one.
+
+    Containment is checked and THEN the write and the rename happen, so performing both by path
+    would let a lane swapped for a symlink in that window send them outside the inbox. Both
+    directories are held open with `O_NOFOLLOW | O_DIRECTORY` for the whole operation instead, and
+    the create and the rename are addressed relative to those descriptors — a later swap of either
+    path cannot redirect an operation that no longer names a path. The containment assertions stay:
+    they reject a hostile NAME, which is a different attack from a hostile directory.
     """
-    staging = _assert_inside(directory, directory / "staging" / name)
+    _assert_inside(directory, directory / "staging" / name)
     with _publish_lock(directory):
-        staging.write_text(body, encoding="utf-8")
-        os.chmod(staging, 0o600)
-        target = _assert_inside(directory, _free_name(directory / lane / name))
+        staging_fd = _lane_dir_fd(directory, "staging")
         try:
-            os.replace(staging, target)
-        except OSError:
-            staging.unlink(missing_ok=True)
-            raise
+            lane_fd = _lane_dir_fd(directory, lane)
+            try:
+                # O_EXCL so an attacker cannot pre-create the staging name as a symlink and have us
+                # write through it; O_NOFOLLOW so an existing symlink is refused, not followed.
+                handle = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o600, dir_fd=staging_fd)
+                try:
+                    os.write(handle, body.encode("utf-8"))
+                finally:
+                    os.close(handle)
+                target = _assert_inside(directory, _free_name(directory / lane / name))
+                try:
+                    os.replace(name, target.name, src_dir_fd=staging_fd, dst_dir_fd=lane_fd)
+                except OSError:
+                    os.unlink(name, dir_fd=staging_fd)
+                    raise
+            finally:
+                os.close(lane_fd)
+        finally:
+            os.close(staging_fd)
     return target
 
 
@@ -352,7 +472,7 @@ def _all_verdicts(root: Path | str | None) -> list[dict]:
             try:
                 if path.stat().st_size > MAX_VERDICT_BYTES:
                     continue
-                out.append(loads_verdict(path.read_bytes()))
+                out.append(loads_verdict(_read_lane_file(path)))
             except (PacketError, OSError):
                 continue
     return out
@@ -541,24 +661,86 @@ def publish_advice(advice: Mapping[str, Any], *, root: Path | str | None = None)
 # Detect / claim
 # --------------------------------------------------------------------------------------------
 
-def _lane_files(root: Path | str | None, lane: str) -> list[Path]:
-    """Readable `.json` files in one lane, oldest first (names are timestamp-prefixed).
+def _lane_scan(root: Path | str | None, lane: str) -> LaneScan:
+    """List one lane, oldest first, and REPORT what was refused instead of discarding it.
 
-    Only regular, non-hidden `.json` files count. Symlinks and directories are ignored outright —
-    a hand-dropped symlink must never let a reader follow the inbox out to another file.
+    Only regular, non-hidden `.json` files count. Symlinks and directories are never followed — a
+    hand-dropped symlink must not let a reader walk the inbox out to another file. But a refusal is
+    recorded, not silently absorbed: a `.json` entry that is a symlink or is not a regular file, and
+    any listing error other than "the lane does not exist yet", clears ``complete``.
+
+    A lane directory that has simply never been created is genuinely, provably empty — `_ensure_tree`
+    has not run — so `FileNotFoundError` alone returns a COMPLETE empty scan. Every other `OSError`
+    (a permission wall, an I/O error) is a refusal: we do not know what is in there.
+
+    Checking the lane with `lstat` and then RE-OPENING IT BY PATH to list it would be two path
+    resolutions with a window between them, which is not a check: swap the lane for a symlink in
+    that window and the listing walks outside the inbox while reporting a complete scan, after which
+    `claim_next` moves an outside file into `claimed/`. The lane is opened ONCE and every entry is
+    stated relative to that open descriptor, so nothing here depends on the path resolving the same
+    way twice.
+
+    `O_NOFOLLOW | O_DIRECTORY` also makes the refusal atomic and total in one syscall: a symlinked
+    lane cannot be opened at all (ELOOP on Linux, ENOTDIR on macOS), and neither can a lane that is a
+    regular file, a FIFO, or anything else that is not a directory. No enumeration of the ways a lane
+    can fail to be a directory has to be complete for that to hold.
     """
     directory = inbox_root(root) / lane
     try:
-        entries = list(directory.iterdir())
-    except OSError:
-        return []
-    return sorted(
-        entry for entry in entries
-        if entry.suffix == ".json"
-        and not entry.name.startswith(".")
-        and not entry.is_symlink()
-        and entry.is_file()
-    )
+        fd = os.open(directory, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    except FileNotFoundError:
+        return LaneScan(files=(), refused=(), complete=True)   # never created: provably empty
+    except OSError as exc:
+        return LaneScan(files=(), refused=(f"<the lane could not be opened: "
+                                           f"{exc.strerror or type(exc).__name__}>",),
+                        complete=False)
+
+    files: list[Path] = []
+    refused: list[str] = []
+    try:
+        try:
+            with os.scandir(fd) as entries:
+                names = [entry.name for entry in entries]
+        except OSError as exc:
+            return LaneScan(files=(), refused=(f"<the lane could not be listed: "
+                                               f"{exc.strerror or type(exc).__name__}>",),
+                            complete=False)
+        for name in names:
+            if not name.endswith(".json") or name.startswith("."):
+                continue
+            # Stated against the open lane, not against a path that could now mean something else.
+            # `follow_symlinks=False` reports the LINK, so `S_ISREG` is false for a symlink, a
+            # directory, a FIFO or a device in a single answer.
+            try:
+                entry_stat = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except OSError:
+                refused.append(name)
+                continue
+            if not _stat.S_ISREG(entry_stat.st_mode):
+                refused.append(name)
+                continue
+            files.append(directory / name)
+    finally:
+        os.close(fd)
+    return LaneScan(files=tuple(sorted(files)), refused=tuple(refused), complete=not refused)
+
+
+def _lane_files(root: Path | str | None, lane: str) -> list[Path]:
+    """Readable `.json` files in one lane, oldest first — FAILING CLOSED on an incomplete listing.
+
+    This is the safe default and what nearly every caller wants: if the lane could not be read in
+    full, you are told, rather than handed an empty list you cannot distinguish from an empty lane.
+    A caller that must stay live in the presence of a hostile drop calls `_lane_scan` directly and
+    decides for itself — and, because it is opting out of the guard, must say in its own docstring
+    which direction it is choosing to be wrong in.
+
+    :raises LaneUnreadable: the lane exists but could not be listed completely.
+    """
+    scan = _lane_scan(root, lane)
+    if not scan.complete:
+        log.warning("twoperson.lane_unreadable", lane=lane, refused=list(scan.refused))
+        raise LaneUnreadable(scan.reason(lane))
+    return list(scan.files)
 
 
 def pending(root: Path | str | None = None) -> list[Path]:
@@ -576,7 +758,7 @@ def _load(path: Path) -> dict:
     size = path.stat().st_size
     if size > MAX_PACKET_BYTES:
         raise PacketError(f"packet: size {size} exceeds the {MAX_PACKET_BYTES}-byte limit")
-    return loads_packet(path.read_bytes())
+    return loads_packet(_read_lane_file(path))
 
 
 def quarantine(path: Path, reason: str, *, root: Path | str | None = None) -> Path:
@@ -676,8 +858,23 @@ def archive_claimed(path: Path, *, root: Path | str | None = None) -> Path:
 # --------------------------------------------------------------------------------------------
 
 def pending_signals(root: Path | str | None = None) -> list[Path]:
-    """Unacknowledged completion-signal files, oldest first."""
-    return _lane_files(root, "signals")
+    """Unacknowledged completion-signal files, oldest first — TOLERANT of a refused entry.
+
+    This lane deliberately opts out of `_lane_files`' fail-closed listing, and the reason is the
+    line between the two behaviours: **a packet gates a ship; a signal gates nothing.** A signal only
+    reports that a session stopped — it satisfies no audit, unlocks no push, and the protocol is
+    explicit that it is not the packet. Refusing to serve the lane because someone dropped a symlink
+    in it would convert a nuisance into an outage of the whole event-driven wake-up, and would do so
+    to protect a decision that is not being made here.
+
+    The direction this chooses to be wrong in: **under-report**. A refused entry is skipped and
+    logged, so at worst Reviewer is not woken by *this* signal and is woken by the next one or by its
+    poll. Nothing is admitted, and no absence here is ever read as evidence.
+    """
+    scan = _lane_scan(root, "signals")
+    if not scan.complete:
+        log.warning("twoperson.signal_scan_incomplete", lane="signals", refused=list(scan.refused))
+    return list(scan.files)
 
 
 def has_pending_signals(root: Path | str | None = None) -> bool:
@@ -699,7 +896,7 @@ def read_signals(root: Path | str | None = None) -> list[tuple[Path, dict]]:
             size = path.stat().st_size
             if size > MAX_SIGNAL_BYTES:
                 raise PacketError(f"signal: size {size} exceeds the {MAX_SIGNAL_BYTES}-byte limit")
-            out.append((path, loads_signal(path.read_bytes())))
+            out.append((path, loads_signal(_read_lane_file(path))))
         except PacketError as exc:
             quarantine(path, str(exc), root=directory)
         except OSError:  # vanished or unreadable between listing and load — nothing to report
@@ -775,7 +972,7 @@ def read_verdicts(root: Path | str | None = None) -> list[tuple[Path, dict]]:
             size = path.stat().st_size
             if size > MAX_VERDICT_BYTES:
                 raise PacketError(f"verdict: size {size} exceeds the {MAX_VERDICT_BYTES}-byte limit")
-            out.append((path, loads_verdict(path.read_bytes())))
+            out.append((path, loads_verdict(_read_lane_file(path))))
         except PacketError as exc:
             quarantine(path, str(exc), root=directory)
         except OSError:  # vanished or unreadable between listing and load — nothing to report
@@ -834,11 +1031,20 @@ def verdicted_packet_ids(root: Path | str | None = None) -> frozenset[str]:
     it) — those two cases must never be treated the same way; blindly requeuing the second case would
     silently duplicate an already-shipped review.
 
-    Best-effort: a verdict file that is oversize, unparseable, or otherwise corrupt is skipped rather
-    than raised — one bad file must never abort the scan, and skipping it only ever makes this
-    function UNDER-report (a real packet_id treated as "no verdict found yet"), which biases the
-    caller toward requeuing rather than toward silently archiving something never actually verified —
-    the safe direction to be wrong in.
+    Best-effort at the FILE level: a verdict file that is oversize, unparseable, or otherwise corrupt
+    is skipped rather than raised — one bad file must never abort the scan.
+
+    That per-FILE tolerance does NOT extend to the LANE, because under-reporting is not the safe
+    direction here. The consumer is a stale-claim sweep that treats an id missing from this set as
+    UNRESOLVED and requeues the claim, so a short set does not fail harmlessly toward requeuing — it
+    re-audits a packet whose durable verdict already exists, breaking at-most-once. "Skip a file we
+    cannot parse" and "cannot see the lane at all" are different sizes of doubt, and only the first
+    one is safe to absorb.
+
+    So the lane listing goes through `_lane_files` and fails closed like every other gating reader.
+    A caller that cannot get an answer must decline to act, not act on a set it knows is short.
+
+    :raises LaneUnreadable: a verdict lane could not be listed completely.
     """
     directory = inbox_root(root)
     ids: set[str] = set()
@@ -847,7 +1053,7 @@ def verdicted_packet_ids(root: Path | str | None = None) -> frozenset[str]:
             size = path.stat().st_size
             if size > MAX_VERDICT_BYTES:
                 continue
-            verdict = loads_verdict(path.read_bytes())
+            verdict = loads_verdict(_read_lane_file(path))
         except (PacketError, OSError):
             continue
         packet_id = verdict.get("packet_id")
@@ -875,7 +1081,7 @@ def _load_consult(path: Path) -> dict:
     size = path.stat().st_size
     if size > MAX_CONSULT_BYTES:
         raise PacketError(f"consult: size {size} exceeds the {MAX_CONSULT_BYTES}-byte limit")
-    return loads_consult(path.read_bytes())
+    return loads_consult(_read_lane_file(path))
 
 
 def _next_consult(root: Path | str | None, *, claim: bool) -> Claimed | None:
@@ -979,7 +1185,7 @@ def read_advice(root: Path | str | None = None) -> list[tuple[Path, dict]]:
             size = path.stat().st_size
             if size > MAX_ADVICE_BYTES:
                 raise PacketError(f"advice: size {size} exceeds the {MAX_ADVICE_BYTES}-byte limit")
-            out.append((path, loads_advice(path.read_bytes())))
+            out.append((path, loads_advice(_read_lane_file(path))))
         except PacketError as exc:
             quarantine(path, str(exc), root=directory)
         except OSError:  # vanished or unreadable between listing and load — nothing to report
@@ -1022,8 +1228,11 @@ def ack_advice(paths: Iterable[Path], *, root: Path | str | None = None) -> list
 
 def answered_consult_ids(root: Path | str | None = None) -> frozenset[str]:
     """Every ``consult_id`` that already has durable advice recorded — scanning BOTH ``advice/`` and
-    ``advice_seen/``. The consult-lane sibling of `verdicted_packet_ids`; see its docstring for why
-    this specific under-report-is-safe direction matters for the stale-claim sweep."""
+    ``advice_seen/``. The consult-lane sibling of `verdicted_packet_ids`, and it fails closed for the
+    same reason: its consumer treats a missing id as unresolved, so a lane it could not read in full
+    must decline the sweep rather than requeue an already-answered consult.
+
+    :raises LaneUnreadable: an advice lane could not be listed completely."""
     directory = inbox_root(root)
     ids: set[str] = set()
     for path in _lane_files(directory, "advice") + _lane_files(directory, "advice_seen"):
@@ -1031,7 +1240,7 @@ def answered_consult_ids(root: Path | str | None = None) -> frozenset[str]:
             size = path.stat().st_size
             if size > MAX_ADVICE_BYTES:
                 continue
-            advice = loads_advice(path.read_bytes())
+            advice = loads_advice(_read_lane_file(path))
         except (PacketError, OSError):
             continue
         consult_id = advice.get("consult_id")

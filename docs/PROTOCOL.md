@@ -143,8 +143,8 @@ the ladder.
 | `template` | builder | Emit a skeleton packet. Evidence fields (task/session/run ids, goal, shas, counts, tests, evidence, model and impact) are `unknown`. Fixed placeholders: `schema_version`; `packet_id` `replace-me`; `created_at` `1970-01-01T00:00:00Z`; `git.base_ref` `origin/main`; `acceptance_criteria` `["unknown"]`; push flags `false` with the no-push statement; every other list empty. |
 | `verify --from p.json` | builder | Validate a packet without writing anything. Exit 2 if rejected. |
 | `publish --from p.json` | builder | Validate and land the packet in `pending/`. |
-| `check` | reviewer | Is a packet waiting? Exit 0 = yes, 1 = no. Costs no model tokens. |
-| `list` | reviewer | What is waiting, oldest first. |
+| `check` | reviewer | Is a packet waiting? Exit 0 = yes, 1 = no, 2 = the lane could not be read in full. Costs no model tokens. |
+| `list` | reviewer | What is waiting, oldest first. Exits 2 rather than listing nothing if a lane could not be read in full. |
 | `next` | reviewer | Claim the oldest packet and render it for audit. |
 | `tier` | reviewer | Difficulty tier (`low`/`medium`/`high`/`critical`, with score and reasons) of the oldest pending packet, or `--packet <id>`. Reads without claiming. |
 | `verdict --packet <id> --decision <d> [--note …] [--finding …]` | reviewer | Return the audit result. |
@@ -173,7 +173,7 @@ A consult never enters `pending/`, never produces a verdict, and never unlocks a
 | `signals --ack` | Reviewer: which sessions finished since last check. |
 | `install-hook` | Register the `Stop` hook in `.claude/settings.json`. `--check` reports without writing. |
 | `install-watch` | Install the launchd agent (macOS) that fires on inbox changes. |
-| `watch --once` | One dispatch pass: notify both sides, launch configured commands. `--off`/`--on`/`--status` control the mute switch. |
+| `watch --once` | One dispatch pass: notify both sides, launch configured commands. `--off`/`--on`/`--status` control the mute switch. Exits 2 if a lane could not be read — that lane announces nothing and forgets nothing, and the other lanes still fire. |
 
 ## 6. Environment
 

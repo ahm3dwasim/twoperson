@@ -15,6 +15,7 @@ from __future__ import annotations
 from .hook import HookInstallError, hook_settings, install_hook
 from .inbox import (
     Claimed,
+    LaneScan,
     ack_advice,
     ack_signals,
     ack_verdicts,
@@ -88,6 +89,7 @@ from .verdict import (
 )
 from .packet import (
     SCHEMA_VERSION,
+    LaneUnreadable,
     PacketError,
     SchemaError,
     SecretLeakError,
@@ -132,6 +134,8 @@ __all__ = [
     "Cursor",
     "DispatchReport",
     "HookInstallError",
+    "LaneScan",
+    "LaneUnreadable",
     "PacketError",
     "SchemaError",
     "SecretLeakError",

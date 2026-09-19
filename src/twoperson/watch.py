@@ -52,6 +52,7 @@ from pathlib import Path
 import structlog
 
 from .inbox import inbox_root, pending, pending_advice, pending_consults, pending_verdicts
+from .packet import LaneUnreadable
 
 log = structlog.get_logger(__name__)
 
@@ -187,6 +188,10 @@ class WatchDelta:
     new_consults: tuple[str, ...] = ()
     new_advice: tuple[str, ...] = ()
 
+    #: Lanes that could not be listed this pass, each with its reason. A lane named here announced
+    #: nothing and forgot nothing — its cursor slice was carried forward unchanged.
+    unreadable: tuple[str, ...] = ()
+
     @property
     def is_empty(self) -> bool:
         return not (self.new_packets or self.new_verdicts
@@ -205,6 +210,9 @@ class DispatchReport:
     launched: list[str] = field(default_factory=list)
     launch_failed: list[str] = field(default_factory=list)
     muted: bool = False
+    #: Lanes that could not be listed this pass, each with its reason. Reported, never swallowed.
+    #: A lane named here announced nothing and forgot nothing; every OTHER lane still fired.
+    lane_unreadable: tuple[str, ...] = ()
 
     @property
     def acted(self) -> bool:
@@ -223,15 +231,27 @@ def scan_new(root: Path | str | None, cursor: Cursor) -> WatchDelta:
     the current lane contents**, so a file that has since been claimed/acked drops out and can never
     pin the cursor open — and because inbox filenames are unique (timestamp + id), a name never
     legitimately reappears, so pruning cannot cause a re-fire of real work.
+
+    The four listings are read one at a time, so a refusal in ANY of them costs exactly that lane. As
+    one expression, a malformed `advice/` or `consult/` lane — neither of which gates anything —
+    would suppress notification and launch for a real audit packet sitting readable in `pending/`.
+    A lane that refuses carries its PREVIOUS cursor slice forward untouched: nothing in it is
+    announced, nothing in it is marked seen, and the next pass tries it again.
     """
-    packets_now = frozenset(p.name for p in pending(root))
-    verdicts_now = frozenset(p.name for p in pending_verdicts(root))
-    consults_now = frozenset(p.name for p in pending_consults(root))
-    advice_now = frozenset(p.name for p in pending_advice(root))
-    new_packets = tuple(sorted(packets_now - cursor.packets))
-    new_verdicts = tuple(sorted(verdicts_now - cursor.verdicts))
-    new_consults = tuple(sorted(consults_now - cursor.consults))
-    new_advice = tuple(sorted(advice_now - cursor.advice))
+    unreadable: list[str] = []
+
+    def _lane(name: str, read, seen: frozenset[str]) -> tuple[tuple[str, ...], frozenset[str]]:
+        try:
+            now = frozenset(p.name for p in read(root))
+        except LaneUnreadable as exc:
+            unreadable.append(f"{name}: {exc}")
+            return (), seen          # carry the slice forward; announce nothing, forget nothing
+        return tuple(sorted(now - seen)), now
+
+    new_packets, packets_now = _lane("pending", pending, cursor.packets)
+    new_verdicts, verdicts_now = _lane("verdicts", pending_verdicts, cursor.verdicts)
+    new_consults, consults_now = _lane("consult", pending_consults, cursor.consults)
+    new_advice, advice_now = _lane("advice", pending_advice, cursor.advice)
     return WatchDelta(
         new_packets=new_packets,
         new_verdicts=new_verdicts,
@@ -239,6 +259,7 @@ def scan_new(root: Path | str | None, cursor: Cursor) -> WatchDelta:
         new_advice=new_advice,
         cursor=Cursor(packets=packets_now, verdicts=verdicts_now,
                       consults=consults_now, advice=advice_now),
+        unreadable=tuple(unreadable),
     )
 
 
@@ -461,9 +482,16 @@ def dispatch_once(
         # still win. Bail with the cursor untouched, exactly as the pre-lock fast-path does.
         if is_muted(root):
             return DispatchReport(muted=True)
+        # A refusal costs its own lane and no other. `scan_new` reports which lanes it could not read
+        # and carries each of their cursor slices forward untouched, so nothing in a refused lane is
+        # announced and nothing in it is marked seen; the readable lanes still fire, which is the
+        # whole point of an event bridge that must keep delivering audits.
         delta = scan_new(root, load_cursor(root))
+        if delta.unreadable:
+            log.warning("twoperson.lane_unreadable", lanes=list(delta.unreadable))
         report = DispatchReport(new_packets=delta.new_packets, new_verdicts=delta.new_verdicts,
-                                new_consults=delta.new_consults, new_advice=delta.new_advice)
+                                new_consults=delta.new_consults, new_advice=delta.new_advice,
+                                lane_unreadable=delta.unreadable)
 
         # Advance the cursor to the current lanes by default; below we RETAIN (keep unseen) any lane
         # whose configured launch failed, so a failed audit/wake/consult is retried rather than

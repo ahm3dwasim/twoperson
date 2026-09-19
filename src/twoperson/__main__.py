@@ -54,7 +54,14 @@ import structlog
 
 from . import inbox
 from .hook import HookInstallError, hook_script_path, install_hook
-from .packet import PacketError, dumps_packet, loads_packet, render_for_review, template_packet
+from .packet import (
+    LaneUnreadable,
+    PacketError,
+    dumps_packet,
+    loads_packet,
+    render_for_review,
+    template_packet,
+)
 from .watch import DEFAULT_INTERVAL_SECONDS, dispatch_once, is_muted, set_muted, watch_loop
 from .watchagent import WatchInstallError, install_watch_agent, watch_script_path
 from .signal import (
@@ -330,7 +337,12 @@ def _watch(args) -> int:
             print(f"notified: {side}")
         for side in report.launched:
             print(f"launched: {side}")
-        return EXIT_OK
+        # Un-mute reported successful activation while its catch-up pass had silently failed to read
+        # a lane. "Pause, not skip" is the promise; a lane the catch-up could not read has been
+        # skipped, and saying so is the difference between the two.
+        for lane in report.lane_unreadable:
+            print(f"watch: catch-up could not read a lane — {lane}", file=sys.stderr)
+        return EXIT_REJECTED if report.lane_unreadable else EXIT_OK
     if args.status:
         print(f"watch: {'OFF (muted)' if is_muted() else 'ON'}")
         return EXIT_OK
@@ -343,9 +355,15 @@ def _watch(args) -> int:
             print(f"notified: {side}")
         for side in report.launched:
             print(f"launched: {side}")
+        # A refused lane printed "nothing new" and exited 0 — refusal-equals-empty rebuilt at the CLI
+        # boundary, one level above the reader that was fixed for it. "I could not read this lane" is
+        # not "there is nothing in it", and the exit code has to say so.
+        for lane in report.lane_unreadable:
+            print(f"watch: lane refused — {lane}", file=sys.stderr)
         if not report.acted:
-            print("watch: nothing new")
-        return EXIT_OK
+            print("watch: nothing new" if not report.lane_unreadable
+                  else "watch: nothing new IN THE LANES IT COULD READ")
+        return EXIT_REJECTED if report.lane_unreadable else EXIT_OK
     print(f"watch: polling the inbox every {args.interval:g}s (Ctrl-C to stop)", file=sys.stderr)
     watch_loop(interval=args.interval)
     return EXIT_OK
@@ -492,7 +510,21 @@ def main(argv: list[str] | None = None) -> int:
                       help="write the plist but do not launchctl (re)load it")
 
     args = parser.parse_args(argv)
+    # One boundary net so no command can traceback on a lane it was refused. `_lane_files` fails
+    # closed, which is right — a refused lane must never be answered as an empty one. But "fails
+    # closed" has to arrive at the operator as a refusal, not as a stack trace, and guarding each
+    # command separately is a hand-kept list: the commands that had guards would be the ones somebody
+    # remembered, and the next command added would not. Catching it once, here, covers every command
+    # including ones not yet written. `check` and `list` keep their own handlers below on purpose:
+    # their exit code IS their answer, and a refusal there must never be reported as EXIT_NOTHING by
+    # anything, including this net.
+    try:
+        return _dispatch(args)
+    except LaneUnreadable as exc:
+        return _fail(f"inbox refused — {exc}")
 
+
+def _dispatch(args) -> int:
     if args.cmd == "template":
         print(dumps_packet(template_packet()), end="")
         return EXIT_OK
@@ -520,10 +552,20 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
 
     if args.cmd == "check":
-        return EXIT_OK if inbox.has_pending() else EXIT_NOTHING
+        # A lane that could not be read in full must never answer EXIT_NOTHING: "no work waiting" and
+        # "I was refused" are different answers, and a poller that cannot tell them apart goes quiet
+        # on exactly the tampering the refusal exists to catch.
+        try:
+            return EXIT_OK if inbox.has_pending() else EXIT_NOTHING
+        except LaneUnreadable as exc:
+            return _fail(f"cannot determine whether work is waiting — {exc}")
 
     if args.cmd == "list":
-        for path in inbox.pending():
+        try:
+            paths = inbox.pending()
+        except LaneUnreadable as exc:
+            return _fail(f"cannot list pending packets — {exc}")
+        for path in paths:
             print(path)
         return EXIT_OK
 

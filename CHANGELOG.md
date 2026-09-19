@@ -34,6 +34,42 @@ All notable changes to this project are documented here. The format follows
   self-reported per packet. The feature was unreleased, so there is no compatibility path for the
   old boolean field.
 
+### Fixed
+
+- **An inbox lane that cannot be listed is refused, not answered as an empty one.** Listing a lane
+  returned `[]` identically for a lane that was empty and for a lane that could not be read, so a
+  permission wall or a hand-dropped symlink made `has_pending()` report "no work waiting" and
+  `pending()` report a clean zero — a false negative on exactly the tampering the refusal exists to
+  catch. Readers now raise `LaneUnreadable` (a `PacketError`) on an incomplete listing. This is a
+  behaviour change for callers: `check` exits `2` instead of `1`, `list` reports the refusal instead
+  of printing nothing, and any command that reads a lane reports the refusal rather than a traceback
+  (one net in `main`, so the covered set is not a hand-kept list of remembered commands).
+  `verdicted_packet_ids` and `answered_consult_ids` raise for the same reason — the sweep that
+  consumes them treats a missing id as *unresolved*, so a short set would requeue work whose durable
+  verdict already exists. The `signals/` lane is the one deliberate exception: a signal gates
+  nothing, so that lane stays live and skips a refused entry rather than going dark.
+- **Publishing no longer rewrites the permissions of a directory outside the inbox.**
+  `_ensure_tree` used `mkdir(exist_ok=True)`, which *succeeds* on a symlink to a directory — an
+  "already exists" case, not an error — and `os.chmod` then followed it, so a lane replaced by a link
+  had its target chmodded to `0700` by an ordinary `publish`. Directories are now created, checked
+  and permission-set through a descriptor opened `O_NOFOLLOW`, so what is created, what is checked
+  and what is modified are provably the same object.
+- **A lane file can no longer be swapped for a symlink between the listing and the read, and a
+  publish can no longer be redirected out of the inbox mid-write.** Every lane read opens with
+  `O_NOFOLLOW`, so the refusal happens in the open rather than after a `stat` that a second path
+  resolution could invalidate; and a publish holds both `staging/` and the destination lane open with
+  `O_NOFOLLOW | O_DIRECTORY` for the whole operation, creating the staging file `O_EXCL` and
+  addressing the rename relative to those descriptors instead of to paths that could mean something
+  else by then. The containment assertions stay — they reject a hostile *name*, which is a different
+  attack from a hostile *directory*. The descriptor-relative code uses the same POSIX surface this
+  module already required for its `fcntl.flock` publish lock, so it narrows nothing further.
+- **`watch` no longer swallows a refusal.** The four lane listings were a single expression, so an
+  unreadable `advice/` or `consult/` lane — neither of which gates anything — suppressed notification
+  and launch for a real audit packet sitting readable in `pending/`. Each lane is now read on its
+  own; a refused lane carries its cursor slice forward untouched, so nothing in it is announced and
+  nothing in it is marked seen; and `watch --once` exits `2` with the refusal on stderr instead of
+  printing "nothing new" and exiting `0`.
+
 ## [0.1.1] - 2026-09-03
 
 ### Security

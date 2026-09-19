@@ -575,3 +575,69 @@ def test_an_old_cursor_without_advisory_lanes_loads_as_empty_lanes():
     old = Cursor.from_json({"packets": ["p.json"], "verdicts": ["v.json"]})
     assert old.packets == frozenset({"p.json"})
     assert old.consults == frozenset() and old.advice == frozenset()
+
+
+# --------------------------------------------------------------------------------------------
+# A refusal costs its own lane — and is never answered as "nothing new"
+# --------------------------------------------------------------------------------------------
+
+def _drop_symlink(root, lane: str, name: str = "9999-hostile.json"):
+    """Hand-drop a `.json` SYMLINK into a lane, the way an attacker or a stray `ln -s` would."""
+    directory = root / lane
+    directory.mkdir(parents=True, exist_ok=True)
+    outside = root.parent / "elsewhere.json"
+    outside.write_text("{}")
+    link = directory / name
+    link.symlink_to(outside)
+    return link
+
+
+def _dispatch(root):
+    """One pass with no launch commands and recording effects — the shape the refusal tests need."""
+    recorder = Recorder()
+    return dispatch_once(root=root, audit_cmd="", wake_cmd="", consult_cmd="", advice_cmd="",
+                         notify_fn=recorder.notify, run_fn=recorder.run)
+
+
+def test_a_refused_lane_costs_that_lane_and_no_other(root):
+    """The four listings used to be one expression, so a bad `advice/` lane — which gates nothing —
+    suppressed notification and launch for a real audit packet sitting readable in `pending/`.
+    """
+    inbox.publish(valid_packet(), root=root)      # a REAL packet, in a readable lane
+    _drop_symlink(root, "advice")                 # a refusal in a lane that gates nothing
+
+    report = _dispatch(root)
+    assert report.lane_unreadable, "the refusal must be reported"
+    assert any("advice" in lane for lane in report.lane_unreadable)
+    assert report.new_packets, (
+        "an unreadable advice lane suppressed a readable audit packet — one refusal took down "
+        "three lanes that were fine"
+    )
+
+
+def test_a_refused_lane_forgets_nothing_so_the_next_pass_still_sees_it(root):
+    """The other half: a refused lane must not have its cursor slice advanced past unseen work.
+
+    Advancing past a lane it could not read is how a real packet gets marked seen without ever being
+    announced. The slice is carried forward untouched, so the next pass retries it.
+    """
+    inbox.publish(valid_packet(), root=root)
+    _drop_symlink(root, "pending")
+
+    first = _dispatch(root)
+    assert first.lane_unreadable and not first.new_packets
+    assert load_cursor(root).packets == frozenset(), "the refused lane's slice moved"
+
+    (root / "pending" / "9999-hostile.json").unlink()          # the drop is cleaned up
+    second = _dispatch(root)
+    assert second.new_packets, "the packet was never announced — it was swallowed by the refusal"
+
+
+def test_a_refused_pending_lane_is_reported_by_the_scan_itself(root):
+    """`scan_new` is the pure core, so the refusal is visible there before any effect runs."""
+    inbox.publish(valid_packet(), root=root)
+    _drop_symlink(root, "pending")
+
+    delta = scan_new(root, Cursor())
+    assert delta.new_packets == (), "a refused lane must announce nothing"
+    assert any("pending" in lane for lane in delta.unreadable)

@@ -235,3 +235,72 @@ def test_install_hook_rejects_an_implausible_target(root, tmp_path, capsys):
     assert main(["install-hook", "--settings", str(target)]) == 2
     assert "must be named" in capsys.readouterr().err
     assert not target.exists()
+
+
+# --------------------------------------------------------------------------------------------
+# Fail-closed must ARRIVE as a refusal, not as a stack trace
+#
+# Making the lane listing raise is only half a fix. The other half is that every edge which reads a
+# lane — the CLI, the watcher — turns that raise into an outcome an operator can act on, without
+# dying.
+# --------------------------------------------------------------------------------------------
+
+def _drop_symlink(root, lane: str, name: str = "9999-hostile.json"):
+    """Hand-drop a `.json` SYMLINK into a lane, the way an attacker or a stray `ln -s` would."""
+    directory = root / lane
+    directory.mkdir(parents=True, exist_ok=True)
+    outside = root.parent / "elsewhere.json"
+    outside.write_text("{}")
+    link = directory / name
+    link.symlink_to(outside)
+    return link
+
+
+def test_no_cli_command_tracebacks_on_a_lane_it_was_refused(root, capsys):
+    """One boundary net, so the covered set is not a hand-kept list of remembered commands.
+
+    Four commands read a lane through the raising helper with nothing between them and the operator
+    that caught it.
+    """
+    for lane, argv in (("verdicts", ["verdicts"]),
+                       ("advice", ["consult-advice"]),
+                       ("consult", ["consult-list"]),
+                       ("pending", ["next"])):
+        _drop_symlink(root, lane, name=f"9999-hostile-{lane}.json")
+        code = main(argv)
+        captured = capsys.readouterr()
+        assert code != 0, f"{argv[0]}: a refused lane must not report success"
+        assert "refused" in (captured.err + captured.out).lower(), (
+            f"{argv[0]}: the refusal must reach the operator, got {captured.err!r}"
+        )
+
+
+def test_the_check_probe_never_answers_nothing_waiting_for_a_lane_it_could_not_read(root, capsys):
+    """`check`'s exit code IS its answer, so EXIT_NOTHING here would be the false negative itself."""
+    from twoperson.__main__ import EXIT_NOTHING
+
+    _drop_symlink(root, "pending")
+    code = main(["check"])
+    assert code != EXIT_NOTHING, "a refused lane reported as 'no work waiting'"
+    assert code != 0
+
+
+def test_the_list_command_reports_a_refused_lane_instead_of_listing_nothing(root, capsys):
+    _drop_symlink(root, "pending")
+    code = main(["list"])
+    captured = capsys.readouterr()
+    assert code != 0
+    assert "refused" in captured.err.lower()
+
+
+def test_watch_once_reports_a_refused_lane_and_exits_nonzero(root, capsys):
+    """A refused lane printed "nothing new" and exited 0 — refusal-equals-empty rebuilt at the CLI
+    boundary, one level above the reader that was fixed for it. "I could not read this lane" is not
+    "there is nothing in it", and the exit code has to say so.
+    """
+    _drop_symlink(root, "pending")
+    code = main(["watch", "--once"])
+    captured = capsys.readouterr()
+    assert code != 0, "watch --once reported success on a lane it was refused"
+    assert "lane refused" in captured.err
+    assert "nothing new" not in captured.out or "COULD READ" in captured.out
