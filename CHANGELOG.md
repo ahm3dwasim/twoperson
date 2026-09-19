@@ -6,6 +6,27 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- The watcher's master mute switch now fails CLOSED, not open, when its own occupancy cannot be
+  determined: a transient fault reading the switch file itself (`EIO`, `EACCES`, ...) used to be
+  read the same as "the switch is absent", so a configured audit/wake command could launch — and the
+  cursor advance past it — with the pause state genuinely unknown. It is now treated exactly like an
+  explicit mute: nothing launches, nothing notifies, and the cursor is left untouched so the arrival
+  is still picked up once the fault clears. A root that cannot be opened at all is unaffected by this
+  change and still surfaces as a reportable lane refusal, not as "muted" — nothing can launch on such
+  a pass either way, since every lane fails to list as new, but the CLI's `watch --once` still needs
+  to see it as a rejection.
+- The structural `_safefs` guard (the test suite's own enforcement that every file operation in the
+  package routes through the primitive) no longer misses a guarded operation reached through an
+  import alias: `import os as fs; fs.open(...)`, `from os import open as raw_open; raw_open(...)`,
+  an unaliased `from os import open; open(...)`, and the `fcntl`/`pathlib` equivalents all now
+  resolve to the same finding the un-aliased spelling would. It also now flags a guarded operation
+  that is merely *referenced* (assigned to a variable, passed as a callback) without being called in
+  the module that names it, since that reference is exactly as able to reach the filesystem later as
+  a call would be. This closes a real gap in the guard itself, not in any code it was already
+  scanning — `getattr`/`importlib`/dynamic dispatch remain outside what an AST-level check can see.
+
 ## [0.1.2] - 2026-09-19
 
 ### Added

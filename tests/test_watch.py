@@ -740,6 +740,95 @@ def test_the_mute_switch_is_never_stamped_through_a_symlink(root):
     assert not (root / watch.SWITCH_NAME).is_symlink()
 
 
+def test_switch_unreadable_fails_closed_not_open(root, monkeypatch):
+    """A transient fault reading the mute switch itself (`EIO`, `EACCES`, ...) must read as MUTED, not
+    as un-muted. The switch's whole job is to STOP a launch; an "I could not tell" answer read as
+    "not muted" is exactly how a fail-open bug lets a launch through with the pause state unknown."""
+    inbox._ensure_tree(root)
+
+    def boom(_dir_fd, _name, **_k):
+        raise watch._safefs.SafeFsRefusal("the mute switch could not be examined: Input/output error")
+
+    monkeypatch.setattr(watch._safefs, "stat_nolink", boom)
+
+    assert is_muted(root) is True, "an unreadable switch must fail CLOSED (muted), not open"
+
+
+def test_a_refused_root_open_reads_as_not_muted_not_unknown(root, monkeypatch):
+    """The root's own open can refuse too (a hostile or unreadable root) — and here, unlike the
+    switch's own stat, ``False`` is still the right answer, deliberately NOT fail-closed: a root that
+    cannot be opened cannot be scanned for lanes either, so nothing can launch on this pass regardless
+    of what `is_muted` answers, and the refusal must still surface as `dispatch_once`'s
+    `lane_unreadable` (which the CLI maps to a hard rejection) rather than being swallowed here as a
+    silent, successful "muted" (see `test_a_refused_root_open_still_reports_lane_unreadable_not_muted`
+    and `tests/test_cli.py::test_every_lane_command_refuses_a_root_it_cannot_use[watch-once-...]`)."""
+    inbox._ensure_tree(root)
+
+    def boom(_root, **_k):
+        raise watch.inbox.LaneUnreadable("the inbox root could not be opened: Permission denied")
+
+    monkeypatch.setattr(watch.inbox, "_open_root_dir", boom)
+
+    assert is_muted(root) is False, "a refused root open must not be reported as 'muted'"
+
+
+def test_an_unreadable_switch_blocks_the_launch_and_leaves_the_cursor_untouched(root, monkeypatch):
+    """The reported failure: a refused switch stat used to read as "not muted", so the configured
+    audit command launched and the cursor was saved with the pause state genuinely unknown. Fixed:
+    the tick degrades exactly like an explicit mute — no notify, no launch, cursor untouched — and
+    the loop survives to try again next tick."""
+    inbox.publish(valid_packet())
+
+    def boom(_dir_fd, _name, **_k):
+        raise watch._safefs.SafeFsRefusal("the mute switch could not be examined: Input/output error")
+
+    monkeypatch.setattr(watch._safefs, "stat_nolink", boom)
+
+    rec = Recorder()
+    report = dispatch_once(root, audit_cmd="x", notify_fn=rec.notify, run_fn=rec.run)
+
+    assert report.muted is True
+    assert rec.notes == [] and rec.commands == [], "an unknown mute state must launch nothing"
+    assert load_cursor(root).packets == frozenset(), "an unknown mute state must not advance the cursor"
+
+
+def test_a_refused_root_open_still_reports_lane_unreadable_not_muted(root, monkeypatch):
+    """A refused root open must still launch nothing (every lane fails to open, so nothing is ever
+    seen as "new"), but it must reach the CLI as `lane_unreadable` — a rejection — not as `muted`, a
+    reported success. Collapsing the two here is the regression this pins: `watch --once` on a root
+    it cannot use has to exit non-zero, which depends on `report.muted` staying `False`."""
+    inbox.publish(valid_packet())
+
+    def boom(_root, **_k):
+        raise watch.inbox.LaneUnreadable("the inbox root could not be opened: Permission denied")
+
+    monkeypatch.setattr(watch.inbox, "_open_root_dir", boom)
+
+    rec = Recorder()
+    report = dispatch_once(root, audit_cmd="x", notify_fn=rec.notify, run_fn=rec.run)
+
+    assert report.muted is False, "a refused root open must not be reported as 'muted'"
+    assert report.lane_unreadable, "a refused root open must surface as a lane refusal instead"
+    assert rec.notes == [] and rec.commands == [], "a refused root open must still launch nothing"
+    assert load_cursor(root).packets == frozenset(), "a refused root open must not advance the cursor"
+
+
+def test_loop_survives_an_unreadable_switch_without_launching(root, monkeypatch):
+    """The loop must survive an unknown mute state indefinitely: it must not raise, must never count
+    the pass as acted-on, and must keep re-checking the switch on every subsequent tick."""
+    inbox.publish(valid_packet())
+
+    def boom(_dir_fd, _name, **_k):
+        raise watch._safefs.SafeFsRefusal("the mute switch could not be examined: Input/output error")
+
+    monkeypatch.setattr(watch._safefs, "stat_nolink", boom)
+
+    acted = watch.watch_loop(root, interval=0, max_passes=2, audit_cmd="x")
+
+    assert acted == 0, "an unknown mute state must never be counted as an acted-on pass"
+    assert load_cursor(root).packets == frozenset(), "the cursor must not advance while unreadable"
+
+
 @pytest.mark.parametrize("writer", ["_dispatch_lock", "_cursor", "_switch"], ids=str)
 def test_no_watcher_write_follows_a_symlinked_root(root, tmp_path, writer):
     """The root itself as a symlink: every write is refused, and NOTHING lands in the target.

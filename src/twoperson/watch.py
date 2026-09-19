@@ -174,29 +174,46 @@ def _replace_in_root(root_fd: int, final_name: str, body: bytes) -> None:
 
 
 def is_muted(root: Path | str | None = None) -> bool:
-    """True when the watcher is switched OFF (the mute file exists). Never raises.
+    """True when the watcher is switched OFF (the mute file exists), OR the switch's own occupancy
+    could not be determined. Never raises.
 
-    Asked through the root's own descriptor with ``follow_symlinks=False``. ``Path.exists()``
-    resolves the root again and follows the switch itself, so a name that is a symlink answered a
-    question about some other file; here the switch's PRESENCE is what is reported, which is what the
-    switch means, and it is the same rule `inbox._occupies` uses for a name that is taken.
+    The switch exists to STOP a launch (`dispatch_once` treats ``True`` here exactly like an explicit
+    mute: no notify, no launch, cursor untouched). An "I could not tell" answer must never be spelled
+    the same as "confirmed absent" — a probe that has already told us it cannot be trusted must not be
+    read as permission to launch anyway. So a refused `stat_nolink` on the switch's own name now
+    answers ``True`` — fail CLOSED — rather than ``False``:
 
-    ``stat_nolink`` REFUSES rather than answers when the switch's occupancy cannot be determined at
-    all (``EIO``, ``EACCES``, ...) — that refusal used to be left uncaught here, so a transient fault
-    on the switch's own ``stat`` propagated out of `dispatch_once` and killed a ``--loop`` run instead
-    of costing one tick. It is read the same as the root being unreadable, just above: this probe's
-    contract is "never raises", so a switch that cannot be examined is treated as one that is not
-    there, not as a reason to stop watching.
+    * the root does not exist at all (``FileNotFoundError`` from `inbox._open_root_dir`) — nothing has
+      ever been published here, so the switch provably is not there either. That is a confirmed
+      answer, not an unknown one, and stays ``False`` (see `test_switch_survives_a_missing_inbox`).
+    * the root open itself is REFUSED (`PacketError` — a hostile or unreadable root: a symlink, a
+      permission wall, ``ENOTDIR``) also stays ``False`` here, and deliberately does NOT fail closed:
+      a root that cannot be opened cannot be scanned for lanes either, so `scan_new` (reached right
+      after this check) will find every lane refused and every ``new_*`` delta empty — nothing CAN
+      launch on this pass regardless of what this function answers, and the refusal must still reach
+      `dispatch_once` as a reportable `lane_unreadable`, not be swallowed here as a silent, successful
+      "muted" (the CLI's `watch --once` maps `report.muted` to exit 0 and `lane_unreadable` to exit 2 —
+      collapsing the first into the second here would turn a real root failure into a false success;
+      see `test_every_lane_command_refuses_a_root_it_cannot_use[watch-once-...]`).
+    * ``stat_nolink`` REFUSES rather than answers when the switch's occupancy cannot be determined at
+      all (``EIO``, ``EACCES``, ...), with the root otherwise open and every lane readable — that used
+      to read the same as "not there", so a transient fault on the switch's own ``stat`` let a launch
+      through with the pause state genuinely unknown, a new packet freshly found, and the cursor saved
+      over it. This is the one case only `is_muted` itself can catch, and it now fails CLOSED (``True``).
+
+    Asked through the root's own descriptor with ``follow_symlinks=False``. ``Path.exists()`` resolves
+    the root again and follows the switch itself, so a name that is a symlink answered a question about
+    some other file; here the switch's PRESENCE is what is reported, which is what the switch means.
     """
     try:
         root_fd = inbox._open_root_dir(inbox_root(root))
     except (FileNotFoundError, PacketError):
-        return False        # an unreadable inbox is not a mute; the caller's own probe fails closed
+        return False        # an unreadable root is not a mute; `scan_new` reports the refusal instead
     try:
         return _safefs.stat_nolink(root_fd, SWITCH_NAME) is not None
     except PacketError as exc:
         log.warning("twoperson.watch_switch_unreadable", error=str(exc))
-        return False        # could not be examined; same fail-closed answer as an unreadable root
+        return True         # could not be examined: unknown state fails CLOSED (muted), not unmuted
     finally:
         _safefs.close_quietly(root_fd)
 
