@@ -99,12 +99,12 @@ def test_derive_refuses_when_git_itself_fails(tmp_path, monkeypatch):
     repo.write("a.txt", "y\n")
     head = repo.commit("head")
 
-    import twoperson.gitfacts as gitfacts_mod
+    import twoperson._gitrun as gitrun_mod
 
-    def _broken_run(*args, **kwargs):
+    def _broken_popen(*args, **kwargs):
         raise FileNotFoundError("git: command not found")
 
-    monkeypatch.setattr(gitfacts_mod.subprocess, "run", _broken_run)
+    monkeypatch.setattr(gitrun_mod.subprocess, "Popen", _broken_popen)
     with pytest.raises(GitFactsError):
         derive(repo.path, base, head)
 
@@ -118,6 +118,38 @@ def test_derive_refuses_base_equal_to_head(tmp_path):
     head = repo.commit("only commit")
     with pytest.raises(GitFactsError, match="same commit"):
         derive(repo.path, head, head)
+
+
+def test_derive_refuses_an_abbreviated_base_equal_to_the_full_head(tmp_path):
+    """`base_sha` and `head_sha` are abbreviated independently by whoever wrote the packet — an
+    abbreviated base naming the SAME commit as a full head must be caught by resolving both to
+    their full commit id first, not by comparing the strings the packet happened to spell. Before
+    this fix, `base_sha == head_sha` compared the strings, missed this pair, and let `_is_ancestor`
+    (correctly, per git's own definition that a commit is its own ancestor) wave it through to
+    "derive" an empty diff stamped `diff_provenance: "derived"`."""
+    repo = git_repo(tmp_path)
+    repo.write("a.txt", "x\n")
+    head = repo.commit("only commit")
+    abbreviated_base = head[:12]
+    assert abbreviated_base != head  # unequal as strings — the exact shape of the bypass
+    with pytest.raises(GitFactsError, match="same commit"):
+        derive(repo.path, abbreviated_base, head)
+
+
+def test_derive_accepts_an_empty_diff_between_genuinely_distinct_commits(tmp_path):
+    """An empty diff between two DIFFERENT commits (an empty follow-up commit, same tree as its
+    parent) is not a git failure — it is simply true, and `gitfacts.derive` has no notion of
+    "shipped" to refuse it on. The refusal for THIS shape belongs to
+    `inbox._refuse_empty_shipped_diff`, layered on top of this general-purpose deriver — see
+    `tests/test_inbox_diff_evidence.py`."""
+    repo = git_repo(tmp_path)
+    repo.write("a.txt", "one\n")
+    base = repo.commit("base")
+    head = repo.commit("empty follow-up")  # GitRepo.commit always passes --allow-empty
+    assert base != head
+    facts = derive(repo.path, base, head)
+    assert facts["diff_summary"]["files_changed"] == 0
+    assert facts["changed_files"] == []
 
 
 def test_derive_refuses_a_base_unrelated_to_the_head(tmp_path):

@@ -145,12 +145,12 @@ def test_git_failing_is_a_refusal_never_a_silent_pass(root, tmp_path, monkeypatc
     head = repo.commit("head")
     monkeypatch.chdir(repo.path)
 
-    import twoperson.gitfacts as gitfacts_mod
+    import twoperson._gitrun as gitrun_mod
 
     def _broken(*args, **kwargs):
         raise FileNotFoundError("git: command not found")
 
-    monkeypatch.setattr(gitfacts_mod.subprocess, "run", _broken)
+    monkeypatch.setattr(gitrun_mod.subprocess, "Popen", _broken)
 
     packet = valid_packet(git={"branch": "b", "base_ref": "origin/main",
                               "base_sha": base, "head_sha": head})

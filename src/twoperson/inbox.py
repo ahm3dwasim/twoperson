@@ -736,6 +736,37 @@ def _refuse_unverified_ship(packet: Mapping) -> None:
     )
 
 
+def _refuse_empty_shipped_diff(packet: Mapping) -> None:
+    """Refuse a shipped, concrete-head packet whose DERIVED diff touches zero files.
+
+    `_refuse_unverified_ship` closes the claimed/underived half of the "nothing was actually
+    checked" gap; this closes the other half. `gitfacts.derive` is right to accept a base and head
+    that are genuinely different commits (a PROPER ancestor, per `git merge-base --is-ancestor`) even
+    when the diff between them happens to be empty — an empty commit (`git commit --allow-empty`), or
+    a head whose tree matches its base's for some other honest reason, is not a git failure, it is
+    just true. But a shipped report resting on it has nothing a reviewer could have reviewed:
+    `diff_provenance: "derived"` says the numbers were checked against the head, not that there were
+    any numbers to check. This lives here, not in `gitfacts`, so that module stays a general-purpose
+    diff deriver with no notion of "shipped" — the same separation `_refuse_unverified_ship` already
+    draws.
+    """
+    push = packet["push_status"]
+    if not (push["pushed"] or push["deployed"] or push["restarted"]):
+        return
+    if packet["diff_provenance"] != "derived":
+        return  # _refuse_unverified_ship already refuses this combination
+    if packet["diff_summary"]["files_changed"] != 0:
+        return
+    raise PacketError(
+        f"push_status reports a push/deploy/restart for concrete head "
+        f"{packet['git']['head_sha']!r}, but the diff derived against base_sha "
+        f"{packet['git']['base_sha']!r} touches zero files — an empty change has nothing for a "
+        "reviewer to have reviewed. Correct git.base_sha to the commit this change actually starts "
+        "from, or do not report a ship until there is a real change to ship (see "
+        "docs/PROTOCOL.md §2a)."
+    )
+
+
 def prepare_packet(packet: Any, *, root: Path | str | None = None, repo: Path | str | None = None,
                    derive: bool = False) -> tuple[dict, list[str]]:
     """Validate, derive diff evidence, and run every ship-gate check `publish` runs — WITHOUT
@@ -765,6 +796,7 @@ def prepare_packet(packet: Any, *, root: Path | str | None = None, repo: Path | 
     assert_review_ref_resolves(validated, root=root)
     validated, notes = _bind_diff_evidence(validated, repo=repo, derive=derive)
     _refuse_unverified_ship(validated)
+    _refuse_empty_shipped_diff(validated)
     # Re-run after derivation: the ack-content check must reason over the DERIVED changed_files (a
     # git-verified rename, an omitted test file), not the builder's self-report that just got
     # replaced.

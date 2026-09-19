@@ -188,3 +188,54 @@ def test_a_draft_with_unknown_head_and_no_push_is_unaffected(root):
     packet["git"]["base_sha"] = "unknown"
     packet["git"]["head_sha"] = "unknown"
     assert inbox.publish(packet).exists()
+
+
+# --------------------------------------------------------------------------------------------
+# Gap C — a shipped report's derived diff must not be EMPTY, either. `base_sha == head_sha` (the
+# string-comparison bug closed in `gitfacts.derive`) is one way to reach an empty "derived" diff;
+# two genuinely DIFFERENT, properly-ancestored commits that just happen to diff to nothing (an
+# empty commit) is another, and `gitfacts` has no notion of "shipped" to refuse that one on — so
+# the refusal lives here, at the ship-gate layer, same as Gap A's.
+# --------------------------------------------------------------------------------------------
+
+def test_an_honestly_derived_but_empty_diff_cannot_unlock_a_ship(root):
+    """The diff is not CLAIMED (Gap A already refuses that) — it is genuinely `"derived"`, and it
+    is genuinely empty. A reviewer who approved a packet reporting zero changed files reviewed
+    nothing, and a ship report resting on that has nothing to cite as evidence of a real change."""
+    packet_for("pkt-empty", head_sha="0900128", derived=True)
+    ref = inbox.publish_verdict(
+        build_verdict(packet_id="pkt-empty", decision="Approve", head_sha="0900128")).stem
+    ship = valid_packet(
+        packet_id="ship-empty", diff_provenance="derived", changed_files=[],
+        diff_summary={"files_changed": 0, "insertions": 0, "deletions": 0},
+    )
+    ship["git"]["head_sha"] = "0900128"
+    ship["push_status"].update(pushed=True, review_ref=ref,
+                               statement="Shipped after the recorded approval.")
+    with pytest.raises(PacketError, match="zero files"):
+        publish_derived(ship)
+    assert inbox.find_packet("ship-empty") is None
+
+
+def test_an_empty_derived_diff_is_unaffected_for_a_draft_that_reports_no_push(root):
+    """Scoped correctly: a packet may legitimately derive to an empty diff — a round that verified
+    something changed nothing — as long as it is not the basis for a ship."""
+    ship = valid_packet(
+        packet_id="draft-empty", diff_provenance="derived", changed_files=[],
+        diff_summary={"files_changed": 0, "insertions": 0, "deletions": 0},
+    )
+    ship["git"]["head_sha"] = "0900128"
+    assert publish_derived(ship).exists()
+
+
+def test_a_nonempty_honestly_derived_ship_report_is_still_unaffected(root):
+    """The positive control, named for this gap specifically: a real, non-empty derived diff behind
+    a shipped report is not touched by this check — it refuses on EMPTINESS, not on shipping."""
+    packet_for("pkt-honest-c", head_sha="0900128", derived=True)
+    ref = inbox.publish_verdict(
+        build_verdict(packet_id="pkt-honest-c", decision="Approve", head_sha="0900128")).stem
+    ship = valid_packet(packet_id="ship-honest-c")
+    ship["git"]["head_sha"] = "0900128"
+    ship["push_status"].update(pushed=True, review_ref=ref,
+                               statement="Shipped after the recorded approval.")
+    assert publish_derived(ship).exists()

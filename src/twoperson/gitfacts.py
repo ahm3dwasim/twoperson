@@ -23,10 +23,10 @@ changed identity as well as location.
 from __future__ import annotations
 
 import re
-import subprocess
 from pathlib import Path
 from typing import Any, Mapping
 
+from . import _gitrun
 from .packet import UNKNOWN, PacketError
 
 #: `git diff --name-status` first-letter code -> the packet's `status` enum. `T` (a type change —
@@ -57,22 +57,16 @@ class GitFactsError(PacketError):
 def _git(repo: Path, *args: str) -> str:
     """Run one git subcommand against an EXPLICIT repository path, with fixed argv and no shell.
 
-    A git failure — missing binary, not a repository, a bad ref, a timeout — is a refusal here,
-    never "no changes": the two answers mean opposite things to a reviewer, and only one of them is
-    true when git simply could not be asked.
+    A git failure — missing binary, not a repository, a bad ref, a timeout, a runaway stream over
+    `MAX_GIT_OUTPUT_BYTES` — is a refusal here, never "no changes": the two answers mean opposite
+    things to a reviewer, and only one of them is true when git simply could not be asked. All of
+    that bounding is `_gitrun.run_git`'s job, not this function's — see that module for why stdout
+    and stderr are each streamed and capped rather than buffered in full before either is checked.
     """
     try:
-        result = subprocess.run(
-            ("git", "-C", str(repo), *args),
-            capture_output=True, timeout=_GIT_TIMEOUT_S, check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise GitFactsError(f"git {' '.join(args)} failed: {exc}") from exc
-    if len(result.stdout) > MAX_GIT_OUTPUT_BYTES:
-        raise GitFactsError(
-            f"git {' '.join(args)} produced more than {MAX_GIT_OUTPUT_BYTES} bytes of output — "
-            "refusing rather than parsing a runaway diff"
-        )
+        result = _gitrun.run_git(repo, *args, timeout=_GIT_TIMEOUT_S, max_bytes=MAX_GIT_OUTPUT_BYTES)
+    except _gitrun.GitRunError as exc:
+        raise GitFactsError(str(exc)) from exc
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", "replace").strip()
         raise GitFactsError(f"git {' '.join(args)} failed: {stderr or 'no output'}")
@@ -125,12 +119,10 @@ def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
     *proper* ancestor (this module's own `derive`) check ``ancestor != descendant`` themselves.
     """
     try:
-        result = subprocess.run(
-            ("git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, descendant),
-            capture_output=True, timeout=_GIT_TIMEOUT_S, check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise GitFactsError(f"git merge-base --is-ancestor failed: {exc}") from exc
+        result = _gitrun.run_git(repo, "merge-base", "--is-ancestor", ancestor, descendant,
+                                 timeout=_GIT_TIMEOUT_S, max_bytes=MAX_GIT_OUTPUT_BYTES)
+    except _gitrun.GitRunError as exc:
+        raise GitFactsError(str(exc)) from exc
     if result.returncode == 0:
         return True
     if result.returncode == 1:
@@ -232,6 +224,16 @@ def derive(repo: Path | str, base_sha: str, head_sha: str, base_ref: str | None 
     numbers actually describe the change the packet is reporting rather than a diff against whatever
     the builder happened to name.
 
+    **The equality check is on the FULL, resolved commit id, never on the sha strings the packet
+    spelled.** `base_sha` and `head_sha` are independently abbreviated — a packet may spell one
+    short and the other long — and an abbreviated sha that names the same commit as a full one is
+    equal as a commit while unequal as a string. Comparing the strings directly would let
+    `base_sha="89cc0fa"` and `head_sha="89cc0fad7c33e6e9fada858c0e67c1c6801bbb7e"` sail past the
+    equality check, reach `_is_ancestor` (which is correct, per git's own definition, that a commit
+    is its own ancestor), and "derive" an empty diff stamped as checked. Both shas are resolved to
+    their full form with `git rev-parse --verify <sha>^{commit}` first, and every comparison below —
+    equality, ancestry, reachability from `base_ref` — is done on those resolved ids.
+
     When `base_ref` is also given and resolves in THIS checkout, `base_sha` must additionally be
     reachable from it. **What that does and does not prove**: it proves the diff is consistent with
     the commits this checkout actually holds under that ref name right now — it does NOT prove
@@ -241,43 +243,51 @@ def derive(repo: Path | str, base_sha: str, head_sha: str, base_ref: str | None 
     non-concrete head.
     """
     repo = Path(repo)
-    if not resolvable(repo, base_sha, head_sha):
+    if not concrete(base_sha) or not concrete(head_sha):
         raise GitFactsError(
             f"cannot describe {base_sha[:12]}...{head_sha[:12]} from {repo} — one or both commits "
             "are not in this repository. Publish from a checkout that holds them, or pass "
             "--no-derive to state explicitly that the diff evidence is unverified."
         )
-    if base_sha == head_sha:
+    full_base, full_head = _rev_parse(repo, base_sha), _rev_parse(repo, head_sha)
+    if full_base is None or full_head is None:
         raise GitFactsError(
-            f"base_sha and head_sha are the same commit ({head_sha[:12]}) — there is no diff to "
-            "derive. A derived diff must be of the head against a PROPER ancestor of it, never "
-            "against itself; state a real base, or pass --no-derive to publish the claim unverified."
+            f"cannot describe {base_sha[:12]}...{head_sha[:12]} from {repo} — one or both commits "
+            "are not in this repository. Publish from a checkout that holds them, or pass "
+            "--no-derive to state explicitly that the diff evidence is unverified."
         )
-    if not _is_ancestor(repo, base_sha, head_sha):
+    if full_base == full_head:
         raise GitFactsError(
-            f"base_sha {base_sha[:12]} is not an ancestor of head_sha {head_sha[:12]} in {repo} — "
+            f"base_sha and head_sha both resolve to the same commit ({full_head[:12]}) — there is "
+            "no diff to derive. A derived diff must be of the head against a PROPER ancestor of it, "
+            "never against itself; state a real base, or pass --no-derive to publish the claim "
+            "unverified."
+        )
+    if not _is_ancestor(repo, full_base, full_head):
+        raise GitFactsError(
+            f"base_sha {full_base[:12]} is not an ancestor of head_sha {full_head[:12]} in {repo} — "
             "a derived diff must be of the head against a commit actually in its history, not an "
             "unrelated one. Correct git.base_sha, or pass --no-derive to publish the claim "
             "unverified."
         )
     if base_ref is not None:
         base_ref_sha = _rev_parse(repo, base_ref)
-        if base_ref_sha is not None and not _is_ancestor(repo, base_sha, base_ref_sha):
+        if base_ref_sha is not None and not _is_ancestor(repo, full_base, base_ref_sha):
             raise GitFactsError(
-                f"base_sha {base_sha[:12]} is not reachable from base_ref {base_ref!r} "
+                f"base_sha {full_base[:12]} is not reachable from base_ref {base_ref!r} "
                 f"({base_ref_sha[:12]}) in {repo} — the packet's declared base is not on the "
                 "branch it claims to be based on. Correct git.base_sha or git.base_ref, or pass "
                 "--no-derive to publish the claim unverified."
             )
     status_rows = _parse_name_status(
-        _git(repo, "diff", "--name-status", "-M", "-z", f"{base_sha}...{head_sha}"))
+        _git(repo, "diff", "--name-status", "-M", "-z", f"{full_base}...{full_head}"))
     if len(status_rows) > MAX_DERIVED_FILES:
         raise GitFactsError(
             f"{len(status_rows)} changed files exceeds the {MAX_DERIVED_FILES}-file derivation "
             "cap — a packet this wide is not reviewable as one unit; split it"
         )
     numstat_counts = _parse_numstat(
-        _git(repo, "diff", "--numstat", "-M", "-z", f"{base_sha}...{head_sha}"))
+        _git(repo, "diff", "--numstat", "-M", "-z", f"{full_base}...{full_head}"))
     if numstat_counts.keys() != {row["new_path"] for row in status_rows}:
         raise GitFactsError("git numstat and name-status disagree on which files changed")
 

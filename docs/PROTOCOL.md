@@ -118,7 +118,12 @@ first would mask them behind a single git-shaped refusal. Once derivation succee
 `git.head_sha` (`git merge-base --is-ancestor`, and not equal to it) or derivation refuses outright:
 a `base_sha` equal to `head_sha` resolves and "derives" an empty diff for any packet, and a
 `base_sha` that resolves to some unrelated commit — a different branch, a stale fork point, a typo —
-resolves too, and derives a well-formed diff against the *wrong* history. When `git.base_ref` also
+resolves too, and derives a well-formed diff against the *wrong* history. The equality check is on
+the FULL commit id each sha resolves to (`git rev-parse --verify <sha>^{commit}`), never on the sha
+strings the packet spelled: `base_sha` and `head_sha` are abbreviated independently, so an
+abbreviated `base_sha` naming the same commit as a full `head_sha` is equal as a commit while unequal
+as a string, and comparing the strings would let exactly that pair "derive" an empty diff stamped as
+checked. When `git.base_ref` also
 resolves in the checkout doing the deriving, `base_sha` must additionally be reachable from it.
 **What that does and does not prove**: it proves the diff is consistent with the commits that
 checkout actually holds under that ref name right now. It does **not** prove `base_ref` is the
@@ -154,6 +159,16 @@ are refused the same way. This holds for `twoperson verify`/`publish` and for an
 checkout that genuinely does not hold the commits — neither of which reports a push for a concrete
 head in the first place, so nothing legitimate is blocked by this.
 
+**A shipped report's derived diff must not be empty, either.** `gitfacts.derive` is right to accept
+two genuinely different commits — a proper ancestor, per the check above — even when the diff between
+them happens to be empty: an empty commit, or a head whose tree matches its base's for some other
+honest reason, is not a git failure, it is simply true, and `gitfacts` has no notion of "shipped" to
+refuse it on. But a shipped report resting on such a diff has nothing a reviewer could have reviewed
+— `diff_provenance: "derived"` says the numbers were checked against the head, not that there were
+any numbers to check — so `inbox.prepare_packet` refuses it at the ship-gate layer: a packet
+reporting a push/deploy/restart for a concrete head whose derived `diff_summary.files_changed` is `0`
+is refused, the same way an underived one is.
+
 **A shipped report must name a concrete head — enforced by the schema itself.** A packet reporting
 `push_status.pushed`/`deployed`/`restarted=true` with `git.head_sha: "unknown"` is refused by
 `packet.validate_packet` before any inbox check ever runs. This does not rely on the ship gate: a
@@ -166,8 +181,12 @@ one gate that happens to catch it as a side effect.
 **A `tests[]` row's `command` is checked at `publish` (never `verify`) against the head being
 published.** A row is a claim that a run can be repeated; `twoperson.citations` resolves the paths
 and bare symbols a `command` cites — a pytest node id's file, a `path/to/file.py` in the command
-text, a backticked whole identifier — against the commit through git plumbing (`git cat-file`,
-`git grep <commit> -- '*.py'`), and refuses a row citing something that commit does not contain.
+text, a backticked whole identifier — against the commit through git plumbing (`git ls-tree`,
+`git grep <commit> -- '*.py'`), and refuses a row citing something that commit does not contain. A
+path check distinguishes "provably absent at this head" (`ls-tree` exits 0 with empty output) from
+"git could not answer" (any other exit status, raised rather than read as absence) — the two used to
+share the same exit code from `git cat-file -e`, which let an unrelated git failure on the
+scratch-directory probe silently pass as "exempt, resolves".
 This is a **necessary condition, never a sufficient one**: it proves nothing about a row it does not
 refuse. The check is deliberately narrow, and the narrowing is stated rather than hidden — only
 `command` is read, never `evidence` (an evidence field asserting a symbol is *gone* is correct and

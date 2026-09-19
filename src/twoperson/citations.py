@@ -69,9 +69,11 @@ from __future__ import annotations
 
 import keyword
 import re
-import subprocess
 from pathlib import Path
 from typing import Any, Mapping, NamedTuple
+
+from . import _gitrun
+from .gitfacts import MAX_GIT_OUTPUT_BYTES
 
 # A bound on SUBPROCESS WORK, never a statement about what was verified. Exceeding it yields
 # UNDETERMINABLE, so the cap can never be used to smuggle an unchecked citation past the gate.
@@ -168,18 +170,19 @@ def cited_symbols(packet: Mapping[str, Any]) -> list[Citation]:
     return _dedupe(found)
 
 
-def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
-    """Run one git subcommand against an EXPLICIT repository path, fixed argv, bounded, timed out.
+def _git(repo: Path, *args: str) -> _gitrun.GitResult:
+    """Run one git subcommand against an EXPLICIT repository path, through the shared bounded runner.
 
-    Only the return code is read by every caller here (`-e`, `-l`, `--verify --quiet` all answer
-    through it), so the output itself is not size-capped the way `gitfacts._git`'s is — there is
-    nothing here that parses a git stdout of unbounded size. A failure to even RUN git (missing
-    binary, a timeout) raises `OSError`/`subprocess.SubprocessError`; `check_citations` is what
-    catches that, at the two call sites below, and turns it into `UNDETERMINABLE` rather than a
-    crash or a silent pass.
+    Every caller here reads only the return code, plus — since the fix for the top-level-probe
+    conflation below — occasionally `stderr` for a refusal message. Bounding (time, and stdout/stderr
+    bytes each) is entirely `_gitrun.run_git`'s job now, not this function's: a git stdout this
+    module never parses can still exhaust memory just by being buffered, which is why it is bounded
+    the same as `gitfacts._git`'s is, through the same runner. A failure to even RUN git (missing
+    binary, a timeout, either stream over `MAX_GIT_OUTPUT_BYTES`) raises `_gitrun.GitRunError`;
+    `check_citations` is what catches that, at the two call sites below, and turns it into
+    `UNDETERMINABLE` rather than a crash or a silent pass.
     """
-    return subprocess.run(("git", "-C", str(repo)) + args,
-                          capture_output=True, timeout=_GIT_TIMEOUT_S, check=False)
+    return _gitrun.run_git(repo, *args, timeout=_GIT_TIMEOUT_S, max_bytes=MAX_GIT_OUTPUT_BYTES)
 
 
 def _head_is_present(repo: Path, head_sha: str) -> bool:
@@ -192,9 +195,20 @@ def _head_is_present(repo: Path, head_sha: str) -> bool:
 def _resolves(repo: Path, head_sha: str, cite: Citation) -> bool:
     """Would a run at this head find what the row cites?
 
-    `git grep`/`git cat-file` against the COMMIT, never the working tree: an uncommitted or stale
+    `git ls-tree`/`git grep` against the COMMIT, never the working tree: an uncommitted or stale
     file on disk is exactly the thing that would let a deleted symbol look present, which is the
     failure this exists to catch wearing a different hat.
+
+    A PATH citation is checked with `git ls-tree`, never `git cat-file -e`. `ls-tree <sha> --
+    <path>` exits 0, with EMPTY output, when `<sha>` resolves but `<path>` is simply not an entry of
+    that tree — a clean, unambiguous "not here" that costs nothing to tell apart from a git failure.
+    `cat-file -e <sha>:<path>` cannot make that distinction: it returns the SAME exit status (128,
+    "fatal: ... does not exist") for a genuinely absent path as it does for other ways the compound
+    `<sha>:<path>` expression fails to resolve. Reading "nonzero" as "absent, exempt" — the previous
+    shape of the top-level-directory probe below — silently turned any such failure into a pass. Any
+    OTHER exit status from `ls-tree` here (the treeish itself failing to resolve, which cannot
+    happen — `_head_is_present` already proved `head_sha` resolves — but is not assumed) is raised
+    rather than swallowed, so an unexpected status is a refusal, never a resolve.
     """
     if cite.kind == "path":
         # Only judge a path whose TOP-LEVEL directory exists at the head. A command's counterfactual
@@ -203,11 +217,28 @@ def _resolves(repo: Path, head_sha: str, cite: Citation) -> bool:
         # property of the tree rather than a list of blessed names, so it does not go stale the way
         # a hardcoded `{"tmp", "scratchpad", ...}` would.
         top = cite.token.split("/", 1)[0]
-        if _git(repo, "cat-file", "-e", f"{head_sha}:{top}").returncode != 0:
-            return True
-        return _git(repo, "cat-file", "-e", f"{head_sha}:{cite.token}").returncode == 0
-    return _git(repo, "grep", "-w", "-F", "-l", "-e", cite.token,
-               head_sha, "--", "*.py").returncode == 0
+        top_probe = _git(repo, "ls-tree", "--name-only", "-z", head_sha, "--", top)
+        if top_probe.returncode != 0:
+            raise _gitrun.GitRunError(
+                f"git ls-tree {head_sha}:{top} exited {top_probe.returncode} unexpectedly — "
+                f"{top_probe.stderr.decode('utf-8', 'replace').strip() or 'no output'}"
+            )
+        if not top_probe.stdout:
+            return True  # the top-level directory is provably absent at this head: exempt
+        full_probe = _git(repo, "ls-tree", "--name-only", "-z", head_sha, "--", cite.token)
+        if full_probe.returncode != 0:
+            raise _gitrun.GitRunError(
+                f"git ls-tree {head_sha}:{cite.token} exited {full_probe.returncode} "
+                f"unexpectedly — {full_probe.stderr.decode('utf-8', 'replace').strip() or 'no output'}"
+            )
+        return bool(full_probe.stdout)
+    grep = _git(repo, "grep", "-w", "-F", "-l", "-e", cite.token, head_sha, "--", "*.py")
+    if grep.returncode not in (0, 1):
+        raise _gitrun.GitRunError(
+            f"git grep -e {cite.token} {head_sha} exited {grep.returncode} unexpectedly — "
+            f"{grep.stderr.decode('utf-8', 'replace').strip() or 'no output'}"
+        )
+    return grep.returncode == 0
 
 
 def check_citations(repo: Path | str, packet: Mapping[str, Any]) -> CitationCheck:
@@ -225,7 +256,7 @@ def check_citations(repo: Path | str, packet: Mapping[str, Any]) -> CitationChec
     # the same mistake as trusting an absent head, in a new place.
     try:
         present = _head_is_present(repo, head_sha)
-    except (OSError, subprocess.SubprocessError) as exc:
+    except _gitrun.GitRunError as exc:
         return CitationCheck(UNDETERMINABLE, 0, (), f"git could not be run here — {exc}")
     if not present:
         return CitationCheck(UNDETERMINABLE, 0, (),
@@ -242,7 +273,7 @@ def check_citations(repo: Path | str, packet: Mapping[str, Any]) -> CitationChec
         for cite in cites:
             if not _resolves(repo, head_sha, cite):
                 missing.append(cite)
-    except (OSError, subprocess.SubprocessError) as exc:
+    except _gitrun.GitRunError as exc:
         return CitationCheck(UNDETERMINABLE, 0, (), f"git stopped answering — {exc}")
 
     if missing:

@@ -163,6 +163,33 @@ def test_a_citation_set_over_the_cap_cannot_report_success(tmp_path):
     assert check.state == UNDETERMINABLE, "a truncated citation set must never report success"
 
 
+def test_an_unexpected_git_failure_after_a_good_head_probe_is_undeterminable_not_resolves(
+    tmp_path, monkeypatch
+):
+    """A head probe succeeding must not let a SUBSEQUENT, unrelated git failure on the top-level
+    directory probe read as "directory absent, exempt". `git cat-file -e` used to return the SAME
+    exit status (128) for a genuinely absent path as for other ways it failed to resolve, so any
+    nonzero there silently passed a citation as resolved. This proves the `git ls-tree` rewrite
+    raises on an unexpected status instead of treating it as an exemption."""
+    import twoperson.citations as citations_mod
+
+    repo = git_repo(tmp_path)
+    repo.write("pkg/mod.py", "x = 1\n")
+    head = repo.commit()
+    packet = _packet(head, "pytest pkg/mod.py")
+
+    real_git = citations_mod._git
+
+    def _fake_git(repo_path, *args):
+        if args[:1] == ("ls-tree",):
+            return citations_mod._gitrun.GitResult(128, b"", b"fatal: injected failure")
+        return real_git(repo_path, *args)
+
+    monkeypatch.setattr(citations_mod, "_git", _fake_git)
+    check = check_citations(repo.path, packet)
+    assert check.state == UNDETERMINABLE
+
+
 def test_citation_findings_names_the_row_and_the_stale_citation(tmp_path):
     repo = git_repo(tmp_path)
     repo.write("pkg/mod.py", "def _helper():\n    pass\n")

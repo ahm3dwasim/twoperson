@@ -68,6 +68,33 @@ All notable changes to this project are documented here. The format follows
   that validates a packet without also running the inbox gate); a shipped report must now name the
   concrete commit that shipped everywhere a packet is validated, independent of whether a verdict
   happens to exist to check it against.
+- `gitfacts.derive`'s `base_sha == head_sha` refusal compared the sha STRINGS the packet spelled, not
+  the commits they name — `base_sha` and `head_sha` are abbreviated independently, so an abbreviated
+  `base_sha` naming the same commit as a full `head_sha` sailed past the string check, reached the
+  ancestor check (where a commit is correctly its own ancestor), and "derived" an empty diff stamped
+  `diff_provenance: "derived"` for a concrete head. Both shas are now resolved to their full commit id
+  (`git rev-parse --verify <sha>^{commit}`) before any comparison — equality, ancestry, or
+  reachability from `base_ref`. Separately, a shipped, concrete-head packet whose derived diff
+  legitimately touches zero files (a genuinely different base and head that just happen to diff to
+  nothing, e.g. an empty commit) is now also refused by `inbox.prepare_packet` — an empty change has
+  nothing for a reviewer to have reviewed, and `gitfacts` itself has no notion of "shipped" to refuse
+  it on.
+- `citations._resolves`'s scratch-directory exemption read ANY nonzero exit from its `git cat-file -e`
+  top-level-directory probe as "the directory is absent, exempt this citation" — but `cat-file -e`
+  returns the same exit status (128) for a path that is genuinely absent as it does for other ways
+  the compound `<sha>:<path>` expression fails to resolve, so an unrelated git failure on that probe
+  silently passed a citation as resolved. The probe (and every other existence check in this module)
+  now uses `git ls-tree`, whose exit code is reserved for "the treeish itself did not resolve" and
+  answers "is this path here" through its OUTPUT (empty means absent) instead — an unexpected exit
+  status is raised, and `check_citations` turns that into `undeterminable`, never `resolves`.
+- `gitfacts._git` (and `citations._git`, which never bounded its output at all) buffered the FULL
+  stdout and stderr of every git subprocess call before the `MAX_GIT_OUTPUT_BYTES` check ever ran,
+  so the bound caught a runaway only after the memory was already spent — and stderr was never
+  bounded either way. Both modules now run every git call through one shared, bounded runner
+  (`twoperson._gitrun.run_git`) that streams stdout and stderr concurrently, capped independently at
+  `MAX_GIT_OUTPUT_BYTES` each, and kills the process the instant either stream crosses its cap or the
+  timeout elapses — a caller only ever sees a complete result or a raised refusal, never a partial
+  buffer.
 
 ## [0.1.3] - 2026-09-19
 
