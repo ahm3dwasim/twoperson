@@ -37,7 +37,6 @@ Design rules, all load-bearing:
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import shutil
@@ -181,6 +180,13 @@ def is_muted(root: Path | str | None = None) -> bool:
     resolves the root again and follows the switch itself, so a name that is a symlink answered a
     question about some other file; here the switch's PRESENCE is what is reported, which is what the
     switch means, and it is the same rule `inbox._occupies` uses for a name that is taken.
+
+    ``stat_nolink`` REFUSES rather than answers when the switch's occupancy cannot be determined at
+    all (``EIO``, ``EACCES``, ...) — that refusal used to be left uncaught here, so a transient fault
+    on the switch's own ``stat`` propagated out of `dispatch_once` and killed a ``--loop`` run instead
+    of costing one tick. It is read the same as the root being unreadable, just above: this probe's
+    contract is "never raises", so a switch that cannot be examined is treated as one that is not
+    there, not as a reason to stop watching.
     """
     try:
         root_fd = inbox._open_root_dir(inbox_root(root))
@@ -188,6 +194,9 @@ def is_muted(root: Path | str | None = None) -> bool:
         return False        # an unreadable inbox is not a mute; the caller's own probe fails closed
     try:
         return _safefs.stat_nolink(root_fd, SWITCH_NAME) is not None
+    except PacketError as exc:
+        log.warning("twoperson.watch_switch_unreadable", error=str(exc))
+        return False        # could not be examined; same fail-closed answer as an unreadable root
     finally:
         _safefs.close_quietly(root_fd)
 
@@ -390,12 +399,9 @@ def _dispatch_lock(root: Path | str | None):
         try:
             yield
         finally:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_UN)
-            except OSError:
-                pass
+            _safefs.unlock_quietly(handle)
     finally:
-        handle.close()
+        _safefs.close_handle_quietly(handle)
 
 
 #: The ceiling on the cursor file. It holds one filename per already-reacted-to entry, so a real one
@@ -445,6 +451,15 @@ def load_cursor(root: Path | str | None = None) -> Cursor:
         return Cursor()
     except json.JSONDecodeError as exc:
         log.warning("twoperson.watch_cursor_unreadable", reason="not json", error=str(exc))
+        return Cursor()
+    except ValueError as exc:
+        # A JSON integer of a few thousand digits is syntactically valid and well under
+        # `MAX_CURSOR_BYTES`, but Python 3.11+ refuses to convert a string that long to an `int` at
+        # all (`sys.set_int_max_str_digits`'s default limit) — a plain `ValueError`, not a
+        # `json.JSONDecodeError` (which subclasses it but is not raised here), so it used to sail
+        # past every handler in this function and kill the tick the same way the two below did.
+        log.warning("twoperson.watch_cursor_unreadable", reason="a number too large to parse",
+                   error=str(exc))
         return Cursor()
     except RecursionError as exc:
         # The byte cap bounds SIZE, and size is not depth: 400KB of `[` is a perfectly valid UTF-8

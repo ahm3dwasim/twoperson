@@ -249,6 +249,42 @@ All notable changes to this project are documented here. The format follows
   that caught `(PacketError, OSError)` are narrowed to `(PacketError, FileNotFoundError)` — the one
   `OSError` the primitive still documents, a lost race — so a refusal that ever escapes the chain
   again fails loudly in the suite instead of being printed as a tidy rejection.
+- **`close_quietly` retried `EINTR`, which is the one retry that is never safe.** The kernel releases
+  a descriptor the instant `close` is called, whatever it then reports — a retry after `EINTR` does
+  not close "the same" descriptor again, it closes whatever number the kernel has since handed to an
+  unrelated `open` on another thread, silently closing that operation's file (or lock) instead of
+  this one. `close` is now attempted exactly once, and the same reasoning covers the new
+  `unlock_quietly` below.
+- **The publish lock's `flock(LOCK_UN)` release sat outside `_safefs` entirely**, called directly
+  from `inbox._publish_lock`'s `finally` block (and the same shape in `watch._dispatch_lock`): an
+  `EIO` there — reachable after the locked work had already succeeded — surfaced as a raw `OSError`
+  traceback replacing a completed publish, because nothing converted it and the structural guard
+  didn't scan for `fcntl` calls outside the primitive at all. A new `_safefs.unlock_quietly`, on the
+  same "never raise from a `finally`" contract as `close_quietly`, now owns every lock release in the
+  package; the guard's `_IO_MODULES` now includes `fcntl`, so a future `flock` call outside
+  `_safefs.py` fails the suite the same way a raw `open()` already did.
+- **`load_cursor` did not catch `ValueError`.** A JSON integer of a few thousand digits is
+  syntactically valid and well under the cursor's byte cap, but Python 3.11+ refuses to convert a
+  string that long to an `int` at all (`sys.set_int_max_str_digits`'s default 4300-digit limit) — a
+  plain `ValueError`, not the `json.JSONDecodeError` the loader already caught, so it sailed past
+  every handler and killed the tick the same way an over-deep cursor used to. `ValueError` is now
+  caught alongside the other parse failures and recovers as no cursor, with a reason logged.
+- **`is_muted` did not catch the refusal its own `stat` could raise.** `stat_nolink` refuses (rather
+  than answering) when the mute switch's occupancy cannot be determined at all — `EIO`, `EACCES`, an
+  unsupported filesystem — and that refusal was left uncaught, so it propagated out of `is_muted`,
+  through `dispatch_once`, and killed `watch_loop`'s `while` on the first bad tick instead of costing
+  that one tick, in violation of `is_muted`'s own "never raises" contract. A switch that cannot be
+  examined is now treated the same as one that is not there, logged and reported `False`.
+- **The syscall sweep only ever faulted the *first* matching call**, so it could never drive a
+  driver past an earlier occurrence of a syscall to reach a later one — which is exactly how the two
+  findings above (the lock release, called *second* per publish after the acquire; the mute-switch
+  `stat`, called on a later pass through `is_muted` than the first) went unswept. `tests/fixtures.py`'s
+  `Fault` now takes an `at` index and fires only the Nth matching call, and
+  `tests/test_safefs_faults.py` measures each syscall's real occurrence count from a clean run and
+  parametrizes over every index reached by any driver — 15 syscalls × 3 errnos becomes ~330 rows
+  instead of 45. The sweep also now drives `watch.dispatch_once` and one bounded `watch.watch_loop`
+  pass, not only `watch.scan_new`, so a refusal that only reaches the loop-level entry points is
+  covered too.
 
 ## [0.1.1] - 2026-09-03
 

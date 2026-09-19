@@ -32,9 +32,11 @@ from __future__ import annotations
 
 import ast
 import errno
+import fcntl
 import json
 import os
 import pathlib
+import tempfile
 
 import pytest
 
@@ -43,7 +45,7 @@ from twoperson import __main__ as cli
 from twoperson.__main__ import main
 from twoperson.packet import LaneUnreadable, PacketError
 from twoperson.watch import Cursor
-from tests.fixtures import _called_from_package, inject as _inject, valid_packet
+from tests.fixtures import _called_from_package, _called_from_safefs, inject as _inject, valid_packet
 
 
 # --------------------------------------------------------------------------------------------
@@ -194,6 +196,21 @@ def _drive_publish_lock(root):
         pass
 
 
+def _drive_dispatch_once(root):
+    # The loop-level entry point, not just its pure core (`scan_new`, already a row above): a
+    # refusal reaching HERE unconverted is what finding 3 (the mute switch's `stat`) actually looked
+    # like — a `PacketError` out of `is_muted`, past every driver `scan_new` alone could exercise.
+    return watch.dispatch_once(root, audit_cmd="", notify_fn=lambda *_a: True, run_fn=lambda *_a: 0)
+
+
+def _drive_watch_loop_once(root):
+    # One bounded `watch_loop` iteration: the contract is that a fault costs the TICK, not the loop,
+    # so this drives the actual `while` body a real `--loop` run executes rather than only the
+    # function it calls each time around.
+    return watch.watch_loop(root, max_passes=1, audit_cmd="", notify_fn=lambda *_a: True,
+                            run_fn=lambda *_a: 0)
+
+
 def _exit_two(value) -> bool:
     """A CLI driver's refusal IS an exit code, so it has no exception to hand back."""
     return value == 2
@@ -223,6 +240,8 @@ DRIVERS = [
     ("cursor:save", _drive_cursor_save, False, None),
     ("lock:dispatch", _drive_dispatch_lock, False, None),
     ("lock:publish", _drive_publish_lock, False, None),
+    ("watch:dispatch_once", _drive_dispatch_once, False, None),
+    ("watch:loop_once", _drive_watch_loop_once, False, None),
 ]
 
 
@@ -237,30 +256,135 @@ def _call(driver, root, tmp_path):
     return "value", result
 
 
-@pytest.mark.parametrize("module,name", SYSCALLS, ids=lambda v: v)
+# --------------------------------------------------------------------------------------------
+# Which OCCURRENCE of a syscall each driver can reach — read from a clean run, not guessed.
+#
+# `Fault` used to fire on every matching call, which means a row could only ever prove something
+# about the FIRST occurrence of a syscall in a driver: the driver raises (or is told a refusal) on
+# that first call and never runs far enough to make a second one. `fcntl.flock` is called twice by
+# every locking driver — `LOCK_EX` to acquire, `LOCK_UN` to release — and a sweep that only ever
+# breaks the first occurrence can never reach the second at all. That is how the release being
+# unconverted (finding 4) went three audit rounds unswept, and how a `stat` reached only on a SECOND
+# pass through `is_muted` (finding 3) did too.
+#
+# So the count is measured, not assumed: every driver is run once per syscall with a COUNTING hook
+# in place of the real call — it never raises, only tallies how many times a package frame reached
+# it — and the highest count any driver produces is how many occurrences that syscall's row sweeps.
+# --------------------------------------------------------------------------------------------
+
+def _reachable_calls(module_name: str, syscall_name: str, base: pathlib.Path) -> int:
+    """The most times any driver reaches ``module.syscall_name`` from a `_safefs.py` frame, clean.
+
+    Scoped to `_called_from_safefs`, not the wider `_called_from_package`: the count measured here
+    is the index space `Fault(at=...)` is later asked to fault, so the two must agree exactly on
+    what "reached" means, or occurrence #3 counted here and occurrence #3 actually faulted later
+    would not be the same call.
+    """
+    holder = os if module_name == "os" else __import__(module_name)
+    real = getattr(holder, syscall_name)
+    counter = {"n": 0}
+
+    def counting(*args, **kwargs):
+        if _called_from_safefs():
+            counter["n"] += 1
+        return real(*args, **kwargs)
+
+    saved_inbox_env = os.environ.get("TWOPERSON_INBOX")
+    saved_audit_env = os.environ.get(watch.AUDIT_CMD_ENV)
+    setattr(holder, syscall_name, counting)
+    best = 0
+    try:
+        for index, (_label, driver, _strict, _refusal) in enumerate(DRIVERS):
+            root = _build_inbox(base / f"count-{module_name}-{syscall_name}-{index:02d}")
+            os.environ["TWOPERSON_INBOX"] = str(root)
+            os.environ.pop(watch.AUDIT_CMD_ENV, None)
+            counter["n"] = 0
+            try:
+                driver(root, base) if driver is _drive_publish_cli else driver(root)
+            except BaseException:          # noqa: BLE001 - only the reachable COUNT matters here
+                pass
+            best = max(best, counter["n"])
+    finally:
+        setattr(holder, syscall_name, real)
+        if saved_inbox_env is None:
+            os.environ.pop("TWOPERSON_INBOX", None)
+        else:
+            os.environ["TWOPERSON_INBOX"] = saved_inbox_env
+        if saved_audit_env is None:
+            os.environ.pop(watch.AUDIT_CMD_ENV, None)
+        else:
+            os.environ[watch.AUDIT_CMD_ENV] = saved_audit_env
+    return best
+
+
+with tempfile.TemporaryDirectory(prefix="twoperson-sweep-count-") as _count_base:
+    #: ``(module, name) -> how many occurrences to sweep``, measured once at collection time. Never
+    #: zero: a syscall no driver reaches still gets one row, which simply never sets `fault.fired`
+    #: and so asserts nothing — the same "free to answer" rule a single-occurrence row always had.
+    CALL_COUNTS: dict[tuple[str, str], int] = {
+        (module, name): max(1, _reachable_calls(module, name, pathlib.Path(_count_base)))
+        for module, name in SYSCALLS
+    }
+
+#: Every ``(module, name, index)`` the sweep drives — the Cartesian product of `SYSCALLS` and each
+#: syscall's own measured occurrence count, not a single flat count for all of them.
+INDEX_CASES = [
+    (module, name, index)
+    for module, name in SYSCALLS
+    for index in range(1, CALL_COUNTS[(module, name)] + 1)
+]
+
+#: ``(name, index)`` pairs whose failure is DROPPED rather than refused, on top of `_TOLERATED`
+#: (which drops a name at every index). Two entries, both explained below.
+_TOLERATED_AT = {
+    # `flock`'s SECOND occurrence in every locking driver is the `LOCK_UN` release
+    # (`_safefs.unlock_quietly`): it runs from a `finally` after the locked work is already done, so
+    # — like `close` — a failure there must not replace a completed outcome. Its FIRST occurrence
+    # (`LOCK_EX`, the acquire) stays strict: a lock that could not be TAKEN must still refuse or
+    # degrade, never silently proceed as if it had been.
+    ("flock", 2),
+    # `mkdir`'s FIRST occurrence in every driver is `_ensure_tree`'s `Path(root).mkdir(exist_ok=True)`
+    # — and every driver here runs against a root `_build_inbox` already created, so this call is
+    # always "recreate a directory that is already there", which `Path.mkdir(exist_ok=True)` is
+    # DOCUMENTED to swallow whatever the errno (it checks `self.is_dir()`, not the errno, precisely
+    # because "the OS could give priority to another error like EACCES" over EEXIST). That is a
+    # stdlib contract this package does not own — the genuinely-missing-root case (where the same
+    # call SHOULD refuse) has no `Path.mkdir(exist_ok=True)` escape hatch and is proved directly by
+    # `test_a_genuinely_missing_root_that_cannot_be_created_is_a_refusal` below instead.
+    ("mkdir", 1),
+}
+
+
+@pytest.mark.parametrize("module,name,index", INDEX_CASES,
+                         ids=[f"{m}.{n}#{i}" for m, n, i in INDEX_CASES])
 @pytest.mark.parametrize("errno_value", ERRNOS, ids=lambda v: errno.errorcode[v])
 def test_no_syscall_failure_escapes_as_a_raw_oserror(tmp_path, monkeypatch,
-                                                     module, name, errno_value):
-    """Break ONE syscall, drive EVERY entry point, and require a refusal at each.
+                                                     module, name, index, errno_value):
+    """Break the ``index``-th reachable call to ONE syscall, drive EVERY entry point, and require a
+    refusal (or a documented, tolerated degrade) at each that reaches it.
 
-    The same fault is held for all drivers in the row: an entry point that reaches the broken call
-    must refuse, and one that never reaches it is free to answer — which is what `Fault.fired` is
-    for. Without that flag the row would either assert nothing (a sweep that cannot fail) or assert
-    a refusal from an entry point that never touched the syscall (a sweep that fails on the truth).
+    The same fault, at the same occurrence index, is held for all drivers in the row: an entry point
+    that reaches that occurrence must refuse (unless the occurrence is `_TOLERATED`/`_TOLERATED_AT`),
+    and one that never reaches it is free to answer — `Fault.fired` decides which. Faulting only ONE
+    occurrence, rather than every one, is what lets a driver run PAST an earlier call to a syscall to
+    reach a later one — see the section comment above for why that is load-bearing.
     """
     holder = os if module == "os" else __import__(module)
-    fault = _inject(monkeypatch, name, errno_value, holder=holder)
+    fault = _inject(monkeypatch, name, errno_value, holder=holder, at=index,
+                    reached=_called_from_safefs)
     fault.armed = False
 
+    tolerated = name in _TOLERATED or (name, index) in _TOLERATED_AT
     failures: list[str] = []
-    for index, (label, driver, strict, refusal_value) in enumerate(DRIVERS):
+    for driver_index, (label, driver, strict, refusal_value) in enumerate(DRIVERS):
         # A FRESH tree per driver, because the drivers are not read-only: `claim/next` MOVES the
         # packet out of `pending/`, so a shared tree would leave every later driver running against
         # an inbox the earlier one had emptied — and "there was nothing there" would read as "the
         # operation refused". Built disarmed; the fault is armed only for the drive itself.
-        root = _build_inbox(tmp_path / f"driver-{index:02d}")
+        root = _build_inbox(tmp_path / f"driver-{driver_index:02d}")
         monkeypatch.setenv("TWOPERSON_INBOX", str(root))
-        fault.armed, fault.fired = True, False
+        fault.reset()
+        fault.armed = True
         outcome, payload = _call(driver, root, tmp_path)
         fault.armed = False
         if outcome == "value" and refusal_value is not None and refusal_value(payload):
@@ -271,12 +395,29 @@ def test_no_syscall_failure_escapes_as_a_raw_oserror(tmp_path, monkeypatch,
                 f"(the contract is a refusal, or exit 2 at the CLI)"
             )
             continue
-        if fault.fired and strict and name not in _TOLERATED and outcome != "refusal":
+        if fault.fired and strict and not tolerated and outcome != "refusal":
             failures.append(
-                f"{label}: {module}.{name} failed with {errno.errorcode[errno_value]} and the "
-                f"driver still answered {payload!r} — a refusal turned into an answer"
+                f"{label}: {module}.{name} call #{index} failed with "
+                f"{errno.errorcode[errno_value]} and the driver still answered {payload!r} — a "
+                f"refusal turned into an answer"
             )
     assert not failures, "\n".join(failures)
+
+
+def test_a_genuinely_missing_root_that_cannot_be_created_is_a_refusal(tmp_path, monkeypatch):
+    """`_TOLERATED_AT` drops `mkdir` call #1 only because every sweep driver runs against a root
+    `_build_inbox` already created: `Path.mkdir(exist_ok=True)` swallows a failure there because the
+    directory already exists (it checks `self.is_dir()`, not the errno), not because anything was
+    refused. This is the same call on a root that does NOT exist yet, where that escape hatch cannot
+    apply and the failure must reach the caller as a refusal.
+    """
+    root = tmp_path / "twoperson"
+    fault = _inject(monkeypatch, "mkdir", errno.ENOSPC, at=1, reached=_called_from_safefs)
+
+    with pytest.raises(PacketError):
+        inbox.publish(valid_packet(), root=root)
+
+    assert fault.fired, "the fault was never reached — this row proves nothing"
 
 
 # --------------------------------------------------------------------------------------------
@@ -540,3 +681,101 @@ def test_every_syscall_the_primitive_calls_is_in_the_sweep():
     swept = set(SYSCALLS)
     assert called == swept, f"the sweep is not covering what the primitive calls: {called ^ swept}"
     assert len(swept) >= 13, f"the sweep collapsed to {len(swept)} rows: {sorted(swept)}"
+
+
+# --------------------------------------------------------------------------------------------
+# tpsync-r6 — four findings the widened sweep above would have caught on its own (all four are
+# also swept: the release at `flock#2`/`_TOLERATED_AT`, the missing-root `mkdir#1`/the dedicated
+# test above, and the cursor/mute-switch rows are driven by `watch:dispatch_once`/`watch:loop_once`
+# through the same `index`-parametrized rows). These are kept as their own tests anyway because a
+# dedicated test names the MECHANISM directly — which occurrence of which syscall, on which entry
+# point — rather than leaving a reader to work it out from a `#3` in a parametrize id.
+# --------------------------------------------------------------------------------------------
+
+def test_close_is_attempted_exactly_once_and_never_retried_after_eintr(monkeypatch):
+    """`close_quietly` used to retry `EINTR` once, on the theory that `EINTR` is the one errno that
+    means the descriptor was NOT released. On Linux (and POSIX generally) that theory is wrong: the
+    descriptor IS released the instant `close` is called, whatever it then reports, so a retry does
+    not close "the same" fd again — there is none left — it closes whatever NUMBER the kernel has
+    since handed to an unrelated `open` on another thread, silently closing THAT operation's file
+    instead of this one.
+
+    Proved here as a call count rather than an outcome, because the defect this guards against is
+    silent by construction: a retried close never raises, it just closes the wrong descriptor.
+    """
+    calls = []
+    real_close = os.close
+
+    def once_then_fail(fd):
+        calls.append(fd)
+        if len(calls) == 1:
+            raise InterruptedError()
+        return real_close(fd)
+
+    monkeypatch.setattr(os, "close", once_then_fail)
+
+    fd = os.open(os.devnull, os.O_RDONLY)
+    _safefs.close_quietly(fd)
+
+    assert calls == [fd], (
+        f"close was attempted {len(calls)} time(s) — it must be attempted exactly once, or a retry "
+        f"can close a DIFFERENT descriptor the kernel has since reused: {calls!r}"
+    )
+    os.close(fd)          # `once_then_fail` raised on the first attempt, so the real close never ran
+
+
+def test_a_cursor_with_an_oversized_integer_recovers_instead_of_killing_the_tick(prepared):
+    """A JSON integer of a few thousand digits is syntactically valid and well under
+    `MAX_CURSOR_BYTES`, but Python 3.11+ refuses to convert a string that long to an `int` at all —
+    `sys.set_int_max_str_digits`'s default 4300-digit limit — which is a plain `ValueError`, not a
+    `json.JSONDecodeError` (a subclass, but not the one actually raised here). `load_cursor` used to
+    catch `JSONDecodeError` and `RecursionError` but not the bare `ValueError`, so this sailed past
+    every handler and would have killed the tick the same way the two already-tested shapes did.
+    """
+    body = (b'{"packets": [], "verdicts": [], "consults": [], "advice": ' + b"9" * 5000 + b"}")
+    inbox._ensure_tree(prepared)
+    (prepared / watch.CURSOR_NAME).write_bytes(body)
+
+    cursor = watch.load_cursor(root=prepared)
+
+    assert cursor == Cursor(), "a cursor with an oversized integer must recover as no cursor"
+    assert watch.dispatch_once(audit_cmd="", notify_fn=lambda *_a: True,
+                               run_fn=lambda *_a: 0) is not None, (
+        "the watcher pass after an oversized-integer cursor must still happen"
+    )
+
+
+def test_an_unstatable_mute_switch_does_not_crash_dispatch_or_the_loop(prepared, monkeypatch):
+    """`is_muted`'s `stat_nolink` call REFUSES (rather than answers) when the switch's occupancy
+    cannot be determined at all — `EIO`, `EACCES`, an unsupported filesystem — and that refusal used
+    to be left uncaught, so it propagated out of `is_muted`, through `dispatch_once` (which never
+    catches a bare `PacketError` around its own `is_muted` calls), and killed `watch_loop`'s `while`
+    on the first bad tick instead of costing that one tick.
+    """
+    fault = _inject(monkeypatch, "stat", errno.EIO, reached=_called_from_safefs)
+
+    report = watch.dispatch_once(root=prepared, audit_cmd="", notify_fn=lambda *_a: True,
+                                 run_fn=lambda *_a: 0)
+    assert fault.fired, "the fault was never reached — this row proves nothing"
+    assert report is not None, "a stat failure on the mute switch must degrade, not raise"
+
+    fault.reset()
+    acted = watch.watch_loop(prepared, max_passes=3, interval=0, audit_cmd="",
+                             notify_fn=lambda *_a: True, run_fn=lambda *_a: 0)
+    assert fault.fired, "the fault was never reached by the loop either"
+    assert acted >= 0, "watch_loop must survive every pass rather than raising out of the while"
+
+
+def test_a_failed_lock_release_does_not_crash_a_successful_publish(prepared, monkeypatch):
+    """`fcntl.flock(handle, LOCK_UN)` used to sit outside `_safefs`'s one conversion point, called
+    directly from `inbox._publish_lock`'s `finally` block: an `EIO` there — reachable on a filesystem
+    where the lock file itself has gone bad after the publish already succeeded — became a raw
+    `OSError` traceback replacing a SUCCESSFUL publish. `_safefs.unlock_quietly` now owns the release
+    and drops the error the same way `close_quietly` already had to.
+    """
+    fault = _inject(monkeypatch, "flock", errno.EIO, holder=fcntl, at=2, reached=_called_from_safefs)
+
+    path = inbox.publish(valid_packet(), root=prepared)
+
+    assert fault.fired, "the fault was never reached — this row proves nothing"
+    assert path.exists(), "a failed lock release must not undo an already-completed publish"

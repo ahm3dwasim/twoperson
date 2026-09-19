@@ -148,6 +148,9 @@ def guarded(fn, *args, **kwargs):
 #: The package whose frames the injector is allowed to break.
 PACKAGE_DIR = pathlib.Path(_safefs.__file__).resolve().parent
 
+#: The primitive itself — narrower than `PACKAGE_DIR`. See `_called_from_safefs`.
+PRIMITIVE_FILE = pathlib.Path(_safefs.__file__).resolve()
+
 
 def _called_from_package() -> bool:
     """Is a frame of this package on the stack above the injected call?"""
@@ -160,6 +163,25 @@ def _called_from_package() -> bool:
     return False
 
 
+def _called_from_safefs() -> bool:
+    """Is a `_safefs.py` frame on the stack above the injected call? Narrower than
+    `_called_from_package`, and what the syscall SWEEP wants: `SYSCALLS` is parsed out of
+    `_safefs.py`'s own source, and the structural guard in `test_safefs_guard.py` proves no other
+    module may make one of these calls — so every occurrence the sweep needs to fault already has
+    `_safefs.py` on the stack. `_called_from_package` is wider on purpose for the single-fault tests
+    elsewhere in this file, but that width is a liability for an INDEXED sweep: a caller like
+    `inbox._assert_inside` reaches `os.stat` too, by way of `pathlib.Path.resolve(strict=False)`,
+    which is documented to swallow any `OSError` its internal `stat` raises and never propagate it —
+    so faulting THAT occurrence proves nothing and would misnumber every real occurrence after it.
+    """
+    frame = sys._getframe(2)
+    while frame is not None:
+        if frame.f_code.co_filename == str(PRIMITIVE_FILE):
+            return True
+        frame = frame.f_back
+    return False
+
+
 class Fault:
     """A monkeypatch target that fails with one errno — inside this package, and only there.
 
@@ -167,24 +189,40 @@ class Fault:
     the syscall it was told about was actually reached. Without the flag, a row for a syscall a given
     entry point never calls would have to choose between asserting nothing and asserting something
     false, and a sweep full of the first is a sweep that cannot fail.
+
+    ``at`` decides WHICH matching call fails: ``None`` (the default) fails every one, which is what
+    every single-fault test in this file wants — the syscall named is broken for the whole driver run.
+    An integer fails only the Nth call reached from a package frame and lets every other one through
+    to the real function. That is what the driver-independent sweep needs: `fcntl.flock` is called
+    twice by every locking driver (`LOCK_EX` to acquire, `LOCK_UN` to release), and a `Fault` that
+    always fires never lets a driver past the acquire to reach the release at all — which is exactly
+    how the release being unconverted escaped three prior audit rounds.
     """
 
-    def __init__(self, errno_value: int, real, detail: str = ""):
+    def __init__(self, errno_value: int, real, detail: str = "", at: int | None = None,
+                reached=_called_from_package):
         self.errno_value = errno_value
         self.real = real
         self.detail = detail or os.strerror(errno_value)
         self.fired = False
         self.calls = 0
+        self.at = at
+        #: Which stack-scope counts as "reached" — `_called_from_package` by default (every
+        #: single-fault test in this file wants that width); the indexed sweep passes
+        #: `_called_from_safefs` instead. See that function's docstring for why the two must not be
+        #: mixed within one count-then-fault pass.
+        self._reached = reached
         #: Disarmed while a test BUILDS the tree a driver is about to be run against: a fault that
         #: is armed during setup breaks the setup, and then the row reports "there was nothing
         #: there" as if it were "the operation refused".
         self.armed = True
 
     def __call__(self, *args, **kwargs):
-        self.calls += 1
-        if self.armed and _called_from_package():
-            self.fired = True
-            raise OSError(self.errno_value, self.detail)
+        if self.armed and self._reached():
+            self.calls += 1
+            if self.at is None or self.calls == self.at:
+                self.fired = True
+                raise OSError(self.errno_value, self.detail)
         return self.real(*args, **kwargs)
 
     def reset(self) -> None:
@@ -192,13 +230,15 @@ class Fault:
         self.calls = 0
 
 
-def inject(monkeypatch, name: str, errno_value: int, *, holder=None, attr: str | None = None) -> Fault:
+def inject(monkeypatch, name: str, errno_value: int, *, holder=None, attr: str | None = None,
+          at: int | None = None, reached=_called_from_package) -> Fault:
     """Make ``holder.name`` (default: ``os.name``) fail with ``errno_value`` inside this package.
 
     ``attr`` names the real callable when it is not the attribute being replaced — for a patch on a
     METHOD, where the attribute and the callable are the same object read off a different holder.
+    ``at`` and ``reached`` are passed straight through to `Fault` — see its docstring.
     """
     holder = os if holder is None else holder
-    fault = Fault(errno_value, getattr(holder, attr or name))
+    fault = Fault(errno_value, getattr(holder, attr or name), at=at, reached=reached)
     monkeypatch.setattr(holder, name, fault)
     return fault

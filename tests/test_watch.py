@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from twoperson import inbox
+from twoperson import _safefs, inbox
 from twoperson.verdict import build_verdict
 from twoperson import watch
 from twoperson.watch import (
@@ -427,7 +427,7 @@ def test_dispatch_lock_degrades_to_a_no_op_when_flock_is_unsupported(root, monke
     def boom(_handle, _op):
         raise OSError("locking not supported on this filesystem")
 
-    monkeypatch.setattr(watch.fcntl, "flock", boom)
+    monkeypatch.setattr(_safefs.fcntl, "flock", boom)
 
     rec = Recorder()
     report = dispatch_once(audit_cmd="audit", notify_fn=rec.notify, run_fn=rec.run)

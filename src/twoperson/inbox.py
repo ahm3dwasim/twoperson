@@ -72,7 +72,6 @@ See `docs/PROTOCOL.md` for the runbook.
 """
 from __future__ import annotations
 
-import fcntl
 import os
 import stat as _stat
 from contextlib import contextmanager
@@ -343,10 +342,8 @@ def _publish_lock(root: Path):
     try:
         yield
     finally:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_UN)
-        finally:
-            handle.close()
+        _safefs.unlock_quietly(handle)
+        _safefs.close_handle_quietly(handle)
 
 
 def _assert_inside(root: Path, target: Path) -> Path:

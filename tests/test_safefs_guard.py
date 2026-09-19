@@ -35,8 +35,12 @@ SOURCE_DIR = pathlib.Path(_safefs.__file__).resolve().parent
 #: The one module allowed to name a file operation.
 PRIMITIVE = "_safefs.py"
 
-#: Calls made through one of these names are file operations by definition.
-_IO_MODULES = frozenset({"os", "shutil", "pathlib"})
+#: Calls made through one of these names are file operations by definition. `fcntl` is here for
+#: `flock`: the lock/unlock pair is as much a name-scoped operation as `os.open` is — a lock taken
+#: on the wrong descriptor is not a lock — and two audit rounds each found a raw `fcntl.flock` call
+#: outside the primitive (`inbox._publish_lock`'s release, then `watch._dispatch_lock`'s) before this
+#: rule existed to catch either on the commit that (re)introduced it.
+_IO_MODULES = frozenset({"os", "shutil", "pathlib", "fcntl"})
 
 #: ...and these are the operations, on those modules.
 _MODULE_OPS = frozenset({
@@ -44,6 +48,7 @@ _MODULE_OPS = frozenset({
     "mkdir", "makedirs", "rmdir", "remove", "unlink", "rename", "replace",
     "chmod", "lchmod", "symlink", "link", "mkfifo",
     "scandir", "stat", "lstat",
+    "flock", "lockf", "fcntl",
 })
 
 #: The same question asked as a METHOD on a `pathlib.Path`. `replace` is deliberately absent: `str`
@@ -206,7 +211,7 @@ def test_the_primitive_actually_makes_the_calls_it_is_exempt_for():
     imported = _imported(tree)
     shapes = {_shape(node, imported) for node in ast.walk(tree) if isinstance(node, ast.Call)}
     for required in ("os.open", "os.mkdir", "os.replace", "os.rename",
-                     "os.unlink", "os.stat", "os.scandir"):
+                     "os.unlink", "os.stat", "os.scandir", "fcntl.flock"):
         assert required in shapes, f"_safefs does not call {required} — so who does?"
     # `fchmod` is a DESCRIPTOR operation, not a name operation, so it is deliberately not in
     # `_MODULE_OPS` — but the primitive is the only module allowed to set a directory's mode at all,
@@ -242,7 +247,11 @@ _PRIMITIVE_SYSCALLS: dict[str, frozenset[str]] = {
 #: with the reason. These are the conversion machinery itself, and one deliberate exception.
 _PRIMITIVE_ALLOWLIST: dict[str, str] = {
     "close_quietly": "releases a descriptor from a finally block, where raising would replace the "
-                     "outcome that brought us there; EINTR is retried and the rest dropped",
+                     "outcome that brought us there; every close error, EINTR included, is dropped "
+                     "rather than retried",
+    "unlock_quietly": "releases an flock from a finally block, for the same reason as close_quietly "
+                      "above — the locked work is already finished, so a failed LOCK_UN must not "
+                      "replace that outcome",
 }
 
 
@@ -326,8 +335,8 @@ def test_every_primitive_allowlist_entry_names_a_real_function_and_a_real_reason
     for name, reason in _PRIMITIVE_ALLOWLIST.items():
         assert name in defined, f"{name} is allowlisted but not defined in the primitive"
         assert len(reason) >= _MIN_REASON, f"{name} — the reason is not a reason: {reason!r}"
-    assert set(_PRIMITIVE_ALLOWLIST) == {"close_quietly"}, (
-        "a second exception to the conversion rule is a change to the error contract, not a detail"
+    assert set(_PRIMITIVE_ALLOWLIST) == {"close_quietly", "unlock_quietly"}, (
+        "a third exception to the conversion rule is a change to the error contract, not a detail"
     )
 
 

@@ -137,14 +137,18 @@ def _converting(label: str, verb: str, kind: type[PacketError],
 
 
 def _release(close) -> None:
-    """Run a close, retrying ``EINTR`` once, dropping every other error. See `close_quietly`."""
+    """Run a close exactly ONCE, dropping any error. See `close_quietly`.
+
+    ``close`` must never be retried, ``EINTR`` included: on Linux (and POSIX generally) the
+    descriptor is released by the kernel the instant ``close`` is called, whatever it then reports.
+    A retry after ``EINTR`` does not close "the same" descriptor again — there is no descriptor left
+    to close — it closes whatever NUMBER the kernel has since handed to an unrelated ``open`` on
+    another thread, silently closing that operation's file (or lock) instead of this one. What used
+    to look like the safe choice — retrying the one errno that claims nothing happened — is the one
+    retry that is never safe here.
+    """
     try:
         close()
-    except InterruptedError:
-        try:
-            close()
-        except OSError:
-            pass
     except OSError:
         pass
 
@@ -159,11 +163,29 @@ def close_quietly(fd: int) -> None:
     success path it would turn a published packet into a traceback after the bytes were already
     ``fsync``ed and revealed.
 
-    ``EINTR`` is retried once because it is the one errno that means the descriptor was NOT
-    released; every other error (``EIO``, ``EBADF``, ``ENOSPC`` is not reachable here) has already
-    released it on the platforms this package supports, so there is nothing left to decide.
+    ``close`` is attempted exactly once, and every error it can report — ``EINTR`` included — is
+    dropped without a retry. See `_release` for why: the descriptor is already gone by the time
+    ``close`` answers, so retrying can only land on a DIFFERENT descriptor that has since been
+    reused.
     """
     _release(lambda: os.close(fd))
+
+
+def unlock_quietly(handle: IO[bytes]) -> None:
+    """Release an ``flock`` from a ``finally`` block, and never raise. See `close_quietly`.
+
+    Every caller takes this lock only to serialize a section of work that is already finished by the
+    time this runs — the packet is revealed, or a refusal is already on its way out — so a failed
+    ``LOCK_UN`` must not replace that outcome any more than a failed ``close`` may. Unlike ``close``,
+    there is nothing to get wrong by not retrying: the descriptor itself is untouched either way, and
+    the ``close_quietly``/``close_handle_quietly`` call that follows this one releases every ``flock``
+    the process holds on it regardless — so a dropped unlock error here is never the last word on the
+    lock.
+    """
+    try:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    except OSError:
+        pass
 
 
 def close_handle_quietly(handle: IO[bytes]) -> None:
