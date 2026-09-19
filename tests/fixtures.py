@@ -8,10 +8,62 @@ from __future__ import annotations
 import copy
 import os
 import pathlib
+import subprocess
 import sys
 from typing import Any
 
 from twoperson import _safefs
+
+#: `-c` overrides, not global config: a test repo must never depend on — or pollute — the
+#: developer's own `~/.gitconfig` (name, email, default branch, signing).
+_GIT_ENV = ("-c", "user.name=test", "-c", "user.email=test@example.com",
+           "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main")
+
+
+class GitRepo:
+    """A throwaway git repository for `gitfacts`/`citations` tests, addressed by real commits.
+
+    Both modules read the repository at a named head through git plumbing, never the working tree
+    (see docs/PROTOCOL.md §3a), so a test that exercises them has to commit real content rather than
+    only writing files to disk.
+    """
+
+    def __init__(self, path: pathlib.Path) -> None:
+        self.path = path
+        self._run("init", "-q")
+
+    def _run(self, *args: str) -> str:
+        result = subprocess.run(("git", *_GIT_ENV, *args), cwd=self.path,
+                                capture_output=True, text=True, check=False)
+        assert result.returncode == 0, f"git {args} failed: {result.stderr}"
+        return result.stdout
+
+    def write(self, relpath: str, content: str) -> None:
+        target = self.path / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+
+    def rm(self, relpath: str) -> None:
+        (self.path / relpath).unlink()
+
+    def mv(self, src: str, dst: str) -> None:
+        self._run("mv", src, dst)
+
+    def commit(self, message: str = "commit") -> str:
+        self._run("add", "-A")
+        self._run("commit", "-q", "-m", message, "--allow-empty")
+        return self._run("rev-parse", "HEAD").strip()
+
+    def head(self) -> str:
+        return self._run("rev-parse", "HEAD").strip()
+
+
+def git_repo(tmp_path: pathlib.Path) -> GitRepo:
+    """A fresh `GitRepo` under ``tmp_path``. Not a pytest fixture itself — call it from one, so
+    each test picks its own subdirectory name rather than sharing a fixture-scoped repo."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(exist_ok=True)
+    return GitRepo(repo_dir)
 
 
 def valid_packet(**overrides: Any) -> dict:

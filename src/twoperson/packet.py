@@ -327,6 +327,13 @@ _TEST_FIELDS = {
 
 _EVIDENCE_FIELDS = {"kind": _short, "ref": _text, "note": _text}
 
+#: Whether `changed_files`/`diff_summary` were checked against the head they name
+#: (`twoperson.gitfacts`) or are simply what the builder typed. `"claimed"` is the OLD behaviour —
+#: self-reported, unverified — and is what a packet published before this field existed always was,
+#: which is why it is also the default a missing field fills in: an absent value must read as the
+#: unfavourable, unverified case, never be upgraded to "derived" for free.
+_DIFF_PROVENANCE = frozenset({"derived", "claimed"})
+
 _MODEL_CLASS_FIELDS = {
     "account_class": _short,
     "primary_model": _short,
@@ -364,6 +371,7 @@ _SCHEMA: dict[str, Any] = {
     "acceptance_criteria": lambda v, f: _string_list(v, f, minimum=1),
     "git": lambda v, f: _object(v, f, _GIT_FIELDS),
     "diff_summary": lambda v, f: _object(v, f, _DIFF_FIELDS),
+    "diff_provenance": lambda v, f: _enum(v, f, _DIFF_PROVENANCE),
     "changed_files": lambda v, f: _object_list(v, f, _CHANGED_FILE_FIELDS, limit=MAX_CHANGED_FILES,
                                                optional=_CHANGED_FILE_OPTIONAL_FIELDS),
     "tests": lambda v, f: _object_list(v, f, _TEST_FIELDS, limit=MAX_LIST),
@@ -377,6 +385,16 @@ _SCHEMA: dict[str, Any] = {
 }
 
 REQUIRED_FIELDS = frozenset(_SCHEMA)
+
+
+#: Fields added to the schema AFTER packets were already on disk. A missing one is filled with this
+#: default instead of rejecting the packet: a running inbox holds audited packets the tooling still
+#: re-reads, and a new hard-required key would make every one of them unreadable — turning a schema
+#: addition into a silent loss of the audit trail. Each default is the UNFAVOURABLE reading of an
+#: absent value, never one that credits the packet with something it never claimed.
+_DEFAULTED_FIELDS: dict[str, Any] = {
+    "diff_provenance": "claimed",
+}
 
 
 def validate_packet(packet: Any) -> dict:
@@ -404,7 +422,10 @@ def validate_packet(packet: Any) -> dict:
     out: dict[str, Any] = {}
     for field, check in _SCHEMA.items():
         if field not in packet:
-            raise SchemaError(f"{field}: missing (required)")
+            if field not in _DEFAULTED_FIELDS:
+                raise SchemaError(f"{field}: missing (required)")
+            out[field] = check(_DEFAULTED_FIELDS[field], field)
+            continue
         out[field] = check(packet[field], field)
 
     push = out["push_status"]
@@ -467,6 +488,10 @@ def template_packet() -> dict:
         "git": {"branch": UNKNOWN, "base_ref": "origin/main",
                 "base_sha": UNKNOWN, "head_sha": UNKNOWN},
         "diff_summary": {"files_changed": UNKNOWN, "insertions": UNKNOWN, "deletions": UNKNOWN},
+        # Left as the "claimed" default rather than "derived": a template has not been through
+        # `publish` yet, so nothing has checked it against a head, and that is the honest starting
+        # point (see `_DEFAULTED_FIELDS`).
+        "diff_provenance": _DEFAULTED_FIELDS["diff_provenance"],
         "changed_files": [],
         "tests": [],
         "evidence": [],
@@ -522,7 +547,8 @@ def render_for_review(packet: Mapping) -> str:
         f"Created: {packet['created_at']}",
         f"Branch: {git['branch']} (base {git['base_ref']} @ {git['base_sha']}) "
         f"head={git['head_sha']}",
-        f"Diff: {diff['files_changed']} file(s), +{diff['insertions']} -{diff['deletions']}",
+        f"Diff: {diff['files_changed']} file(s), +{diff['insertions']} -{diff['deletions']} "
+        f"[{packet['diff_provenance']}]",
     ]
     lines += _bullets("Acceptance criteria", list(packet["acceptance_criteria"]))
 

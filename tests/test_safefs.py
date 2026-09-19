@@ -436,7 +436,9 @@ def test_a_full_disk_at_every_creating_step_exits_two_through_the_cli(root, tmp_
     packet_path.write_text(json.dumps(valid_packet()), encoding="utf-8")
     inject(monkeypatch)
 
-    rc = main(["publish", "--from", str(packet_path)])
+    # --no-derive: this drives the ENOSPC fault at the disk-write step inbox.publish reaches, not
+    # the (unrelated) refusal a synthetic head gets from the diff derivation.
+    rc = main(["publish", "--no-derive", "--from", str(packet_path)])
     err = capsys.readouterr().err
 
     assert rc == 2, f"{step}: exit {rc}, and the refusal is supposed to be exit 2"

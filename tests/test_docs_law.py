@@ -57,10 +57,10 @@ def test_the_docs_do_not_claim_reviewer_independence_is_enforced() -> None:
     assert "doesn't know who the reviewer is" in readme
     assert "per commit, not per packet" in readme
     assert "operating assumption" in protocol
-    assert "nothing in the gate reads head or the working tree" in readme, \
+    assert "the ship-report gate itself reads none of it" in readme, \
         "README must say the gate validates reports, not repository state"
-    assert "never runs `git`" not in readme, "signal.py and the hook scripts DO call git rev-parse"
-    assert "never observes the repository" not in protocol, "inbox.py reads .git/commondir; signal.py runs git rev-parse"
+    assert "never runs `git`" not in readme, "signal.py, gitfacts.py and citations.py DO call git"
+    assert "never observes the repository" not in protocol, "gitfacts.py/citations.py read the head; signal.py runs git rev-parse"
     assert "does not inspect commit or worktree contents" in protocol
     assert "find a virtualenv" in protocol, "the hook scripts' git rev-parse must be in the stated boundary"
     assert "a valid `signal` invocation never returns 2" in readme

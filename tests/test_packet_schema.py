@@ -18,6 +18,7 @@ from twoperson.packet import (
     SchemaError,
     SecretLeakError,
     UnsafePathError,
+    _DEFAULTED_FIELDS,
     find_secrets,
     loads_packet,
     render_for_review,
@@ -36,11 +37,22 @@ def test_valid_packet_round_trips():
     assert source["goal"] == "Durable Builder->Reviewer handoff bridge."
 
 
-@pytest.mark.parametrize("field", sorted(REQUIRED_FIELDS))
+@pytest.mark.parametrize("field", sorted(REQUIRED_FIELDS - set(_DEFAULTED_FIELDS)))
 def test_every_required_field_is_required(field):
     with pytest.raises(SchemaError) as excinfo:
         validate_packet(without(field))
     assert field in str(excinfo.value)
+
+
+@pytest.mark.parametrize("field", sorted(_DEFAULTED_FIELDS))
+def test_a_defaulted_field_fills_instead_of_orphaning_older_packets(field):
+    """`diff_provenance` was added after packets were already on disk in a running inbox.
+
+    Making it hard-required would make every one of those unreadable to `next --peek` and the
+    verdict tooling — a schema addition that silently destroys the audit trail. It defaults
+    instead, and the default is the unfavourable reading of an absent value, never a favourable one.
+    """
+    assert validate_packet(without(field))[field] == _DEFAULTED_FIELDS[field]
 
 
 def test_required_fields_cover_the_brief():
@@ -411,7 +423,11 @@ def test_the_template_leaves_every_fact_unknown_and_only_structure_fixed():
         else:
             yield path, node
     skip = {"schema_version", "packet_id", "created_at", "git.base_ref", "acceptance_criteria[0]",
-            "push_status.pushed", "push_status.deployed", "push_status.restarted", "push_status.statement"}
+            "push_status.pushed", "push_status.deployed", "push_status.restarted", "push_status.statement",
+            # "claimed" is not an invented fact: a fresh template has not been through `publish`,
+            # so nothing has checked it against a head, and that absence of verification is
+            # something we KNOW rather than something we failed to find out.
+            "diff_provenance"}
     for path, value in leaves(t):
         if path in skip: continue
         assert value == "unknown", f"{path} = {value!r} is a fact the template must not invent"

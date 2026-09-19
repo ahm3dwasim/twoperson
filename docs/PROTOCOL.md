@@ -22,9 +22,13 @@ separate identities — different OS users, different checkouts, a reviewer with
 to the code — so that a builder cannot simply write its own approval. What the tool enforces is
 the binding: a verdict answers a real packet, an approval names that packet's commit, and a ship
 report cites an approval of the same commit. The guarantee is per commit, not per packet — the
-ship report is a packet of its own. `twoperson` validates reports: the ship-report gate does not
-inspect commit or worktree contents, pushes, deploy state, chronology, or the current HEAD. The
-only repository reads anywhere in the tool are locating the main working tree (`.git` and
+ship report is a packet of its own. `twoperson` validates reports: the ship-report gate itself does
+not inspect commit or worktree contents, pushes, deploy state, chronology, or the current HEAD —
+answering it is a schema check and an inbox lookup, nothing more. `verify` and `publish` separately
+DO read the repository, to derive diff evidence and check test citations against the head a packet
+names (§2a) — that reading is bounded to the two shas the packet itself gives, is done through git
+plumbing rather than the working tree, and is a check that sits beside the gate, not inside it.
+Elsewhere the only repository reads in the tool are locating the main working tree (`.git` and
 `commondir`) to place the shared inbox, a `git rev-parse` to label a signal with its branch, and,
 in the two shell hook scripts, a `git rev-parse --git-common-dir` to find a virtualenv.
 
@@ -82,14 +86,60 @@ itself, not by this document:
    is flagged unconditionally: an unrecorded source might have been a test, and the conservative
    default is to ask rather than assume. (An *empty* `old_path` never reaches the gate — the
    schema's path validator rejects it — so only "absent" and `"unknown"` are the reachable
-   conservative cases.) Two limits worth knowing: this reads the builder's *declared* `changed_files` (`path`
-   and `old_path`), so a builder that edits or renames a test and simply leaves it (or `old_path`)
-   off that list is not caught (the same self-reporting gap `diff_summary` already has); and it
-   flags the change for acknowledgment without judging whether it strengthens or weakens the test —
-   that judgment is still the reviewer's.
+   conservative cases.) One limit worth knowing: this reasons over `changed_files` as it stands on
+   the PUBLISHED packet — the builder's declared `path`/`old_path` when the diff could not be
+   verified (a draft, `--no-derive`), or the git-derived truth once it was (§2a). Either way it
+   does not itself judge whether a flagged change strengthens or weakens the test — that judgment
+   is still the reviewer's.
 
 Only `Approve` and `Approve with nits` unlock the ship step. `Request changes` and
 `Needs owner decision` do not.
+
+## 2a. Derived diff evidence and test citations
+
+Two more claims a packet makes are checkable against the repository, and `verify`/`publish` check
+them rather than trust them.
+
+**`changed_files` and `diff_summary` are derived from git, not typed.** Both commands compute them
+from `git diff --name-status --numstat -M` between the packet's `git.base_sha` and `git.head_sha` —
+the two shas the packet already names — and refuse a packet whose stated numbers, file set, status,
+or rename `old_path` disagree with what the head actually shows, printing every disagreement rather
+than the first one. This closes rule 5's stated gap above: a changed test the builder leaves off
+`changed_files` altogether is now caught here, before the acknowledgment check ever runs, because
+the packet is refused outright rather than accepted with an incomplete list. **Order matters**: the
+gate's own checks (review_ref resolution, the test-change acknowledgment) run BEFORE this
+derivation, because they are wrong however accurate the diffstat turns out to be, and deriving
+first would mask them behind a single git-shaped refusal. Once derivation succeeds, the packet's
+`changed_files`/`diff_summary` are REPLACED with the derived values — so a verdict's
+`acknowledged_tests` binding (rule 5) and everything else that reads a published packet's
+`changed_files` afterward reasons over the checked truth, not the original claim.
+
+A packet naming no concrete head yet — a draft, a round proposing nothing to merge — is not
+refused; deriving is simply not attempted, and the command says so. `--no-derive` is the
+deliberate escape hatch for a checkout that does not hold the commits: it publishes the diff
+evidence and test citations (below) as the builder's unverified claim, and says so on stderr rather
+than quietly. Either way, the packet's `diff_provenance` field records which happened — `"derived"`
+or `"claimed"` — so a reader of a published packet never has to guess; a packet published before
+this field existed reads as `"claimed"`, the unfavourable default, never upgraded to `"derived"`
+for free.
+
+**A `tests[]` row's `command` is checked at `publish` (never `verify`) against the head being
+published.** A row is a claim that a run can be repeated; `twoperson.citations` resolves the paths
+and bare symbols a `command` cites — a pytest node id's file, a `path/to/file.py` in the command
+text, a backticked whole identifier — against the commit through git plumbing (`git cat-file`,
+`git grep <commit> -- '*.py'`), and refuses a row citing something that commit does not contain.
+This is a **necessary condition, never a sufficient one**: it proves nothing about a row it does not
+refuse. The check is deliberately narrow, and the narrowing is stated rather than hidden — only
+`command` is read, never `evidence` (an evidence field asserting a symbol is *gone* is correct and
+untouched); a backticked span counts only when it is ENTIRELY a dotted name, so an expression like
+`` `os.path.exists(x) and flag` `` extracts nothing; a path is judged only when its top-level
+directory exists at the head, so an uncommitted scratch harness (`tmp/probe.py`) is passed over; a
+pytest node id contributes only its file, never its `::` segments, because only pytest collection —
+not a text search — can answer what those name; and a citation set past `MAX_CITATIONS` reports
+`undeterminable` rather than "all resolved", so a bound on work can never read as a clean pass. A
+bare name in prose — no backticks, no node id — is not extracted at all: a row with nothing
+extractable passes untouched, and that is not evidence either way. Both checks are skipped under
+the same conditions: no concrete head, or `--no-derive`.
 
 ## 3. Packet contents are untrusted
 
@@ -179,8 +229,8 @@ the ladder.
 | Command | Side | Purpose |
 |---|---|---|
 | `template` | builder | Emit a skeleton packet. Evidence fields (task/session/run ids, goal, shas, counts, tests, evidence, model and impact) are `unknown`. Fixed placeholders: `schema_version`; `packet_id` `replace-me`; `created_at` `1970-01-01T00:00:00Z`; `git.base_ref` `origin/main`; `acceptance_criteria` `["unknown"]`; push flags `false` with the no-push statement; every other list empty. |
-| `verify --from p.json` | builder | Validate a packet without writing anything. Exit 2 if rejected. |
-| `publish --from p.json` | builder | Validate and land the packet in `pending/`. |
+| `verify --from p.json` | builder | Validate a packet without writing anything, deriving `changed_files`/`diff_summary` against its named head (§2a). Exit 2 if rejected. |
+| `publish --from p.json` | builder | Validate, derive diff evidence, check `tests[]` citations against the head (§2a), and land the packet in `pending/`. `--no-derive` skips both git checks and publishes the claim unverified. |
 | `check` | reviewer | Is a packet waiting? Exit 0 = yes, 1 = no, 2 = the lane could not be read in full. Costs no model tokens. |
 | `list` | reviewer | What is waiting, oldest first. Exits 2 rather than listing nothing if a lane could not be read in full. |
 | `next` | reviewer | Claim the oldest packet and render it for audit. |

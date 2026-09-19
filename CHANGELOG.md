@@ -6,6 +6,28 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-19
+
+### Added
+
+- `verify`/`publish` now derive `changed_files` and `diff_summary` from `git diff` between the
+  packet's own `base_sha`/`head_sha`, and refuse a packet whose stated diff disagrees with the head
+  it names — printing every disagreement, including a mismatched status or a rename missing its
+  `old_path`. This closes the gap where a builder could leave a changed test off `changed_files`
+  entirely: the test-change acknowledgment gate now reasons over the git-verified list on a
+  published packet, not the builder's self-report. A packet naming no concrete head (a draft) is
+  not refused; `--no-derive` is the explicit escape hatch for a checkout that does not hold the
+  commits, and the new `diff_provenance` field ("derived" or "claimed") records which happened so a
+  published packet never leaves it to be guessed. A packet published before this field existed
+  reads as `"claimed"`, the unfavourable default.
+- `publish` (never `verify`) refuses a `tests[]` row whose `command` cites a path or a bare Python
+  symbol that does not exist at the head being published — a stale reproduction step copied forward
+  from an earlier round. It is a necessary condition, not a sufficient one, and the documented gaps
+  are stated alongside it: only `command` is read, never `evidence`; an expression-shaped citation
+  (not a whole dotted name) is not extracted; an uncommitted scratch path is passed over; a pytest
+  node id contributes only its file. `--no-derive` skips this check too, for the same reason it
+  skips the diff derivation.
+
 ## [0.1.3] - 2026-09-19
 
 ### Fixed

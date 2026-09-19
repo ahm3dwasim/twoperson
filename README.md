@@ -86,18 +86,18 @@ exact test paths (twoperson verdict --ack-test-changes)
 tests the reviewer actually had in front of them. That's deliberate: the acknowledgment records
 the *specific* test paths, not a bare "I acknowledge test changes" flag, so a verdict written for
 one packet's test changes can't be cited to silently unlock a *different* ship report's *different*
-test changes at the same head (`changed_files` is self-reported per packet). The binding isn't just
-a CLI convention, either: `publish_verdict` itself refuses to write a verdict whose
-`acknowledged_tests` names a path the reviewed packet didn't alter, so an API caller can't mint an
-acknowledgment for arbitrary paths and have it replayed onto a different report later. It's still a narrow
-check in every other respect: it only sees the `changed_files` the builder reported (leaving a
-changed test off that list evades it — the same self-reporting gap `diff_summary` already has),
-and it flags *any* qualifying test change for acknowledgment rather than deciding whether it
-strengthens or weakens the test. It exists so a builder can't get a quietly weakened test past a
-reviewer who never looked at the diff, not so a machine can judge test quality. Only adding or
-copying a test is treated as safe; every other status — including an `unknown` one — needs the
-ack, so a change can't slip through on a vague status, and `TWOPERSON_TEST_GLOBS` only *adds*
-patterns rather than being able to switch detection off.
+test changes at the same head. The binding isn't just a CLI convention, either: `publish_verdict`
+itself refuses to write a verdict whose `acknowledged_tests` names a path the reviewed packet
+didn't alter, so an API caller can't mint an acknowledgment for arbitrary paths and have it
+replayed onto a different report later. It's still a narrow check in every other respect: it
+reasons over `changed_files` as it stands on the packet being checked — self-reported when the
+diff couldn't be verified against git (see below), git-derived truth when it could — and it flags
+*any* qualifying test change for acknowledgment rather than deciding whether it strengthens or
+weakens the test. It exists so a builder can't get a quietly weakened test past a reviewer who
+never looked at the diff, not so a machine can judge test quality. Only adding or copying a test is
+treated as safe; every other status — including an `unknown` one — needs the ack, so a change
+can't slip through on a vague status, and `TWOPERSON_TEST_GLOBS` only *adds* patterns rather than
+being able to switch detection off.
 
 A rename is the one status where the changed path alone isn't enough: `changed_files` only
 records where a file ended up, so renaming `tests/test_auth.py` to `src/auth.py` would look like
@@ -105,9 +105,58 @@ records where a file ended up, so renaming `tests/test_auth.py` to `src/auth.py`
 entries may carry an optional `old_path`, and a rename is flagged if *either* end looks like a
 test — or if `old_path` is missing or `unknown`, since an unrecorded source might have been one.
 
+## Derived diffs and checked citations
+
+Two more things a packet claims are checkable, and `verify`/`publish` check them instead of
+trusting them.
+
+`changed_files` and `diff_summary` used to be entirely self-reported — a builder that left a
+changed test off the list, or mis-typed its status, was invisible to every check above, because
+they only ever look at what the packet *says* changed. Now both commands recompute both fields
+from `git diff` between the two shas the packet names, and refuse a packet whose claim disagrees
+with the head:
+
+```
+$ twoperson publish --from packet.json
+packet rejected — the packet's diff evidence does not describe the head it names:
+  - changed_files: tests/test_gate.py is in the diff but not in the packet
+  - diff_summary.files_changed: packet says 1, head is 2
+The values above were derived from the head; correct the packet, or pass --no-derive
+to publish an explicitly unverified claim instead.
+```
+
+Once derivation succeeds, the packet's `changed_files`/`diff_summary` are the derived values, not
+the original claim — so `--ack-test-changes` and everything else that reads a published packet
+afterward reasons over checked truth. A packet naming no concrete head yet (a draft) is not
+refused, and `--no-derive` is the deliberate escape hatch for a checkout that does not hold the
+commits: it publishes the claim unverified and says so on stderr. Either way, the packet's
+`diff_provenance` field records which happened — `derived` or `claimed` — so nobody has to guess
+from a published packet alone; one from before this field existed reads as `claimed`.
+
+`publish` (never `verify` — it may run anywhere, without the commit checked out) also checks every
+`tests[]` row's `command` for a path or a bare symbol that does not exist at the head being
+published:
+
+```
+$ twoperson publish --from packet.json
+error: tests[] row 'regression probe' cites '`_reclaimable_tree`', which does not exist
+at the head being published — that run cannot be repeated here
+publish refused — 1 of 1 citations do not resolve at 6e5acc68
+```
+
+It's a necessary condition, not a sufficient one, and it says so by being narrow on purpose: only
+`command` is read, never `evidence`; a backticked span counts only when it's an entire dotted name,
+so an expression like `` `os.path.exists(x) and flag` `` extracts nothing; an uncommitted scratch
+path (`tmp/probe.py`) is passed over rather than refused; a pytest node id contributes only its
+file, never its `::` segments, because only pytest collection can answer what those name; and a row
+citing nothing extractable — most of them, in practice — passes untouched rather than counting as
+evidence either way. `--no-derive` skips this check too, for the same reason it skips the diff
+derivation: neither can be verified from a checkout that doesn't hold the commits.
+
 So an approval is for one sha of one packet. Rebase, amend, or add a commit and it's stale. The
 builder has to publish again and the reviewer has to look again. `verify` runs the same checks as
-`publish` and writes nothing, so a builder can dry-run its own ship report.
+`publish`, including the diff derivation, and writes nothing, so a builder can dry-run its own ship
+report; only the citations check is publish-only.
 
 ## Try it
 
@@ -275,8 +324,12 @@ have to be the packet that was originally reviewed, because after a rebase it ca
 
 It doesn't spawn agents or call models. It's a directory with a lock and a validator.
 
-It doesn't watch your repository or your deploys. Nothing in the gate reads HEAD or the working
-tree; the only git it touches is a `git rev-parse` to label a signal with its branch name and, in
+It doesn't watch your repository or your deploys. The ship-report gate itself reads none of it —
+answering it is a schema check and an inbox lookup. `verify`/`publish` separately read the head a
+packet names, through git plumbing and bounded to the two shas the packet gives (see "Derived
+diffs and checked citations" above); neither ever reads the working tree, and both are a pull, not
+a watch — nothing runs on a timer or a hook into your repository. Outside those two checks, the
+only git `twoperson` touches is a `git rev-parse` to label a signal with its branch name and, in
 the shell hooks, to find a virtualenv. It never sees a push happen. What it validates is the
 builder's *report*:
 a packet that says "I pushed/deployed/restarted commit X" is refused unless it cites an approving

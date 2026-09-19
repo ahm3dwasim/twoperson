@@ -31,7 +31,10 @@ def _write(tmp_path, packet, name="packet.json"):
 
 
 def test_publish_from_a_file_exits_zero_and_prints_the_path(root, tmp_path, capsys):
-    rc = main(["publish", "--from", _write(tmp_path, valid_packet())])
+    # --no-derive: the shared fixture names a synthetic head, which the diff derivation correctly
+    # refuses (pinned by test_a_fabricated_head_is_refused_by_default). This test is about publish
+    # writing the packet, so it opts out of the git checks rather than inventing a real commit.
+    rc = main(["publish", "--no-derive", "--from", _write(tmp_path, valid_packet())])
     out = capsys.readouterr().out
     assert rc == 0
     assert str(root / "pending") in out
@@ -41,7 +44,7 @@ def test_publish_from_a_file_exits_zero_and_prints_the_path(root, tmp_path, caps
 def test_publish_from_stdin(root, monkeypatch, capsys):
     import io
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(valid_packet())))
-    assert main(["publish", "--from", "-"]) == 0
+    assert main(["publish", "--no-derive", "--from", "-"]) == 0
     assert len(inbox.pending()) == 1
 
 
@@ -61,9 +64,32 @@ def test_publish_of_a_missing_file_exits_nonzero(root, tmp_path, capsys):
 
 
 def test_verify_does_not_publish(root, tmp_path, capsys):
-    assert main(["verify", "--from", _write(tmp_path, valid_packet())]) == 0
+    assert main(["verify", "--no-derive", "--from", _write(tmp_path, valid_packet())]) == 0
     assert inbox.pending() == []
     assert "ok" in capsys.readouterr().out.lower()
+
+
+def test_a_fabricated_head_is_refused_by_default(root, tmp_path, capsys):
+    """A packet whose head is not a real commit must not publish.
+
+    Before this check, a packet naming a head that does not exist — or one that exists but whose
+    diff is nothing like the stated numbers — published cleanly, and the reviewer had to notice.
+    """
+    assert main(["publish", "--from", _write(tmp_path, valid_packet())]) == 2
+    assert inbox.pending() == []
+    err = capsys.readouterr().err
+    assert "not in this repository" in err
+    assert "--no-derive" in err, "the refusal must name the deliberate escape hatch"
+
+
+def test_no_derive_says_out_loud_that_nothing_was_checked(root, tmp_path, capsys):
+    """An unverified claim may publish, but it must never look like a verified one."""
+    assert main(["publish", "--no-derive", "--from", _write(tmp_path, valid_packet())]) == 0
+    err = capsys.readouterr().err
+    assert "NOT derived" in err
+    assert "NOT verified" in err
+    packet = inbox.peek_next().packet
+    assert packet["diff_provenance"] == "claimed"
 
 
 def test_verify_reports_the_failing_rule(root, tmp_path, capsys):
@@ -330,7 +356,7 @@ _LANE_COMMANDS = (
     pytest.param(["next", "--peek"], "pending", id="next-peek"),
     pytest.param(["tier"], "pending", id="tier"),
     pytest.param(["watch", "--once"], "pending", id="watch-once"),
-    pytest.param(["publish", "--from", "@packet"], "pending", id="publish"),
+    pytest.param(["publish", "--from", "@packet", "--no-derive"], "pending", id="publish"),
     pytest.param(["verdict", "--packet", "any-id", "--decision", "Approve"], "pending",
                  id="verdict"),
     pytest.param(["verdicts"], "verdicts", id="verdicts"),
@@ -430,7 +456,7 @@ def test_every_lane_command_refuses_a_symlinked_root_or_lane(root, tmp_path, cap
 # to do with the hop that was broken. Symlinking a lane further down the list is what isolates it —
 # `next` finds a perfectly good packet in `pending/`, claims it, and only then walks into `claimed/`.
 _WRITING_COMMANDS = (
-    pytest.param(["publish", "--from", "@packet"], id="publish"),
+    pytest.param(["publish", "--from", "@packet", "--no-derive"], id="publish"),
     pytest.param(["next"], id="next"),
     pytest.param(["verdict", "--packet", "@packet_id", "--decision", "Approve"], id="verdict"),
     pytest.param(["consult-publish", "--from", "@consult"], id="consult-publish"),
@@ -550,7 +576,7 @@ _ROOT_REFUSAL_COMMANDS = (
     pytest.param(["next", "--peek"], "pending", id="next-peek"),
     pytest.param(["tier"], "pending", id="tier"),
     pytest.param(["watch", "--once"], "pending", id="watch-once"),
-    pytest.param(["publish", "--from", "@packet"], "pending", id="publish"),
+    pytest.param(["publish", "--from", "@packet", "--no-derive"], "pending", id="publish"),
     pytest.param(["verdict", "--packet", "any-id", "--decision", "Approve"], "pending", id="verdict"),
     pytest.param(["verdicts"], "verdicts", id="verdicts"),
     pytest.param(["verdicts", "--ack"], "verdicts", id="verdicts-ack"),

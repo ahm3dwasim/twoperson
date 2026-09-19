@@ -161,7 +161,9 @@ def _drive_check_cli(root):
 def _drive_publish_cli(root, tmp_path):
     packet_file = tmp_path / "sweep-packet.json"
     packet_file.write_text(json.dumps(valid_packet()), encoding="utf-8")
-    return main(["publish", "--from", str(packet_file)])
+    # --no-derive: the fixture's head is synthetic, so this reaches the syscall the sweep is
+    # driving instead of the (unrelated) diff-derivation refusal.
+    return main(["publish", "--no-derive", "--from", str(packet_file)])
 
 
 def _drive_watch_scan(root):
