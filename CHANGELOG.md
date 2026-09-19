@@ -20,6 +20,23 @@ All notable changes to this project are documented here. The format follows
   commits, and the new `diff_provenance` field ("derived" or "claimed") records which happened so a
   published packet never leaves it to be guessed. A packet published before this field existed
   reads as `"claimed"`, the unfavourable default.
+- Derivation now requires `base_sha` to be a PROPER ancestor of `head_sha`
+  (`git merge-base --is-ancestor`), not merely a sha that also happens to resolve: `base_sha ==
+  head_sha` used to "derive" an empty diff for any packet, and a `base_sha` naming an unrelated
+  commit (a different branch, a stale fork point, a typo) resolved and derived just as happily
+  against the wrong history. Both are now refused. When the packet's `base_ref` also resolves in
+  the publishing checkout, `base_sha` must additionally be reachable from it — this proves the diff
+  is consistent with the commits that checkout actually holds under that ref right now; it does not
+  prove `base_ref` is the project's current upstream default branch, and the check is skipped
+  outright when the ref does not resolve locally (an unfetched remote-tracking ref).
+- A packet that reports `push_status.pushed`/`deployed`/`restarted` for a CONCRETE head is now
+  refused at `verify`/`publish` unless its diff was actually derived (`diff_provenance: "derived"`).
+  `--no-derive` publishes an unverified, self-reported `changed_files` — exactly the shape a builder
+  could previously ship with a test change quietly left off the list, since the test-change
+  acknowledgment gate reasons over whatever `changed_files` a shipped packet arrives with. A claimed
+  diff for a concrete head can no longer be the basis for a ship; `--no-derive` remains available
+  for drafts and for a checkout that genuinely does not hold the commits, neither of which reports a
+  push for a concrete head in the first place.
 - `publish` (never `verify`) refuses a `tests[]` row whose `command` cites a path or a bare Python
   symbol that does not exist at the head being published — a stale reproduction step copied forward
   from an earlier round. It is a necessary condition, not a sufficient one, and the documented gaps

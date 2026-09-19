@@ -168,15 +168,16 @@ def test_publish_refuses_a_tests_row_citing_a_symbol_the_head_does_not_contain(
 ):
     repo = git_repo(tmp_path)
     repo.write("pkg/mod.py", "def _helper():\n    pass\n")
-    repo.commit("still true")
+    base = repo.commit("still true")
     repo.write("pkg/mod.py", "def _other():\n    pass\n")
-    head = repo.commit("went stale")
-    base = head  # base == head: only the citation is under test here
+    head = repo.commit("went stale")  # a real, proper ancestor relationship — see gitfacts.derive
     monkeypatch.chdir(repo.path)
 
     packet = valid_packet(
         git={"branch": "b", "base_ref": "origin/main", "base_sha": base, "head_sha": head},
-        changed_files=[], diff_summary={"files_changed": 0, "insertions": 0, "deletions": 0},
+        changed_files=[{"path": "pkg/mod.py", "status": "modified", "insertions": 1,
+                        "deletions": 1}],
+        diff_summary={"files_changed": 1, "insertions": 1, "deletions": 1},
         tests=[{"name": "probe", "command": "call `_helper()` directly", "result": "passed",
                "evidence": "n/a"}],
     )
@@ -191,11 +192,12 @@ def test_publish_refuses_a_tests_row_citing_a_symbol_the_head_does_not_contain(
 def test_publish_accepts_a_tests_row_whose_citation_resolves(root, tmp_path, monkeypatch, capsys):
     repo = git_repo(tmp_path)
     repo.write("pkg/mod.py", "def _helper():\n    pass\n")
-    head = repo.commit()
+    base = repo.commit("base")
+    head = repo.commit("head")  # an empty commit: a real ancestor, with nothing left to diff
     monkeypatch.chdir(repo.path)
 
     packet = valid_packet(
-        git={"branch": "b", "base_ref": "origin/main", "base_sha": head, "head_sha": head},
+        git={"branch": "b", "base_ref": "origin/main", "base_sha": base, "head_sha": head},
         changed_files=[], diff_summary={"files_changed": 0, "insertions": 0, "deletions": 0},
         tests=[{"name": "probe", "command": "call `_helper()` directly", "result": "passed",
                "evidence": "n/a"}],
@@ -278,16 +280,222 @@ def test_a_renamed_test_needs_acknowledgment_at_the_derived_path(root, tmp_path,
     assert rc == 0, capsys.readouterr().err
 
 
+# --------------------------------------------------------------------------------------------
+# A derived diff must be of the head against a real base — not merely two shas that both resolve.
+# --------------------------------------------------------------------------------------------
+
+def test_publish_refuses_when_base_equals_head(root, tmp_path, monkeypatch, capsys):
+    repo = git_repo(tmp_path)
+    repo.write("a.txt", "x\n")
+    head = repo.commit("only commit")
+    monkeypatch.chdir(repo.path)
+
+    packet = valid_packet(git={"branch": "b", "base_ref": "origin/main",
+                              "base_sha": head, "head_sha": head})
+    rc = main(["publish", "--from", _write(tmp_path, packet)])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "same commit" in err
+    assert inbox.pending() == []
+
+
+def test_publish_refuses_a_base_unrelated_to_head(root, tmp_path, monkeypatch, capsys):
+    repo = git_repo(tmp_path)
+    repo.write("common.txt", "shared\n")
+    root_commit = repo.commit("root")
+    repo._run("checkout", "-q", "-b", "side", root_commit)
+    repo.write("side.txt", "side\n")
+    unrelated = repo.commit("side branch")
+    repo._run("checkout", "-q", "main")
+    repo.write("main.txt", "main\n")
+    head = repo.commit("main branch")
+    monkeypatch.chdir(repo.path)
+
+    packet = valid_packet(git={"branch": "b", "base_ref": "origin/main",
+                              "base_sha": unrelated, "head_sha": head})
+    rc = main(["publish", "--from", _write(tmp_path, packet)])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "not an ancestor" in err
+    assert inbox.pending() == []
+
+
+def test_publish_refuses_a_base_not_reachable_from_base_ref(root, tmp_path, monkeypatch, capsys):
+    repo = git_repo(tmp_path)
+    repo.write("common.txt", "shared\n")
+    release_point = repo.commit("root")
+    repo._run("branch", "-q", "release", release_point)
+    repo.write("main.txt", "main\n")
+    on_main_only = repo.commit("main-only")
+    repo.write("more.txt", "more\n")
+    head = repo.commit("head")
+    monkeypatch.chdir(repo.path)
+
+    packet = valid_packet(
+        git={"branch": "b", "base_ref": "release", "base_sha": on_main_only, "head_sha": head},
+        changed_files=[{"path": "more.txt", "status": "added", "insertions": 1, "deletions": 0}],
+        diff_summary={"files_changed": 1, "insertions": 1, "deletions": 0},
+    )
+    rc = main(["publish", "--from", _write(tmp_path, packet)])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "not reachable from base_ref" in err
+    assert inbox.pending() == []
+
+
+# --------------------------------------------------------------------------------------------
+# `--no-derive` for a concrete, shipped head can never unlock a ship — the omitted-test bypass.
+# --------------------------------------------------------------------------------------------
+
+def test_no_derive_ship_report_with_an_omitted_test_is_refused(root, tmp_path, monkeypatch, capsys):
+    """The exact bypass this closes: a ship report published with --no-derive can self-report a
+    `changed_files` that omits an altered test, get an approval that never saw it, and ship the
+    same head with `diff_provenance: "claimed"` — unless a claimed diff for a concrete head is
+    refused outright, before its `changed_files` is ever trusted for the test-change ack check."""
+    from twoperson.verdict import build_verdict
+
+    repo = git_repo(tmp_path)
+    repo.write("src/thing.py", "x = 1\n")
+    repo.write("tests/test_thing.py", "def test_x(): assert True\n")
+    base = repo.commit("base")
+    repo.write("src/thing.py", "x = 2\n")
+    repo.write("tests/test_thing.py", "def test_x(): assert False\n")
+    head = repo.commit("head")
+    monkeypatch.chdir(repo.path)
+
+    # A prior, honestly-derived reviewed packet and an approval of it — the reviewer never
+    # acknowledged the test change because nothing (yet) told it a test changed.
+    inbox.publish(valid_packet(
+        packet_id="reviewed-1",
+        git={"branch": "b", "base_ref": "origin/main", "base_sha": base, "head_sha": head},
+        changed_files=[{"path": "src/thing.py", "status": "modified", "insertions": 1,
+                        "deletions": 1}],
+        diff_summary={"files_changed": 1, "insertions": 1, "deletions": 1},
+    ))
+    verdict_id = inbox.publish_verdict(
+        build_verdict(packet_id="reviewed-1", decision="Approve", head_sha=head)).stem
+
+    ship = valid_packet(
+        packet_id="ship-1",
+        git={"branch": "b", "base_ref": "origin/main", "base_sha": base, "head_sha": head},
+        # Self-reported, and OMITS tests/test_thing.py — the head actually modifies it.
+        changed_files=[{"path": "src/thing.py", "status": "modified", "insertions": 1,
+                        "deletions": 1}],
+        diff_summary={"files_changed": 1, "insertions": 1, "deletions": 1},
+    )
+    ship["push_status"].update(pushed=True, review_ref=verdict_id,
+                               statement="Shipped after the recorded approval.")
+    rc = main(["publish", "--no-derive", "--from", _write(tmp_path, ship, name="ship.json")])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "diff_provenance" in err
+    assert "'claimed'" in err
+    assert not any("ship-1" in str(p) for p in inbox.pending())
+
+
+def test_a_verdict_for_a_properly_derived_packet_cannot_be_reused_by_a_claimed_ship_report(
+    root, tmp_path, monkeypatch, capsys,
+):
+    """The mirror question the finding asks: even when the REVIEWED packet went through real
+    derivation (git-verified `changed_files`, a verdict that honestly acknowledges the actual test
+    change), a SEPARATE ship report citing that same approval is still refused if IT is claimed for
+    a concrete head — the ship packet's own provenance is what gates it, not the packet the cited
+    verdict was originally written against."""
+    from twoperson.testset import altered_test_files
+    from twoperson.verdict import build_verdict
+
+    repo = git_repo(tmp_path)
+    repo.write("src/thing.py", "x = 1\n")
+    repo.write("tests/test_thing.py", "def test_x(): assert True\n")
+    base = repo.commit("base")
+    repo.write("src/thing.py", "x = 2\n")
+    repo.write("tests/test_thing.py", "def test_x(): assert False\n")
+    head = repo.commit("head")
+    monkeypatch.chdir(repo.path)
+
+    reviewed = valid_packet(
+        packet_id="reviewed-honest",
+        git={"branch": "b", "base_ref": "origin/main", "base_sha": base, "head_sha": head},
+        changed_files=[
+            {"path": "src/thing.py", "status": "modified", "insertions": 1, "deletions": 1},
+            {"path": "tests/test_thing.py", "status": "modified", "insertions": 1, "deletions": 1},
+        ],
+        diff_summary={"files_changed": 2, "insertions": 2, "deletions": 2},
+    )
+    rc = main(["publish", "--from", _write(tmp_path, reviewed, name="reviewed.json")])
+    assert rc == 0, capsys.readouterr().err
+    published = inbox._load(inbox.pending()[0])
+    assert published["diff_provenance"] == "derived"
+
+    acked = altered_test_files(published["changed_files"])
+    assert acked == ["tests/test_thing.py"]
+    verdict_id = inbox.publish_verdict(
+        build_verdict(packet_id="reviewed-honest", decision="Approve", head_sha=head,
+                      acknowledged_tests=acked)).stem
+
+    # A separate ship report, same head, citing that honest approval — but published claimed and
+    # omitting the test file from its own self-report.
+    ship = valid_packet(
+        packet_id="ship-reuse",
+        git={"branch": "b", "base_ref": "origin/main", "base_sha": base, "head_sha": head},
+        changed_files=[{"path": "src/thing.py", "status": "modified", "insertions": 1,
+                        "deletions": 1}],
+        diff_summary={"files_changed": 1, "insertions": 1, "deletions": 1},
+    )
+    ship["push_status"].update(pushed=True, review_ref=verdict_id,
+                               statement="Shipped after the recorded approval.")
+    rc = main(["publish", "--no-derive", "--from", _write(tmp_path, ship, name="ship-reuse.json")])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "diff_provenance" in err
+    assert not any("ship-reuse" in str(p) for p in inbox.pending())
+
+
+def test_verify_also_refuses_a_no_derive_ship_for_a_concrete_head(root, tmp_path, capsys):
+    """`verify` mirrors `publish`'s refusal here too — it must fail for every reason publish would,
+    including one that only exists because a flag was passed, not because of a git-shaped defect."""
+    from twoperson.verdict import build_verdict
+
+    inbox.publish(valid_packet(
+        packet_id="reviewed-x",
+        git={"branch": "b", "base_ref": "origin/main", "base_sha": "a" * 40, "head_sha": "b" * 40},
+    ))
+    verdict_id = inbox.publish_verdict(
+        build_verdict(packet_id="reviewed-x", decision="Approve", head_sha="b" * 40)).stem
+
+    packet = valid_packet(
+        packet_id="ship-x",
+        git={"branch": "b", "base_ref": "origin/main", "base_sha": "a" * 40, "head_sha": "b" * 40},
+    )
+    packet["push_status"].update(pushed=True, review_ref=verdict_id,
+                                 statement="Shipped after the recorded approval.")
+    rc = main(["verify", "--no-derive", "--from", _write(tmp_path, packet)])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "diff_provenance" in err
+
+
+def test_a_draft_that_never_ships_is_unaffected_by_the_unverified_ship_check(root, tmp_path, capsys):
+    """The new check is scoped to a packet that actually reports shipping — a claimed draft with no
+    push at all must still publish exactly as before."""
+    packet = valid_packet(git={"branch": "b", "base_ref": "origin/main",
+                              "base_sha": "unknown", "head_sha": "unknown"})
+    rc = main(["publish", "--no-derive", "--from", _write(tmp_path, packet)])
+    assert rc == 0, capsys.readouterr().err
+    assert inbox.pending() != []
+
+
 def test_verify_never_checks_citations(root, tmp_path, monkeypatch, capsys):
     """The check reads the repository at the head being published; `verify` may run anywhere and
     must not depend on it."""
     repo = git_repo(tmp_path)
     repo.write("pkg/mod.py", "def _other():\n    pass\n")
-    head = repo.commit()
+    base = repo.commit("base")
+    head = repo.commit("head")  # an empty commit: a real ancestor, with nothing left to diff
     monkeypatch.chdir(repo.path)
 
     packet = valid_packet(
-        git={"branch": "b", "base_ref": "origin/main", "base_sha": head, "head_sha": head},
+        git={"branch": "b", "base_ref": "origin/main", "base_sha": base, "head_sha": head},
         changed_files=[], diff_summary={"files_changed": 0, "insertions": 0, "deletions": 0},
         tests=[{"name": "probe", "command": "call `_never_existed_anywhere()` directly",
                "result": "passed", "evidence": "n/a"}],

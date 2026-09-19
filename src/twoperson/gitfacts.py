@@ -89,17 +89,55 @@ def concrete(sha: Any) -> bool:
     return isinstance(sha, str) and sha != UNKNOWN and bool(_SHA_RE.match(sha))
 
 
+def _rev_parse(repo: Path, ref: str) -> str | None:
+    """The commit sha ``ref`` names in ``repo``, or ``None`` if it does not resolve locally.
+
+    Never raises — this is a probe, used both by `resolvable` (does a claimed sha exist at all) and
+    by `derive` (does a claimed `base_ref` resolve in THIS checkout, so it is worth checking against
+    at all — a ref this checkout never fetched is simply not a check `derive` can make).
+    """
+    try:
+        out = _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+    except GitFactsError:
+        return None
+    return out.strip() or None
+
+
 def resolvable(repo: Path | str, *shas: str) -> bool:
     """True when every sha names a commit in ``repo``. Never raises — this is a probe."""
     repo = Path(repo)
     for sha in shas:
         if not concrete(sha):
             return False
-        try:
-            _git(repo, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}")
-        except GitFactsError:
+        if _rev_parse(repo, sha) is None:
             return False
     return True
+
+
+def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    """True when ``ancestor`` is reachable from ``descendant`` in ``repo``'s commit graph.
+
+    `git merge-base --is-ancestor` answers exactly this: exit 0 is yes, exit 1 is no — a real
+    answer, not a failure, and the one case where a non-zero exit from this module is NOT a
+    refusal. Any other exit code (git itself missing, a ref that does not resolve) is the same
+    refusal every other call in this module gives, never silently read as "not an ancestor".
+    A commit is its own ancestor here, same as git's own definition — callers that need a
+    *proper* ancestor (this module's own `derive`) check ``ancestor != descendant`` themselves.
+    """
+    try:
+        result = subprocess.run(
+            ("git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, descendant),
+            capture_output=True, timeout=_GIT_TIMEOUT_S, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GitFactsError(f"git merge-base --is-ancestor failed: {exc}") from exc
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    stderr = result.stderr.decode("utf-8", "replace").strip()
+    raise GitFactsError(
+        f"git merge-base --is-ancestor {ancestor} {descendant} failed: {stderr or 'no output'}")
 
 
 def _split_z(output: str) -> list[str]:
@@ -176,13 +214,31 @@ def _parse_numstat(output: str) -> dict[str, tuple[int, int]]:
     return counts
 
 
-def derive(repo: Path | str, base_sha: str, head_sha: str) -> dict[str, Any]:
+def derive(repo: Path | str, base_sha: str, head_sha: str, base_ref: str | None = None) -> dict[str, Any]:
     """``changed_files`` + ``diff_summary`` for ``base_sha...head_sha``, computed from the repo.
 
     The three-dot form is deliberate: it describes what the branch ADDS relative to the merge base,
     which is what a reviewer reads, and does not report unrelated commits that landed on the base
     since the branch started. ``-M`` turns a delete-plus-add pair the tool would otherwise report as
     two unrelated entries into one ``"renamed"`` entry with `old_path` set.
+
+    **A derived diff must be the diff of the head against its declared base, not against anything
+    that merely resolves.** Both shas resolving is necessary but not sufficient: `base_sha ==
+    head_sha` resolves and "derives" an empty diff for any packet, and a `base_sha` that resolves to
+    some unrelated commit (a different branch, a stale fork point, a typo) resolves too — either way
+    the three-dot diff is well-formed and *wrong*. This refuses unless `base_sha` is a PROPER
+    ancestor of `head_sha` (`git merge-base --is-ancestor`, and not equal to it): that is the one
+    relationship every real "here is my branch's diff" claim has, and it is what makes the derived
+    numbers actually describe the change the packet is reporting rather than a diff against whatever
+    the builder happened to name.
+
+    When `base_ref` is also given and resolves in THIS checkout, `base_sha` must additionally be
+    reachable from it. **What that does and does not prove**: it proves the diff is consistent with
+    the commits this checkout actually holds under that ref name right now — it does NOT prove
+    `base_ref` is the project's current upstream default branch, and it proves nothing when the ref
+    does not resolve here at all (an unfetched remote-tracking ref), in which case this half of the
+    check is simply not attempted, the same way derivation itself is not attempted against a
+    non-concrete head.
     """
     repo = Path(repo)
     if not resolvable(repo, base_sha, head_sha):
@@ -191,6 +247,28 @@ def derive(repo: Path | str, base_sha: str, head_sha: str) -> dict[str, Any]:
             "are not in this repository. Publish from a checkout that holds them, or pass "
             "--no-derive to state explicitly that the diff evidence is unverified."
         )
+    if base_sha == head_sha:
+        raise GitFactsError(
+            f"base_sha and head_sha are the same commit ({head_sha[:12]}) — there is no diff to "
+            "derive. A derived diff must be of the head against a PROPER ancestor of it, never "
+            "against itself; state a real base, or pass --no-derive to publish the claim unverified."
+        )
+    if not _is_ancestor(repo, base_sha, head_sha):
+        raise GitFactsError(
+            f"base_sha {base_sha[:12]} is not an ancestor of head_sha {head_sha[:12]} in {repo} — "
+            "a derived diff must be of the head against a commit actually in its history, not an "
+            "unrelated one. Correct git.base_sha, or pass --no-derive to publish the claim "
+            "unverified."
+        )
+    if base_ref is not None:
+        base_ref_sha = _rev_parse(repo, base_ref)
+        if base_ref_sha is not None and not _is_ancestor(repo, base_sha, base_ref_sha):
+            raise GitFactsError(
+                f"base_sha {base_sha[:12]} is not reachable from base_ref {base_ref!r} "
+                f"({base_ref_sha[:12]}) in {repo} — the packet's declared base is not on the "
+                "branch it claims to be based on. Correct git.base_sha or git.base_ref, or pass "
+                "--no-derive to publish the claim unverified."
+            )
     status_rows = _parse_name_status(
         _git(repo, "diff", "--name-status", "-M", "-z", f"{base_sha}...{head_sha}"))
     if len(status_rows) > MAX_DERIVED_FILES:

@@ -732,6 +732,14 @@ def assert_review_ref_resolves(packet: Mapping[str, Any], *, root: Path | str | 
     changes cannot silently unlock a DIFFERENT ship report's different test changes at the same
     head — `changed_files` is self-reported per packet, and a bare boolean acknowledgment could be
     replayed across reports.
+
+    This function reasons over whatever `changed_files` the packet ARRIVES with, self-reported or
+    derived — it has no way to tell the two apart, and that is deliberate: it is also the function
+    every synthetic-sha test in this suite calls directly, with a `changed_files` that was never put
+    through `twoperson.gitfacts` at all. The property that a CLAIMED (underived) diff can never be
+    the basis for a ship is enforced one layer up, at the CLI (`twoperson.__main__._dispatch`),
+    which is the one caller that knows whether `--no-derive` was used and can refuse before this
+    function — and `inbox.publish` — are ever reached. See docs/PROTOCOL.md §2a.
     """
     push = packet["push_status"]
     if not (push["pushed"] or push["deployed"] or push["restarted"]):

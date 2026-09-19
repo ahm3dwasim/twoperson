@@ -114,6 +114,19 @@ first would mask them behind a single git-shaped refusal. Once derivation succee
 `acknowledged_tests` binding (rule 5) and everything else that reads a published packet's
 `changed_files` afterward reasons over the checked truth, not the original claim.
 
+**Both shas resolving is necessary, not sufficient.** `git.base_sha` must be a PROPER ancestor of
+`git.head_sha` (`git merge-base --is-ancestor`, and not equal to it) or derivation refuses outright:
+a `base_sha` equal to `head_sha` resolves and "derives" an empty diff for any packet, and a
+`base_sha` that resolves to some unrelated commit — a different branch, a stale fork point, a typo —
+resolves too, and derives a well-formed diff against the *wrong* history. When `git.base_ref` also
+resolves in the checkout doing the deriving, `base_sha` must additionally be reachable from it.
+**What that does and does not prove**: it proves the diff is consistent with the commits that
+checkout actually holds under that ref name right now. It does **not** prove `base_ref` is the
+project's current upstream default branch — this tool never fetches or asks a remote anything — and
+it proves nothing at all when the ref does not resolve locally (an unfetched remote-tracking ref, or
+the schema's own `"unknown"`), in which case this half of the check is simply not attempted, the
+same way derivation itself is not attempted against a non-concrete head.
+
 A packet naming no concrete head yet — a draft, a round proposing nothing to merge — is not
 refused; deriving is simply not attempted, and the command says so. `--no-derive` is the
 deliberate escape hatch for a checkout that does not hold the commits: it publishes the diff
@@ -122,6 +135,16 @@ than quietly. Either way, the packet's `diff_provenance` field records which hap
 or `"claimed"` — so a reader of a published packet never has to guess; a packet published before
 this field existed reads as `"claimed"`, the unfavourable default, never upgraded to `"derived"`
 for free.
+
+**A claimed diff can never be the basis for a ship.** `--no-derive` publishes `changed_files`
+exactly as the builder typed it, unchecked — which means the test-change acknowledgment gate (rule
+5) would otherwise reason over a list a builder could shape at will, including by simply omitting an
+altered test. `verify`/`publish` therefore refuse a packet outright when it reports
+`push_status.pushed`/`deployed`/`restarted` for a **concrete** head while `diff_provenance` is
+anything other than `"derived"` — before that packet's `changed_files` is ever trusted for the
+acknowledgment check or handed to `inbox.publish`. `--no-derive` remains exactly what it says it is
+for: a draft, or a checkout that genuinely does not hold the commits — neither of which reports a
+push for a concrete head in the first place, so nothing legitimate is blocked by this.
 
 **A `tests[]` row's `command` is checked at `publish` (never `verify`) against the head being
 published.** A row is a claim that a run can be repeated; `twoperson.citations` resolves the paths
@@ -230,7 +253,7 @@ the ladder.
 |---|---|---|
 | `template` | builder | Emit a skeleton packet. Evidence fields (task/session/run ids, goal, shas, counts, tests, evidence, model and impact) are `unknown`. Fixed placeholders: `schema_version`; `packet_id` `replace-me`; `created_at` `1970-01-01T00:00:00Z`; `git.base_ref` `origin/main`; `acceptance_criteria` `["unknown"]`; push flags `false` with the no-push statement; every other list empty. |
 | `verify --from p.json` | builder | Validate a packet without writing anything, deriving `changed_files`/`diff_summary` against its named head (§2a). Exit 2 if rejected. |
-| `publish --from p.json` | builder | Validate, derive diff evidence, check `tests[]` citations against the head (§2a), and land the packet in `pending/`. `--no-derive` skips both git checks and publishes the claim unverified. |
+| `publish --from p.json` | builder | Validate, derive diff evidence, check `tests[]` citations against the head (§2a), and land the packet in `pending/`. `--no-derive` skips both git checks and publishes the claim unverified — it can never lead to a ship for a concrete head (§2a). |
 | `check` | reviewer | Is a packet waiting? Exit 0 = yes, 1 = no, 2 = the lane could not be read in full. Costs no model tokens. |
 | `list` | reviewer | What is waiting, oldest first. Exits 2 rather than listing nothing if a lane could not be read in full. |
 | `next` | reviewer | Claim the oldest packet and render it for audit. |

@@ -125,6 +125,15 @@ The values above were derived from the head; correct the packet, or pass --no-de
 to publish an explicitly unverified claim instead.
 ```
 
+Both shas resolving isn't enough on its own, either: `base_sha` has to be a genuine ancestor of
+`head_sha` (checked with `git merge-base --is-ancestor`), or derivation refuses. Without that, a
+`base_sha` equal to `head_sha` would "derive" an empty diff for anything, and a `base_sha` that
+happens to resolve to some unrelated commit would derive a clean-looking diff against the wrong
+history entirely. When the packet's `base_ref` also resolves in the publishing checkout, `base_sha`
+has to be reachable from it too — proving the diff is consistent with what that checkout actually
+holds under that ref, not that the ref is the project's real upstream default branch, and this half
+of the check is simply skipped when the ref isn't fetched locally.
+
 Once derivation succeeds, the packet's `changed_files`/`diff_summary` are the derived values, not
 the original claim — so `--ack-test-changes` and everything else that reads a published packet
 afterward reasons over checked truth. A packet naming no concrete head yet (a draft) is not
@@ -132,6 +141,14 @@ refused, and `--no-derive` is the deliberate escape hatch for a checkout that do
 commits: it publishes the claim unverified and says so on stderr. Either way, the packet's
 `diff_provenance` field records which happened — `derived` or `claimed` — so nobody has to guess
 from a published packet alone; one from before this field existed reads as `claimed`.
+
+That matters beyond bookkeeping: a packet reporting `push_status.pushed`/`deployed`/`restarted` for
+a concrete head is refused outright unless `diff_provenance` is `derived`. Otherwise `--no-derive`
+would let a shipped report carry a self-typed `changed_files` — including one that simply leaves an
+altered test off the list, so the test-change acknowledgment check above never sees it. A claimed
+diff can never be the basis for a ship; `--no-derive` stays available for what it's actually for —
+drafts, and checkouts that genuinely don't hold the commits — neither of which ships a concrete head
+in the first place.
 
 `publish` (never `verify` — it may run anywhere, without the commit checked out) also checks every
 `tests[]` row's `command` for a path or a bare symbol that does not exist at the head being

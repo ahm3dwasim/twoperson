@@ -11,6 +11,11 @@ from tests.fixtures import git_repo
 from twoperson.gitfacts import GitFactsError, concrete, derive, disagreement, resolvable
 from twoperson.packet import UNKNOWN
 
+# --------------------------------------------------------------------------------------------
+# derive() must refuse a base that only RESOLVES, when it does not actually describe the head's
+# history — a base equal to the head, an unrelated commit, or one not reachable from base_ref.
+# --------------------------------------------------------------------------------------------
+
 
 def test_concrete_distinguishes_unknown_from_a_real_looking_sha():
     assert concrete("a" * 40) is True
@@ -102,6 +107,84 @@ def test_derive_refuses_when_git_itself_fails(tmp_path, monkeypatch):
     monkeypatch.setattr(gitfacts_mod.subprocess, "run", _broken_run)
     with pytest.raises(GitFactsError):
         derive(repo.path, base, head)
+
+
+def test_derive_refuses_base_equal_to_head(tmp_path):
+    """`base_sha == head_sha` resolves fine and "derives" an empty diff for ANY packet — exactly the
+    bypass this closes: a shipped report could name any commit as both its base and its head and
+    walk away with a clean, empty, "derived" diffstat regardless of what actually changed."""
+    repo = git_repo(tmp_path)
+    repo.write("a.txt", "x\n")
+    head = repo.commit("only commit")
+    with pytest.raises(GitFactsError, match="same commit"):
+        derive(repo.path, head, head)
+
+
+def test_derive_refuses_a_base_unrelated_to_the_head(tmp_path):
+    """A `base_sha` that resolves but is not in the head's history at all — a different branch, a
+    stale fork point, a typo — must not be silently treated as "the" base to diff against."""
+    repo = git_repo(tmp_path)
+    repo.write("common.txt", "shared\n")
+    root = repo.commit("root")
+    repo._run("checkout", "-q", "-b", "side", root)
+    repo.write("side.txt", "side\n")
+    unrelated = repo.commit("side branch")
+    repo._run("checkout", "-q", "main")
+    repo.write("main.txt", "main\n")
+    head = repo.commit("main branch")
+    with pytest.raises(GitFactsError, match="not an ancestor"):
+        derive(repo.path, unrelated, head)
+
+
+def test_derive_accepts_a_real_ancestor(tmp_path):
+    """The positive case for the ancestry check: a genuine parent commit is accepted exactly as
+    before this closed the base==head / unrelated-base gaps."""
+    repo = git_repo(tmp_path)
+    repo.write("a.txt", "one\n")
+    base = repo.commit("base")
+    repo.write("a.txt", "one\ntwo\n")
+    head = repo.commit("head")
+    facts = derive(repo.path, base, head)
+    assert facts["diff_summary"]["files_changed"] == 1
+
+
+def test_derive_refuses_a_base_not_reachable_from_base_ref(tmp_path):
+    """`base_ref` names a real, resolvable branch in this checkout, but `base_sha` is not on it —
+    the packet's declared base is not on the branch it claims to be based on."""
+    repo = git_repo(tmp_path)
+    repo.write("common.txt", "shared\n")
+    root = repo.commit("root")
+    repo._run("branch", "-q", "release", root)
+    repo.write("main.txt", "main\n")
+    on_main_only = repo.commit("main-only")
+    repo.write("more.txt", "more\n")
+    head = repo.commit("head")
+    with pytest.raises(GitFactsError, match="not reachable from base_ref"):
+        derive(repo.path, on_main_only, head, base_ref="release")
+
+
+def test_derive_accepts_a_base_reachable_from_base_ref(tmp_path):
+    repo = git_repo(tmp_path)
+    repo.write("a.txt", "one\n")
+    base = repo.commit("base")
+    repo._run("branch", "-q", "release", base)
+    repo.write("a.txt", "one\ntwo\n")
+    head = repo.commit("head")
+    facts = derive(repo.path, base, head, base_ref="release")
+    assert facts["diff_summary"]["files_changed"] == 1
+
+
+def test_derive_skips_the_base_ref_check_when_the_ref_does_not_resolve_locally(tmp_path):
+    """`base_ref` naming an unfetched remote-tracking ref (or the schema's own `unknown` default)
+    must not be treated as a refusal — the check simply is not attempted, same as derivation itself
+    against a non-concrete head."""
+    repo = git_repo(tmp_path)
+    repo.write("a.txt", "one\n")
+    base = repo.commit("base")
+    repo.write("a.txt", "one\ntwo\n")
+    head = repo.commit("head")
+    facts = derive(repo.path, base, head, base_ref="origin/main")
+    assert facts["diff_summary"]["files_changed"] == 1
 
 
 def test_derive_caps_an_unreviewably_wide_change(tmp_path):
