@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping
 
-__all__ = ["ESCALATE_PREFIX", "HEAVY_MARKERS", "TIERS", "Classification", "classify_packet",
+__all__ = ["DOCS_ONLY_CEILING", "ESCALATE_PREFIX", "HEAVY_MARKERS", "TIERS", "Classification", "classify_packet",
            "classify_consult", "is_escalation", "tier_env"]
 
 Tier = Literal["low", "medium", "high", "critical"]
@@ -30,6 +30,9 @@ ESCALATE_PREFIX = "ESCALATE:"
 
 #: Words in a review area or a changed path that mark a change as one where a wrong approval is
 #: expensive. Case-insensitive substrings; extend for your project, never shorten for a packet.
+#: The highest score a change touching no executable path may reach — the top of `medium`.
+DOCS_ONLY_CEILING = 6
+
 HEAVY_MARKERS: tuple[str, ...] = (
     "security", "auth", "credential", "secret", "vault", "payment", "billing", "deploy",
     "migration", "infra", "delete", "policy", "routing", "release", "kernel",
@@ -43,12 +46,18 @@ class Classification:
     reasons: tuple[str, ...]
 
 
+#: Score -> tier. Calibrated against a real corpus of 562 audited packets, not by feel. The first
+#: bands (critical >=9, high >=6, medium >=3) put 210 of them on `critical` and 250 on `high`: 82%
+#: of audits began at or above the second-most-expensive rung and 75% never touched the cheapest,
+#: which is not what "cheapest rung first" means. Measured on that corpus, the top rung alone drew
+#: 78% of all audit input tokens against the cheapest rung's 3%. These bands give low 74 / medium
+#: 270 / high 186 / critical 32 on the same corpus. If you change them, replay your own corpus.
 def _tier_for(score: int) -> Tier:
     if score >= 9:
         return "critical"
-    if score >= 6:
+    if score >= 7:
         return "high"
-    if score >= 3:
+    if score >= 4:
         return "medium"
     return "low"
 
@@ -112,17 +121,26 @@ def classify_packet(packet: Mapping[str, Any]) -> Classification:
         score += 1
         reasons.append("tests not run or not stated (+1)")
 
-    if packet.get("open_questions"):
-        score += 1
-        reasons.append("open questions for the reviewer (+1)")
-    if len(packet.get("tradeoffs", []) or []) > 2:
-        score += 1
-        reasons.append("several stated tradeoffs (+1)")
+    # `open_questions` and `tradeoffs` deliberately score NOTHING. They each used to add +1, which
+    # charged a builder for candour: stating what you are unsure about and what you traded away is
+    # what a careful packet does, and those two points were routinely the ones that pushed ordinary
+    # work over the `critical` line. A packet that hid its uncertainty got the cheaper reviewer.
+    # Difficulty is read from what CHANGED, never from how honestly it was described.
 
     push = packet.get("push_status", {}) or {}
     if push.get("pushed") or push.get("deployed") or push.get("restarted"):
         score += 2
         reasons.append("ship report: something already moved (+2)")
+
+    # A change touching no executable path cannot break production, whatever surface its prose is
+    # about: a policy document naming `security` and `routing` scored exactly as high as a change to
+    # the router. Capped, not exempted — a document change still deserves a careful read, and
+    # `medium` is one. The test is the file list, never the packet's description of itself.
+    if paths and not [q for q in paths
+                      if not (q.endswith(".md") or q.endswith(".txt") or q.startswith("docs/"))]:
+        if score > DOCS_ONLY_CEILING:
+            reasons.append(f"docs-only change: capped from {score} to {DOCS_ONLY_CEILING}")
+            score = DOCS_ONLY_CEILING
 
     return Classification(tier=_tier_for(score), score=score, reasons=tuple(reasons))
 

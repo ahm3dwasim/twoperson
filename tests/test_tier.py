@@ -9,7 +9,9 @@ from tests.fixtures import packet_for, valid_packet
 from twoperson import inbox, watch
 from twoperson.__main__ import main
 from twoperson.tier import (
+    DOCS_ONLY_CEILING,
     ESCALATE_PREFIX,
+    _tier_for,
     classify_consult,
     classify_packet,
     is_escalation,
@@ -138,3 +140,67 @@ def test_run_command_merges_tier_env_into_the_child_environment(tmp_path, monkey
     while not out.exists() and time.time() < deadline:
         time.sleep(0.05)
     assert out.read_text() == "high"
+
+
+# --- Calibration -------------------------------------------------------------------------------
+#
+# The first bands were chosen by feel and were wrong in a way only a corpus shows. Replayed over 562
+# real audited packets they gave low 9 / medium 92 / high 250 / critical 210: 82% of audits began at
+# or above the second-most-expensive rung and 75% never touched the cheapest, while the top rung
+# alone drew 78% of all audit input tokens against the cheapest rung's 3%. These guards pin the
+# three fixes, and each fails on the behaviour that shipped before them.
+
+
+def _heavy_change(paths):
+    """A packet scoring well above the cap on every axis except which files it touches.
+
+    Same heavy areas, same wide-and-large diff, same failing test in both calls below, so the only
+    variable is the file list. Without that control these tests compare scoring noise, not the cap.
+    """
+    return valid_packet(
+        review_areas=["security", "routing", "policy"],
+        changed_files=[{"path": p, "status": "modified", "insertions": 40, "deletions": 10}
+                       for p in paths],
+        diff_summary={"files_changed": len(paths), "insertions": 900, "deletions": 400},
+        tests=[{"name": "suite", "command": "pytest", "result": "failed", "evidence": "red"}],
+    )
+
+
+def test_disclosure_is_not_charged_as_risk():
+    """`open_questions` and `tradeoffs` each used to add +1 — the packet paid for candour.
+
+    Those two points were routinely the ones that carried an ordinary change over the `critical`
+    line, so a packet that hid its uncertainty was given the cheaper reviewer.
+    """
+    bare = classify_packet(valid_packet(review_areas=["deploy"]))
+    candid = classify_packet(valid_packet(
+        review_areas=["deploy"],
+        open_questions=["is this the right seam?", "should this be gated?"],
+        tradeoffs=["a", "b", "c", "d"]))
+    assert candid.score == bare.score
+
+
+def test_a_docs_only_change_is_capped_below_high():
+    """Prose about `security` and `routing` is not a change to security or routing."""
+    docs = classify_packet(_heavy_change([f"docs/DOC_{i}.md" for i in range(29)] + ["README.md"]))
+    assert docs.score == DOCS_ONLY_CEILING
+    assert docs.tier == "medium"
+    assert any("docs-only" in r for r in docs.reasons), docs.reasons
+
+
+def test_one_executable_file_lifts_the_docs_cap():
+    """The cap keys on the file list, never on how the packet describes itself."""
+    mixed = classify_packet(_heavy_change([f"docs/DOC_{i}.md" for i in range(29)]
+                                          + ["src/twoperson/inbox.py"]))
+    assert mixed.score > DOCS_ONLY_CEILING
+    assert not any("docs-only" in r for r in mixed.reasons)
+
+
+@pytest.mark.parametrize("score,tier", [
+    (0, "low"), (3, "low"), (4, "medium"), (6, "medium"), (7, "high"), (8, "high"),
+    (9, "critical"), (99, "critical"),
+])
+def test_the_bands(score, tier):
+    """Pinned individually. The old bands made 3 medium and 6 high, and those two off-by-one steps
+    are what put ordinary work on expensive rungs."""
+    assert _tier_for(score) == tier
