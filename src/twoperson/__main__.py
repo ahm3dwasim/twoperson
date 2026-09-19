@@ -169,7 +169,11 @@ def _emit_signal(args) -> int:
             note=args.note,
         )
         path = inbox.publish_signal(signal)
-    except (PacketError, OSError) as exc:
+    # `FileNotFoundError` is the one `OSError` the primitive still lets past — a lost race, an entry
+    # another process moved — and it is named here rather than caught as `OSError` so that a refusal
+    # that ever escapes the chain again is a loud traceback in the tests, not a tidy "not emitted"
+    # line here. The refusal itself arrives as `PacketError`, as everywhere else.
+    except (PacketError, FileNotFoundError) as exc:
         print(f"signal not emitted — {exc}", file=sys.stderr)
         return EXIT_NOTHING
     print(str(path))
@@ -227,7 +231,9 @@ def _emit_verdict(args) -> int:
             acknowledged_tests=acknowledged,
         )
         path = inbox.publish_verdict(verdict)
-    except (PacketError, OSError) as exc:
+    # Named, not `OSError` — see `_emit_signal`: the refusal is a `PacketError`, and the only
+    # `OSError` the primitive still lets past is the documented lost race.
+    except (PacketError, FileNotFoundError) as exc:
         return _fail(f"verdict rejected — {exc}")
     print(str(path))
     return EXIT_OK
@@ -275,7 +281,9 @@ def _emit_consult(args) -> int:
             note=args.note,
         )
         path = inbox.publish_advice(advice)
-    except (PacketError, OSError) as exc:
+    # Named, not `OSError` — see `_emit_signal`: the refusal is a `PacketError`, and the only
+    # `OSError` the primitive still lets past is the documented lost race.
+    except (PacketError, FileNotFoundError) as exc:
         return _fail(f"advice rejected — {exc}")
     print(str(path))
     return EXIT_OK
@@ -521,9 +529,16 @@ def main(argv: list[str] | None = None) -> int:
     # including ones not yet written. `check` and `list` keep their own handlers below on purpose:
     # their exit code IS their answer, and a refusal there must never be reported as EXIT_NOTHING by
     # anything, including this net.
+    #
+    # The net catches `PacketError`, the base of BOTH refusal types, not `LaneUnreadable` alone.
+    # `_safefs` can now raise exactly two refusals — `LaneUnreadable` for anything inside a lane and
+    # `SafeFsRefusal` for the root-level files the watcher owns (the lock, the cursor, the mute
+    # switch) — and a net naming one subclass is the same hand-kept list this comment already
+    # rejects: a syscall converted with the other kind, or a third refusal type added later, would
+    # exit `1` with a stack trace, which is the refusal delivered as a crash.
     try:
         return _dispatch(args)
-    except LaneUnreadable as exc:
+    except PacketError as exc:
         return _fail(f"inbox refused — {exc}")
 
 
@@ -549,7 +564,9 @@ def _dispatch(args) -> int:
             return EXIT_OK
         try:
             path = inbox.publish(packet)
-        except (PacketError, OSError) as exc:
+        # Named, not `OSError` — see `_emit_signal`: the refusal is a `PacketError`, and the only
+        # `OSError` the primitive still lets past is the documented lost race.
+        except (PacketError, FileNotFoundError) as exc:
             return _fail(f"publish failed — {exc}")
         print(str(path))
         return EXIT_OK
@@ -616,7 +633,9 @@ def _dispatch(args) -> int:
             return EXIT_OK
         try:
             path = inbox.publish_consult(consult)
-        except (PacketError, OSError) as exc:
+        # Named, not `OSError` — see `_emit_signal`: the refusal is a `PacketError`, and the only
+        # `OSError` the primitive still lets past is the documented lost race.
+        except (PacketError, FileNotFoundError) as exc:
             return _fail(f"consult publish failed — {exc}")
         print(str(path))
         return EXIT_OK

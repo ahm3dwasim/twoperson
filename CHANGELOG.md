@@ -202,6 +202,53 @@ All notable changes to this project are documented here. The format follows
   `tests/test_safefs_guard.py` fails the suite by AST if any other module performs file I/O from
   `os`/`shutil`/`pathlib`. Three prior rounds each fixed the sites they found and the next round
   found the next site; the guard is what makes the fourth round impossible rather than unlikely.
+- **The publish lock leaked a descriptor every time it was taken.** `open_lockfile` returned a file
+  object built with `closefd=False`, so the `handle.close()` every caller performs closed the file
+  object and left the descriptor open. A watcher takes the lock once per tick and a publish takes it
+  once per packet, so a long-running watcher exhausted the process's descriptor table — measured at
+  exactly one descriptor per tick, 200 ticks and 200 publishes each leaking 200. The handle now owns
+  its descriptor, and every failure path between the open and the return closes it.
+- **A read that failed was answered as an empty inbox.** A failing `read` (EIO from the disk) or a
+  failing `fstat` left the primitive as a raw `OSError`; `inbox._next` swallowed `OSError` and
+  reported "no packet waiting", so an unreadable packet was delivered as the same value as an absent
+  one. The read is now converted at the same single point as the rest of the chain, and every caller
+  that caught `OSError` is narrowed to the documented `FileNotFoundError` — a lost race or a
+  provably empty tree — so nothing converts a refusal into an empty answer any more.
+- **`PermissionError` was read as "that name is free", and one bad entry aborted the whole watcher
+  pass.** `stat_nolink` mapped a permission failure to absence (so a name it could not examine was
+  handed back as an available one) and left EIO unwrapped; `watch.scan_new` caught only
+  `LaneUnreadable`, so a single unstatable entry in one lane suppressed notification for a readable
+  packet in another. A stat failure is now a refusal of that entry's lane — reported, with its
+  cursor slice carried forward untouched — and a permission error is never absence.
+- **A deeply nested cursor killed the watcher.** The byte cap bounded how much cursor was read but
+  not how deep it nested: a 400KB array of `[` raised `RecursionError` out of `json.loads` — neither
+  an `OSError` nor a `JSONDecodeError` — and killed the pass it was written to survive. Nesting is
+  caught with the other parse failures, and a cursor of the wrong shape (not a JSON object, a lane
+  key that is not a list of filenames) is answered as "no cursor" with a reason instead of raising
+  from `Cursor.from_json`.
+- **The primitive's error contract is one conversion point, and it is now proved rather than
+  described.** Every syscall `_safefs` makes goes through a single `with _converting(...)` block, so
+  the only exceptions it can raise are its own refusal types plus the documented
+  `FileNotFoundError` cases; `tests/test_safefs_guard.py` fails the suite by AST if a syscall is
+  written outside one, which covers a syscall added in a future commit on the commit that adds it.
+  `tests/test_safefs_faults.py` proves the same contract behaviourally: it collects every `os.*` and
+  `fcntl.*` call from the primitive's own AST and, for each one × `EIO`/`EACCES`/`ENOSPC`, drives
+  every public entry point — publish, claim, peek, quarantine, the `list`/`check`/`publish` CLI, the
+  watch scan, cursor load and save, both locks — asserting a refusal or exit `2` and never `None`,
+  never `[]`, never "nothing waiting", never a raw traceback. Both were revert-proved against the
+  four findings above.
+- **The one boundary net in `main` caught a subclass where the contract has two classes.** `_safefs`
+  raises exactly two refusals — `LaneUnreadable` for anything inside a lane and `SafeFsRefusal` for
+  the root-level files the watcher owns (the lock, the cursor, the mute switch) — but the net caught
+  only the first, so the second would have arrived at the operator as a stack trace with exit `1`,
+  which reads as "nothing to do". The net now catches `PacketError`, the base of both, and a test
+  pins that it is not an `except OSError` in disguise. No command can reach the net with a
+  `SafeFsRefusal` today (`inbox` normalizes refusals into `LaneUnreadable`, and the lock, cursor and
+  switch sites catch `PacketError` locally), so this guards the contract rather than fixing a live
+  crash; it is revert-proved by driving the net at the seam it wraps. The five CLI publish handlers
+  that caught `(PacketError, OSError)` are narrowed to `(PacketError, FileNotFoundError)` — the one
+  `OSError` the primitive still documents, a lost race — so a refusal that ever escapes the chain
+  again fails loudly in the suite instead of being printed as a tidy rejection.
 
 ## [0.1.1] - 2026-09-03
 

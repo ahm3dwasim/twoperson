@@ -214,6 +214,123 @@ def test_the_primitive_actually_makes_the_calls_it_is_exempt_for():
     assert "os.fchmod(" in source, "nothing in the primitive sets a created directory's mode"
 
 
+# --------------------------------------------------------------------------------------------
+# Inside the primitive: one conversion point, proved rather than described.
+#
+# `_safefs` is exempt from the guard above because it is where the calls live. That exemption is only
+# safe if the module's OWN error contract holds, and for four audit rounds it did not: every round
+# found the next syscall whose `OSError` left the module raw. The rule below is the mechanical form
+# of "one conversion point": a syscall inside `_safefs` is written inside a `with _converting(...)`
+# block, or it fails this test. A newly added syscall is therefore covered on the commit that adds
+# it, without a reviewer having to notice.
+# --------------------------------------------------------------------------------------------
+
+#: The modules and the calls on them that are syscalls for THIS rule. Wider than `_MODULE_OPS`,
+#: which answers a different question (which calls move a NAME): `close`, `fsync`, `fchmod`, `write`
+#: and `fdopen` are all descriptor operations that `_MODULE_OPS` deliberately omits, and every one of
+#: them can fail with an errno a caller must see as a refusal.
+_PRIMITIVE_SYSCALLS: dict[str, frozenset[str]] = {
+    "os": frozenset({
+        "open", "read", "write", "close", "fstat", "stat", "lstat", "fchmod", "chmod",
+        "mkdir", "makedirs", "rmdir", "remove", "unlink", "rename", "replace", "link", "symlink",
+        "scandir", "fdopen", "fsync", "fdatasync", "lseek", "truncate", "ftruncate", "dup", "utime",
+    }),
+    "fcntl": frozenset({"flock", "lockf", "fcntl"}),
+}
+
+#: The functions inside the primitive allowed to name a syscall OUTSIDE a `_converting` block, each
+#: with the reason. These are the conversion machinery itself, and one deliberate exception.
+_PRIMITIVE_ALLOWLIST: dict[str, str] = {
+    "close_quietly": "releases a descriptor from a finally block, where raising would replace the "
+                     "outcome that brought us there; EINTR is retried and the rest dropped",
+}
+
+
+def _syscall_shape(node: ast.Call) -> str | None:
+    """``"os.open"`` for a syscall call, else ``None``."""
+    func = node.func
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) \
+            and func.attr in _PRIMITIVE_SYSCALLS.get(func.value.id, ()):
+        return f"{func.value.id}.{func.attr}"
+    return None
+
+
+def _is_converting(node: ast.AST) -> bool:
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "_converting")
+
+
+def _unconverted_syscalls(source: str) -> list[tuple[int, str, str]]:
+    """Every syscall in the primitive that is not inside a `_converting` block.
+
+    The walk carries two pieces of state down the tree and resets the guard on entering a function
+    DEFINITION: a `with` in one function must not appear to cover a sibling's body, and a function in
+    the allowlist is exempt whatever it is nested in.
+    """
+    tree = ast.parse(source)
+    bad: list[tuple[int, str, str]] = []
+
+    def walk(node: ast.AST, guarded: bool, func: str) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            func, guarded = node.name, node.name in _PRIMITIVE_ALLOWLIST
+        if isinstance(node, ast.With) and any(_is_converting(item.context_expr)
+                                              for item in node.items):
+            guarded = True
+        if isinstance(node, ast.Call):
+            shape = _syscall_shape(node)
+            if shape is not None and not guarded:
+                bad.append((node.lineno, shape, func))
+        for child in ast.iter_child_nodes(node):
+            walk(child, guarded, func)
+
+    walk(tree, False, "<module>")
+    return bad
+
+
+def test_every_syscall_in_the_primitive_is_converted_at_one_point():
+    """THE guard for the module's own error contract, and the one the four findings were about.
+
+    Revert-proved in the r5 report: taking `_converting` off `read_regular`'s file-object read (the
+    syscall finding 2 named) turns this red with the line and the spelling, and
+    `tests/test_safefs_faults.py` turns red with it — the structural guard and the behavioural sweep
+    fail together, which is what makes the contract provable rather than asserted.
+    """
+    source = (SOURCE_DIR / PRIMITIVE).read_text(encoding="utf-8")
+    bad = _unconverted_syscalls(source)
+    assert not bad, (
+        "these syscalls in the primitive can raise a raw OSError past every caller's refusal "
+        "handler — put them inside `with _converting(label, verb, kind[, passthrough])`:\n  "
+        + "\n  ".join(f"_safefs.py:{line} calls {shape} in {func}()" for line, shape, func in bad)
+    )
+
+
+def test_the_conversion_rule_actually_covers_the_syscalls_the_primitive_calls():
+    """A rule with nothing to check is not a rule. This pins that the sweep has real work to do."""
+    source = (SOURCE_DIR / PRIMITIVE).read_text(encoding="utf-8")
+    shapes = {_syscall_shape(node) for node in ast.walk(ast.parse(source))
+              if isinstance(node, ast.Call)}
+    for required in ("os.open", "os.mkdir", "os.fchmod", "os.fstat", "os.fdopen", "os.write",
+                     "os.fsync", "os.close", "os.scandir", "os.stat", "os.unlink", "os.rename",
+                     "os.replace", "fcntl.flock"):
+        assert required in shapes, (
+            f"the primitive no longer calls {required} — if that is a refactor, this list and the "
+            f"sweep's are both stale; if it is not, a syscall moved somewhere this rule cannot see"
+        )
+
+
+def test_every_primitive_allowlist_entry_names_a_real_function_and_a_real_reason():
+    """An allowlist entry here is a claim that a function may raise outside the contract."""
+    tree = ast.parse((SOURCE_DIR / PRIMITIVE).read_text(encoding="utf-8"))
+    defined = {node.name for node in ast.walk(tree)
+               if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    for name, reason in _PRIMITIVE_ALLOWLIST.items():
+        assert name in defined, f"{name} is allowlisted but not defined in the primitive"
+        assert len(reason) >= _MIN_REASON, f"{name} — the reason is not a reason: {reason!r}"
+    assert set(_PRIMITIVE_ALLOWLIST) == {"close_quietly"}, (
+        "a second exception to the conversion rule is a change to the error contract, not a detail"
+    )
+
+
 @pytest.mark.parametrize("module,shape,reason", [
     (module, shape, reason)
     for module, entries in ALLOWLIST.items()

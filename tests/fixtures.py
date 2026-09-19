@@ -160,22 +160,45 @@ def _called_from_package() -> bool:
     return False
 
 
-def fault(errno_value: int, real, detail: str = ""):
-    """A replacement for ``real`` that raises ``OSError(errno_value)`` — from this package only."""
-    def raiser(*args, **kwargs):
-        if _called_from_package():
-            raise OSError(errno_value, detail or os.strerror(errno_value))
-        return real(*args, **kwargs)
-    return raiser
+class Fault:
+    """A monkeypatch target that fails with one errno — inside this package, and only there.
+
+    ``fired`` is what makes a sweep assertion honest: a driver can only be required to REFUSE when
+    the syscall it was told about was actually reached. Without the flag, a row for a syscall a given
+    entry point never calls would have to choose between asserting nothing and asserting something
+    false, and a sweep full of the first is a sweep that cannot fail.
+    """
+
+    def __init__(self, errno_value: int, real, detail: str = ""):
+        self.errno_value = errno_value
+        self.real = real
+        self.detail = detail or os.strerror(errno_value)
+        self.fired = False
+        self.calls = 0
+        #: Disarmed while a test BUILDS the tree a driver is about to be run against: a fault that
+        #: is armed during setup breaks the setup, and then the row reports "there was nothing
+        #: there" as if it were "the operation refused".
+        self.armed = True
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        if self.armed and _called_from_package():
+            self.fired = True
+            raise OSError(self.errno_value, self.detail)
+        return self.real(*args, **kwargs)
+
+    def reset(self) -> None:
+        self.fired = False
+        self.calls = 0
 
 
-def inject(monkeypatch, name: str, errno_value: int, *, holder=None, attr: str | None = None):
+def inject(monkeypatch, name: str, errno_value: int, *, holder=None, attr: str | None = None) -> Fault:
     """Make ``holder.name`` (default: ``os.name``) fail with ``errno_value`` inside this package.
 
-    ``attr`` names the real callable when it is not the attribute being replaced — for a patch that
-    installs a PROXY (an ``os.fdopen`` that returns a handle whose ``read`` fails, say).
+    ``attr`` names the real callable when it is not the attribute being replaced — for a patch on a
+    METHOD, where the attribute and the callable are the same object read off a different holder.
     """
     holder = os if holder is None else holder
-    real = getattr(holder, attr or name)
-    monkeypatch.setattr(holder, name, fault(errno_value, real))
-    return real
+    fault = Fault(errno_value, getattr(holder, attr or name))
+    monkeypatch.setattr(holder, name, fault)
+    return fault
