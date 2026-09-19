@@ -6,322 +6,71 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-### Fixed
-
-- The watcher's master mute switch now fails CLOSED, not open, when its own occupancy cannot be
-  determined: a transient fault reading the switch file itself (`EIO`, `EACCES`, ...) used to be
-  read the same as "the switch is absent", so a configured audit/wake command could launch — and the
-  cursor advance past it — with the pause state genuinely unknown. It is now treated exactly like an
-  explicit mute: nothing launches, nothing notifies, and the cursor is left untouched so the arrival
-  is still picked up once the fault clears. A root that cannot be opened at all is unaffected by this
-  change and still surfaces as a reportable lane refusal, not as "muted" — nothing can launch on such
-  a pass either way, since every lane fails to list as new, but the CLI's `watch --once` still needs
-  to see it as a rejection.
-- **A refused mute probe could still be read as a confirmed boolean, and a transient one could smuggle
-  a launch past it.** The fix above answered a switch-stat refusal with `True` and a root-open refusal
-  with `False`, reasoning that `scan_new`'s own, separate, later root open would fail the identical way
-  and be caught downstream — but that assumed the SAME failure recurs on a DIFFERENT syscall moments
-  apart. A transient fault (`EIO`, `EACCES`, a directory swapped back into place) can clear between
-  `is_muted`'s own root open and `scan_new`'s, so a real pass could hit the refusal at the mute check,
-  then read every lane successfully a moment later, and proceed to notify, launch, and advance the
-  cursor with the pause state never actually established. `is_muted` now raises `MuteUnknown` for both
-  unknowable cases instead of answering either boolean, and `dispatch_once` catches it *before* calling
-  `scan_new` at all, so a transient-clearing race can no longer reach a side effect. The outcome is also
-  now reported as a `lane_unreadable` refusal (logged at error level — `watch --once` exits 2) rather
-  than as a confirmed `report.muted` (exit 0): reading a genuine unknown as a successful pause was
-  itself part of the gap, since it hid the fault from an operator instead of surfacing it. A root that
-  does not exist at all (`FileNotFoundError`) is unaffected — that is still a confirmed "not muted",
-  not an unknown one.
-- The structural `_safefs` guard (the test suite's own enforcement that every file operation in the
-  package routes through the primitive) no longer misses a guarded operation reached through an
-  import alias: `import os as fs; fs.open(...)`, `from os import open as raw_open; raw_open(...)`,
-  an unaliased `from os import open; open(...)`, and the `fcntl`/`pathlib` equivalents all now
-  resolve to the same finding the un-aliased spelling would. It also now flags a guarded operation
-  that is merely *referenced* (assigned to a variable, passed as a callback) without being called in
-  the module that names it, since that reference is exactly as able to reach the filesystem later as
-  a call would be. This closes a real gap in the guard itself, not in any code it was already
-  scanning — `getattr`/`importlib`/dynamic dispatch remain outside what an AST-level check can see.
-
 ## [0.1.2] - 2026-09-19
 
 ### Added
 
-- The ship gate now also refuses a packet whose `changed_files` changes a test file
-  (`twoperson.testset`) unless the cited verdict's `acknowledged_tests` names those exact paths
-  (`twoperson verdict --ack-test-changes`, which derives the paths from the packet under review —
-  never a hand-typed list). Detection fails closed: only `added`/`copied` statuses are safe, so
-  `modified`, `deleted`, `renamed`, the `unknown` sentinel, or any status added to the schema later
-  all require the ack; `TWOPERSON_TEST_GLOBS` only *extends* the built-in test-path rule and can
-  never switch it off; and an optional `old_path` (rename source) is honored on any entry that
-  carries it — a test source flags the change whatever its status, and an absent or `unknown` source
-  is flagged conservatively — closing bypasses where a test moved to a non-test path evaded
-  detection because only the destination path was ever checked.
-- `publish_verdict` now refuses to write a verdict whose `acknowledged_tests` names a test path the
-  reviewed packet doesn't actually alter, so a verdict can only ever acknowledge the test changes
-  present in the packet it reviews. This makes the content-binding structural rather than a CLI
-  convention: without it, a caller writing verdicts directly (bypassing `--ack-test-changes`) could
-  mint an acknowledgment for arbitrary paths and have it replayed onto an unrelated ship report.
+- The ship gate refuses a packet whose `changed_files` modifies a test file (`twoperson.testset`)
+  unless the cited verdict's `acknowledged_tests` names those exact paths
+  (`twoperson verdict --ack-test-changes`, which derives the paths from the packet itself, never a
+  hand-typed list). Detection fails closed: only `added`/`copied` statuses are exempt, and a rename
+  is checked against its `old_path` too, so a test moved to a non-test path is still caught.
+- `publish_verdict` refuses to write a verdict whose `acknowledged_tests` names a path the reviewed
+  packet doesn't actually alter, so an acknowledgment can never be minted for, or replayed onto, an
+  unrelated packet.
 
 ### Changed
 
-- `acknowledged_tests` (a list of the specific test paths the reviewer acknowledges) replaces the
-  earlier boolean `acknowledges_test_changes`. The gate now requires the ship report's altered
-  tests to be a subset of what the cited verdict acknowledged, rather than accepting any truthy
-  flag — a verdict acknowledging one packet's test changes can no longer be cited to unlock a
-  different ship report's different test changes at the same head, since `changed_files` is
-  self-reported per packet. The feature was unreleased, so there is no compatibility path for the
-  old boolean field.
-- A lane operation that loses a race now absorbs only `FileNotFoundError` — "the source is already
-  gone" — instead of any `OSError`. A lane that cannot be *opened* is a refusal, not a lost race, and
-  reporting it as "nothing to claim" was the same refusal-read-as-absence mistake the lane listing
-  already fails closed to avoid.
+- `acknowledged_tests` (the specific test paths a reviewer acknowledges) replaces the earlier
+  boolean `acknowledges_test_changes`; the gate now requires the ship report's altered tests to be a
+  subset of what the cited verdict acknowledged.
+- A lane operation that loses a race now absorbs only `FileNotFoundError` ("the source is already
+  gone"); a lane that cannot be *opened* is reported as a refusal instead.
 
 ### Fixed
 
-- **The refusal for a lane that cannot be *opened* is raised where it happens, so no command turns
-  it into a stack trace.** The entry above made a lane that cannot be *listed* fail closed, but a
-  lane the descriptor chain cannot *open* — a symlinked `claimed/`, a symlinked root — was answered
-  by `os.open` with a raw `OSError`, which is neither a `PacketError` nor what the boundary net
-  catches. `twoperson next` therefore died with `NotADirectoryError` and exit `1`, the code that
-  means "nothing to do": the refusal delivered as the empty answer it exists to be told apart from.
-  The chain now raises `LaneUnreadable` itself, at the root hop, the lane hop, and the entry hop
-  (read and create), so every command — including ones not yet written — gets the refusal with exit
-  `2`. `FileNotFoundError` is deliberately left unconverted: it is the documented answer for the two
-  non-hostile cases, a tree `_ensure_tree` has not created yet (provably empty) and an entry another
-  process already moved (a lost race). This is also a behaviour change for callers that caught
-  `OSError` around a lane operation: they now see `LaneUnreadable`, which several readers had to
-  distinguish from a *bad file* — `_next`, `read_signals`, `read_verdicts`, `read_advice` and
-  `_next_consult` would otherwise have quarantined a good packet because the lane it sat in could not
-  be opened, and `find_packet`, `_all_verdicts`, `verdicted_packet_ids` and `answered_consult_ids`
-  would have silently under-reported, which for the latter two means re-auditing resolved work.
-- **An inbox lane that cannot be listed is refused, not answered as an empty one.** Listing a lane
-  returned `[]` identically for a lane that was empty and for a lane that could not be read, so a
-  permission wall or a hand-dropped symlink made `has_pending()` report "no work waiting" and
-  `pending()` report a clean zero — a false negative on exactly the tampering the refusal exists to
-  catch. Readers now raise `LaneUnreadable` (a `PacketError`) on an incomplete listing. This is a
-  behaviour change for callers: `check` exits `2` instead of `1`, `list` reports the refusal instead
-  of printing nothing, and any command that reads a lane reports the refusal rather than a traceback
-  (one net in `main`, so the covered set is not a hand-kept list of remembered commands).
-  `verdicted_packet_ids` and `answered_consult_ids` raise for the same reason — the sweep that
-  consumes them treats a missing id as *unresolved*, so a short set would requeue work whose durable
-  verdict already exists. The `signals/` lane is the one deliberate exception: a signal gates
-  nothing, so that lane stays live and skips a refused entry rather than going dark.
-- **Publishing no longer rewrites the permissions of a directory outside the inbox.**
-  `_ensure_tree` used `mkdir(exist_ok=True)`, which *succeeds* on a symlink to a directory — an
-  "already exists" case, not an error — and `os.chmod` then followed it, so a lane replaced by a link
-  had its target chmodded to `0700` by an ordinary `publish`. Directories are now created, checked
-  and permission-set through a descriptor opened `O_NOFOLLOW`, so what is created, what is checked
-  and what is modified are provably the same object.
-- **A lane file can no longer be swapped for a symlink between the listing and the read, and a
-  publish can no longer be redirected out of the inbox mid-write.** Every lane read opens with
-  `O_NOFOLLOW`, so the refusal happens in the open rather than after a `stat` that a second path
-  resolution could invalidate; and a publish holds both `staging/` and the destination lane open with
-  `O_NOFOLLOW | O_DIRECTORY` for the whole operation, creating the staging file `O_EXCL` and
-  addressing the rename relative to those descriptors instead of to paths that could mean something
-  else by then. The containment assertions stay — they reject a hostile *name*, which is a different
-  attack from a hostile *directory*. The descriptor-relative code uses the same POSIX surface this
-  module already required for its `fcntl.flock` publish lock, so it narrows nothing further.
-- **`watch` no longer swallows a refusal.** The four lane listings were a single expression, so an
-  unreadable `advice/` or `consult/` lane — neither of which gates anything — suppressed notification
-  and launch for a real audit packet sitting readable in `pending/`. Each lane is now read on its
-  own; a refused lane carries its cursor slice forward untouched, so nothing in it is announced and
-  nothing in it is marked seen; and `watch --once` exits `2` with the refusal on stderr instead of
-  printing "nothing new" and exiting `0`.
-- **`O_NOFOLLOW` was guarding only the last component, so a symlinked inbox ROOT or a lane swapped
-  for a symlink after the listing was still followed.** Opening `<root>/<lane>` with `O_NOFOLLOW`
-  refuses a symlinked *lane* and says nothing about the root above it, which the kernel re-resolved
-  on every call — a scan through a symlinked root returned `complete=True` for a listing taken
-  outside the inbox, and a lane swapped after the scan redirected the read, the claim and the rename
-  that followed it, because the scanner closes its descriptor and hands back plain paths. Every
-  read, claim, rename and publish is now addressed through a **descriptor chain**: the root is opened
-  once with `O_NOFOLLOW | O_DIRECTORY`, each lane is opened by `dir_fd` from that root, and each
-  entry by `dir_fd` from its lane — `os.rename`/`os.replace` take `src_dir_fd`/`dst_dir_fd` and name
-  no path at all, and the size read, the free-name choice and the `.reason.txt` write go through the
-  same chain. The root itself is validated by that open rather than by an `lstat` that a second
-  resolution could invalidate; directories *above* the inbox root are the operator's own layout and
-  stay out of scope, which the module now says in a comment. A symlinked root is refused by scan,
-  read, claim, publish and `_ensure_tree`, and a lane swapped for a symlink between the listing and
-  the read or the claim is refused in the syscall that would have followed it.
-- **A publish could report success after writing only part of the packet.** `os.write` may write
-  fewer bytes than it was given and report how many; the return value was ignored, so a short write
-  left a truncated packet in the lane with no error anywhere. The buffer is now drained in a loop,
-  and a write that makes no progress raises rather than spinning.
-- **A failed publish left its staging file behind and blocked every retry of that packet.** The
-  staging entry was unlinked only when `os.replace` failed, so a failure in the write, the fsync or
-  the destination lookup — or the short write above — stranded it, and since the staging create is
-  `O_EXCL` the next attempt at the same packet refused forever. Every step after the create is now
-  inside one cleanup block: any failure removes the staging entry and re-raises, so a retry of the
-  same packet succeeds.
-- **The watcher's own writes bypassed the descriptor chain the rest of the package had just moved
-  onto.** Inbox operations were addressed by descriptor, but the files the *watcher* writes in the
-  root were still opened by path: `.watch.lock` with mode `"w"`, which resolves the root again and
-  *truncates* whatever it lands on, so a `.watch.lock` pre-created as a symlink had the file it
-  pointed at emptied by an ordinary dispatch tick — no hostile command, no unusual flag. The cursor's
-  temp file and the mute switch reopened the same door through `write_text` and `touch`: the first
-  writes *through* a pre-created symlink, the second re-stamps the target's mtime. All three now go
-  through a root descriptor held `O_NOFOLLOW` (the same `_open_root_dir` the inbox uses), the names
-  are created `O_NOFOLLOW` — `O_EXCL` for the temp, so a leftover is cleared and retried rather than
-  followed or deadlocked on — and the rename is `os.replace` between two `dir_fd`s. A root that is a
-  symlink is refused: the pass degrades to un-serialized as it already documented, the cursor logs and
-  skips the save, and the switch reports what it did. Nothing the watcher writes can reach a file
-  outside the inbox root.
-- **Every lane move derived its destination from the *source* path and discarded the root it was
-  given.** `_move_lane_entry` built the destination as `src.parent.parent / dst_lane`, so
-  `archive_claimed('/outside/claimed/x.json', root='/intended')` wrote under `/outside`: the explicit
-  `root` argument was accepted and ignored, and the operation followed the caller's path out of the
-  inbox. Each operation now names both lanes, `_lane_member` refuses a source that is not an entry of
-  the expected lane *of that root* with a `PacketError` rather than following it, and both endpoints
-  are opened from the root's own descriptor — so claim, requeue, quarantine, archive and the three
-  consult equivalents all resolve inside the root they were handed.
-- **A lane entry swapped for a FIFO could block a reader forever.** `O_NOFOLLOW` refuses a symlink
-  and says nothing about the file type, so a listed entry replaced by a FIFO was opened — and
-  `O_RDONLY` on a FIFO with no writer *blocks in the open itself*, before any read or size check,
-  with no timeout and no error: a wedged watcher and a wedged CLI, neither of which reports anything.
-  Lane entries are now opened `O_NONBLOCK`, `fstat`ed, and refused unless `S_ISREG` before any read or
-  size check, then returned to blocking mode for the read. Covered both for the entry that already is
-  a FIFO and the one swapped in after the listing, under a timeout guard so a regression fails the
-  suite instead of hanging it.
-- **Root and lane creation raised its own errors past the refusal net.** `_ensure_tree` called
-  `mkdir` *before* the refusal-converting open, so a root that was an existing regular file, a
-  dangling symlink, or a root under an unwritable parent raised `FileExistsError` or
-  `PermissionError` from the create — neither a `PacketError` nor anything the command boundary
-  catches — and the command died with a traceback instead of exit `2`. Every `OSError` in root and
-  lane creation or opening is now converted to `LaneUnreadable`, the refusal the boundary answers
-  with exit `2`, and the unwritable parent is refused explicitly rather than discovered by a failing
-  `mkdir`. A missing root whose parent exists and is writable keeps its documented "provably empty"
-  answer. The CLI refusal matrix now covers every lane command against a regular-file root, a
-  dangling root symlink and an unwritable parent — 51 cases, each exiting `2` with no traceback — and
-  pins the `signals` lane's documented opt-out, which exits `1`.
-- **The docs-only score cap was decided by the directory a file sits in, not by the file.** The
-  predicate was `path.startswith("docs/") or path.endswith(".md") or path.endswith(".txt")`, so
-  `docs/deploy.py` — a program on the deploy path — was capped to the prose ceiling while
-  `src/deploy.py` scored as the deploy change it is, and any `.txt` anywhere was treated as prose.
-  The cap now asks the file's own name and answers `.txt` by ALLOWLIST: `.md`, `.rst` and `.adoc` are
-  prose anywhere in the tree, `.txt` is prose only for the conventional document stems (`README`,
-  `LICENSE`/`LICENCE`, `NOTICE`, `AUTHORS`, `CHANGELOG`, `CONTRIBUTING`, `COPYING`, case-insensitive),
-  and nothing else is prose — no executable or source extension wherever it lives, and no path
-  without an extension. The dependency-manifest deny-list this replaces was the same mistake one step
-  in: it caught the machine-read names someone thought of and handed the ceiling to `CMakeLists.txt`
-  — a build program that runs the compiler — for the crime of being a name nobody had enumerated. A
-  ceiling on how cheaply a change may be audited has to fail the other way, so naming the prose is
-  now the only way to get it.
+- Every lane and root operation (open, read, list, claim, publish, quarantine, archive, rename) now
+  reports a refusal (`LaneUnreadable`, exit `2`) instead of a raw traceback, an empty result, or a
+  false "nothing waiting" when a lane, its root, or an entry is a symlink, a dangling link, a hard
+  link, a FIFO, an existing non-directory file, or sits under an unwritable parent.
+- A publish interrupted mid-write (a short `os.write`, a failed fsync or rename) can no longer leave
+  a truncated packet behind, and a failed publish no longer strands its staging entry and blocks
+  every retry of that packet id.
+- `watch` reads its four lanes (packets, verdicts, consults, advice) independently, so an unreadable
+  advice/consult lane no longer suppresses notification for a real packet elsewhere; `watch --once`
+  reports a refused lane on stderr and exits `2` instead of printing "nothing new" and exiting `0`.
+- The master mute switch (`watch --on` / `--off` / `--status`, and every dispatch pass) now reports
+  ON, OFF, or UNKNOWN honestly: a state is only ever reported as ON or OFF once it has been both
+  written (or already true) and confirmed by reading it back. A write that fails, a read-back that
+  cannot be confirmed, or a transient fault that clears between two checks moments apart is reported
+  as UNKNOWN with a non-zero exit — never a guessed or fail-closed boolean — so `watch --off` can
+  never claim a mute it never actually established, and no pass notifies, launches, or advances the
+  cursor while the pause state is unconfirmed.
+- The docs-only score cap (`tier`) is now decided by a file's own name — an allow-list of prose
+  extensions (`.md`, `.rst`, `.adoc`) and conventional document stems (`README`, `LICENSE`,
+  `CHANGELOG`, ...) for `.txt` — rather than the directory it sits in or a blanket `.txt` rule, so a
+  program named `docs/deploy.py` or a build file like `CMakeLists.txt` is no longer capped to the
+  prose ceiling.
 
 ### Security
 
-- **A hard link planted in the inbox could make the package truncate a file outside it.** Quarantine
-  wrote `rejected/<stem>.reason.txt` with `O_TRUNC`, and `O_NOFOLLOW` does not refuse a hard link —
-  it is not a symlink — so a name pre-linked to any file the process can write had that file's
-  contents destroyed by an ordinary rejection. Nothing is written through a name any more: bytes go
-  to a fresh `O_EXCL` temp and arrive at the destination by `os.replace`, which names a *directory
-  entry*, so a second link to the same inode is never reached. The lock, mute-switch and cursor
-  writes had the same shape and are covered by the same change.
-- **FIFO protection covered readers only, so a FIFO at a writable name blocked the package forever.**
-  The previous round refused a non-regular file before *reading* it, but `O_WRONLY` on a FIFO with no
-  reader blocks in the open exactly as `O_RDONLY` does with no writer — a FIFO at a `.reason.txt`,
-  `.watch.lock`, `.watch_seen.json` or `.watch_muted` name hung the command with no timeout and no
-  error. Every open is now `O_NONBLOCK` and type-checked before use, in both directions, and a
-  lockfile that is not a regular file with a single link is refused rather than locked.
-- **The watcher's cursor was an unbounded, path-based read.** `load_cursor` resolved a path (so a
-  symlinked root was followed), opened without `O_NONBLOCK` (so a FIFO hung the watcher's first
-  tick), read without a size limit, and decoded with an implicit UTF-8 that raised
-  `UnicodeDecodeError` — which is neither an `OSError` nor a `JSONDecodeError`, so it escaped the
-  tolerant loader and killed the pass it was written to survive. It now reads through the root
-  descriptor, bounded by `MAX_CURSOR_BYTES`, and answers non-UTF-8 bytes explicitly as "no cursor"
-  with a log line, separately from malformed JSON.
-- **A full disk at lane creation escaped as a raw traceback instead of a refusal.** Lane `mkdir` and
-  the directory `fchmod` sat outside the error-converting open, so an injected `ENOSPC` produced a
-  bare `OSError` — not a `PacketError`, not exit `2` — from exactly the failure the refusal net
-  exists to report. Both are now converted at the chain, like every other root and lane hop.
-- **The class, not the four sites.** `twoperson._safefs` is now the one module that opens anything
-  under an inbox root — `open_dir`, `read_regular`, `replace_regular`, `open_lockfile` — with the
-  threat model written down in its docstring and in `docs/PROTOCOL.md`, and
-  `tests/test_safefs_guard.py` fails the suite by AST if any other module performs file I/O from
-  `os`/`shutil`/`pathlib`. Three prior rounds each fixed the sites they found and the next round
-  found the next site; the guard is what makes the fourth round impossible rather than unlikely.
-- **The publish lock leaked a descriptor every time it was taken.** `open_lockfile` returned a file
-  object built with `closefd=False`, so the `handle.close()` every caller performs closed the file
-  object and left the descriptor open. A watcher takes the lock once per tick and a publish takes it
-  once per packet, so a long-running watcher exhausted the process's descriptor table — measured at
-  exactly one descriptor per tick, 200 ticks and 200 publishes each leaking 200. The handle now owns
-  its descriptor, and every failure path between the open and the return closes it.
-- **A read that failed was answered as an empty inbox.** A failing `read` (EIO from the disk) or a
-  failing `fstat` left the primitive as a raw `OSError`; `inbox._next` swallowed `OSError` and
-  reported "no packet waiting", so an unreadable packet was delivered as the same value as an absent
-  one. The read is now converted at the same single point as the rest of the chain, and every caller
-  that caught `OSError` is narrowed to the documented `FileNotFoundError` — a lost race or a
-  provably empty tree — so nothing converts a refusal into an empty answer any more.
-- **`PermissionError` was read as "that name is free", and one bad entry aborted the whole watcher
-  pass.** `stat_nolink` mapped a permission failure to absence (so a name it could not examine was
-  handed back as an available one) and left EIO unwrapped; `watch.scan_new` caught only
-  `LaneUnreadable`, so a single unstatable entry in one lane suppressed notification for a readable
-  packet in another. A stat failure is now a refusal of that entry's lane — reported, with its
-  cursor slice carried forward untouched — and a permission error is never absence.
-- **A deeply nested cursor killed the watcher.** The byte cap bounded how much cursor was read but
-  not how deep it nested: a 400KB array of `[` raised `RecursionError` out of `json.loads` — neither
-  an `OSError` nor a `JSONDecodeError` — and killed the pass it was written to survive. Nesting is
-  caught with the other parse failures, and a cursor of the wrong shape (not a JSON object, a lane
-  key that is not a list of filenames) is answered as "no cursor" with a reason instead of raising
-  from `Cursor.from_json`.
-- **The primitive's error contract is one conversion point, and it is now proved rather than
-  described.** Every syscall `_safefs` makes goes through a single `with _converting(...)` block, so
-  the only exceptions it can raise are its own refusal types plus the documented
-  `FileNotFoundError` cases; `tests/test_safefs_guard.py` fails the suite by AST if a syscall is
-  written outside one, which covers a syscall added in a future commit on the commit that adds it.
-  `tests/test_safefs_faults.py` proves the same contract behaviourally: it collects every `os.*` and
-  `fcntl.*` call from the primitive's own AST and, for each one × `EIO`/`EACCES`/`ENOSPC`, drives
-  every public entry point — publish, claim, peek, quarantine, the `list`/`check`/`publish` CLI, the
-  watch scan, cursor load and save, both locks — asserting a refusal or exit `2` and never `None`,
-  never `[]`, never "nothing waiting", never a raw traceback. Both were revert-proved against the
-  four findings above.
-- **The one boundary net in `main` caught a subclass where the contract has two classes.** `_safefs`
-  raises exactly two refusals — `LaneUnreadable` for anything inside a lane and `SafeFsRefusal` for
-  the root-level files the watcher owns (the lock, the cursor, the mute switch) — but the net caught
-  only the first, so the second would have arrived at the operator as a stack trace with exit `1`,
-  which reads as "nothing to do". The net now catches `PacketError`, the base of both, and a test
-  pins that it is not an `except OSError` in disguise. No command can reach the net with a
-  `SafeFsRefusal` today (`inbox` normalizes refusals into `LaneUnreadable`, and the lock, cursor and
-  switch sites catch `PacketError` locally), so this guards the contract rather than fixing a live
-  crash; it is revert-proved by driving the net at the seam it wraps. The five CLI publish handlers
-  that caught `(PacketError, OSError)` are narrowed to `(PacketError, FileNotFoundError)` — the one
-  `OSError` the primitive still documents, a lost race — so a refusal that ever escapes the chain
-  again fails loudly in the suite instead of being printed as a tidy rejection.
-- **`close_quietly` retried `EINTR`, which is the one retry that is never safe.** The kernel releases
-  a descriptor the instant `close` is called, whatever it then reports — a retry after `EINTR` does
-  not close "the same" descriptor again, it closes whatever number the kernel has since handed to an
-  unrelated `open` on another thread, silently closing that operation's file (or lock) instead of
-  this one. `close` is now attempted exactly once, and the same reasoning covers the new
-  `unlock_quietly` below.
-- **The publish lock's `flock(LOCK_UN)` release sat outside `_safefs` entirely**, called directly
-  from `inbox._publish_lock`'s `finally` block (and the same shape in `watch._dispatch_lock`): an
-  `EIO` there — reachable after the locked work had already succeeded — surfaced as a raw `OSError`
-  traceback replacing a completed publish, because nothing converted it and the structural guard
-  didn't scan for `fcntl` calls outside the primitive at all. A new `_safefs.unlock_quietly`, on the
-  same "never raise from a `finally`" contract as `close_quietly`, now owns every lock release in the
-  package; the guard's `_IO_MODULES` now includes `fcntl`, so a future `flock` call outside
-  `_safefs.py` fails the suite the same way a raw `open()` already did.
-- **`load_cursor` did not catch `ValueError`.** A JSON integer of a few thousand digits is
-  syntactically valid and well under the cursor's byte cap, but Python 3.11+ refuses to convert a
-  string that long to an `int` at all (`sys.set_int_max_str_digits`'s default 4300-digit limit) — a
-  plain `ValueError`, not the `json.JSONDecodeError` the loader already caught, so it sailed past
-  every handler and killed the tick the same way an over-deep cursor used to. `ValueError` is now
-  caught alongside the other parse failures and recovers as no cursor, with a reason logged.
-- **`is_muted` did not catch the refusal its own `stat` could raise.** `stat_nolink` refuses (rather
-  than answering) when the mute switch's occupancy cannot be determined at all — `EIO`, `EACCES`, an
-  unsupported filesystem — and that refusal was left uncaught, so it propagated out of `is_muted`,
-  through `dispatch_once`, and killed `watch_loop`'s `while` on the first bad tick instead of costing
-  that one tick, in violation of `is_muted`'s own "never raises" contract at the time. A switch that
-  cannot be examined is now caught and reported rather than crashing the tick — the reported outcome
-  for that state has changed twice since (see the mute-probe entries under `[Unreleased]` above).
-- **The syscall sweep only ever faulted the *first* matching call**, so it could never drive a
-  driver past an earlier occurrence of a syscall to reach a later one — which is exactly how the two
-  findings above (the lock release, called *second* per publish after the acquire; the mute-switch
-  `stat`, called on a later pass through `is_muted` than the first) went unswept. `tests/fixtures.py`'s
-  `Fault` now takes an `at` index and fires only the Nth matching call, and
-  `tests/test_safefs_faults.py` measures each syscall's real occurrence count from a clean run and
-  parametrizes over every index reached by any driver — 15 syscalls × 3 errnos becomes ~330 rows
-  instead of 45. The sweep also now drives `watch.dispatch_once` and one bounded `watch.watch_loop`
-  pass, not only `watch.scan_new`, so a refusal that only reaches the loop-level entry points is
-  covered too.
+- All filesystem access under the inbox root goes through one module (`twoperson._safefs`) with a
+  single syscall-conversion point, enforced structurally by a test that fails the suite if any other
+  module performs file I/O directly — including through an import alias — or if a syscall is ever
+  added outside that conversion point.
+- A hard link or FIFO planted at any writable name (a lane entry, the publish or watch lock, the
+  cursor, or the mute switch) can no longer truncate a file outside the inbox, write through a link,
+  or block the process forever: every write goes to a fresh temp file revealed by `os.replace`,
+  nothing is ever opened for writing by an existing name, and a non-regular file is refused before
+  use in either read or write direction.
+- The publish lock no longer leaks a file descriptor on every acquisition, and a failed lock release
+  can no longer crash an already-successful publish or dispatch pass.
+- The watcher's cursor is read with a bounded size; malformed, non-UTF-8, deeply nested, or
+  numerically oversized content recovers as "no cursor" (logged) instead of crashing the watcher.
+- A permission error or an I/O fault reading a lane entry or the mute switch is now reported as a
+  refusal, never silently read as "that name is free" or "not muted" — one bad entry can no longer
+  suppress notification for the rest of a lane, or a transient fault let a launch through with the
+  pause state unknown.
 
 ## [0.1.1] - 2026-09-03
 
