@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-19
+
 ### Added
 
 - The ship gate now also refuses a packet whose `changed_files` changes a test file
@@ -228,6 +230,7 @@ First public release.
   `TWOPERSON_TIER` / `TWOPERSON_TIER_SCORE` / `TWOPERSON_PACKET_ID`, plus the `ESCALATE:`
   convention for asking for a stronger reviewer.
 
-[Unreleased]: https://github.com/ahm3dwasim/twoperson/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/ahm3dwasim/twoperson/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/ahm3dwasim/twoperson/releases/tag/v0.1.2
 [0.1.1]: https://github.com/ahm3dwasim/twoperson/releases/tag/v0.1.1
 [0.1.0]: https://pypi.org/project/twoperson/0.1.0/

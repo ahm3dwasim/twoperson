@@ -281,7 +281,14 @@ def test_the_version_guard_actually_rejects_a_mismatched_tag(tmp_path: Path) -> 
 
     The step calls `python`, which is what a runner has after setup-python. A shim supplies it here
     rather than changing the workflow to suit the test.
+
+    The matching tag is DERIVED from the real pyproject.toml rather than written down. It has to be
+    the declared version for the matching case to mean anything, and a literal here is a test that
+    turns red on the one operation it exists to guard -- a version bump -- for a reason that looks
+    like a broken gate. The rejecting case below is what proves the comparison happens, and it is
+    still a tag no release will ever carry.
     """
+    import re
     import subprocess
     import sys
 
@@ -294,8 +301,10 @@ def test_the_version_guard_actually_rejects_a_mismatched_tag(tmp_path: Path) -> 
     steps = _publish_workflow()["jobs"]["guard"]["steps"]
     body = next(s["run"] for s in steps if "version" in str(s.get("name", "")))
 
+    declared = re.search(r'^version = "([^"]+)"', (ROOT / "pyproject.toml").read_text("utf-8"),
+                         re.M).group(1)
     right = subprocess.run(["bash", "-c", body], cwd=ROOT, capture_output=True, text=True,
-                           env={**env, "TAG": "v0.1.1"})
+                           env={**env, "TAG": f"v{declared}"})
     assert right.returncode == 0, right.stdout + right.stderr
 
     wrong = subprocess.run(["bash", "-c", body], cwd=ROOT, capture_output=True, text=True,
