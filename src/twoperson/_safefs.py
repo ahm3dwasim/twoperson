@@ -54,6 +54,7 @@ the exact confusion :class:`LaneUnreadable` exists to prevent.
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import os
 import stat as _stat
@@ -104,6 +105,72 @@ def refusal(what: str, exc: OSError, *, verb: str = "opened",
     return kind(f"{what} could not be {verb}: {exc.strerror or type(exc).__name__}")
 
 
+@contextlib.contextmanager
+def _converting(label: str, verb: str, kind: type[PacketError],
+                passthrough: tuple[type[BaseException], ...] = ()):
+    """THE one place a syscall's ``OSError`` becomes this module's refusal.
+
+    Every ``os.*`` / ``fcntl.*`` call in this module sits lexically inside one of these blocks, and
+    a structural guard in ``tests/test_safefs_guard.py`` reads this file's AST and fails the build
+    when one does not. That is what makes the module's error contract PROVABLE rather than a list of
+    sites somebody remembered to wrap: the set of exceptions this module can raise is decided at
+    this one function — the refusal ``kind``, plus whatever ``passthrough`` names for this block.
+
+    ``passthrough`` is the deliberate exception, and there are exactly two reasons to name one:
+
+    * ``FileNotFoundError`` — the documented "provably empty / already gone" answer. It is the
+      caller's to read (see the module docstring), and turning it into a refusal would make an inbox
+      nobody has created yet indistinguishable from a hostile one.
+    * ``FileExistsError`` — an ANSWER a caller acts on rather than a failure: a stale temporary to
+      clear, a packet already published, a mute switch already thrown.
+
+    Both are named per block, so which syscall is allowed to say what is visible at the call and not
+    only in a docstring three functions away. Everything else — ``EIO``, ``EACCES``, ``ENOSPC``,
+    ``ELOOP``, ``ENOTDIR``, and a bare ``PermissionError`` — leaves as ``kind``.
+    """
+    try:
+        yield
+    except passthrough:
+        raise
+    except OSError as exc:
+        raise refusal(label, exc, verb=verb, kind=kind) from exc
+
+
+def _release(close) -> None:
+    """Run a close, retrying ``EINTR`` once, dropping every other error. See `close_quietly`."""
+    try:
+        close()
+    except InterruptedError:
+        try:
+            close()
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def close_quietly(fd: int) -> None:
+    """Release a descriptor from a ``finally`` block, and never raise.
+
+    ``close`` is the one syscall whose failure cannot be reported from where it is called: every
+    call site here is finishing — the work is done, or a failure is already on its way out — so
+    raising would REPLACE that outcome. On the cleanup half of a refusal it would replace a refusal
+    with a raw ``OSError``, which is the exact contract this module exists to keep, and on a
+    success path it would turn a published packet into a traceback after the bytes were already
+    ``fsync``ed and revealed.
+
+    ``EINTR`` is retried once because it is the one errno that means the descriptor was NOT
+    released; every other error (``EIO``, ``EBADF``, ``ENOSPC`` is not reachable here) has already
+    released it on the platforms this package supports, so there is nothing left to decide.
+    """
+    _release(lambda: os.close(fd))
+
+
+def close_handle_quietly(handle: IO[bytes]) -> None:
+    """The same for a file object that OWNS its descriptor (``closefd=True``) — see `close_quietly`."""
+    _release(handle.close)
+
+
 def plain_name(name: str) -> str:
     """Refuse a name that is not exactly ONE filesystem component.
 
@@ -122,7 +189,8 @@ def _args(dir_fd: int | None) -> dict:
     return {} if dir_fd is None else {"dir_fd": dir_fd}
 
 
-def _create(dir_fd: int | None, name: str, flags: int, mode: int = FILE_MODE) -> int:
+def _create(dir_fd: int | None, name: str, flags: int, *, label: str, kind: type[PacketError],
+            passthrough: tuple[type[BaseException], ...] = (), mode: int = FILE_MODE) -> int:
     """``os.open`` a name, retrying a concurrent create once.
 
     macOS intermittently answers a create that another thread is performing at the same instant with
@@ -136,10 +204,19 @@ def _create(dir_fd: int | None, name: str, flags: int, mode: int = FILE_MODE) ->
     landed, so the second call finds the name — ``O_CREAT`` opens it, and ``O_EXCL`` reports
     ``EEXIST``, which IS the answer that caller asked for. This is only for CREATING opens: a read
     that says ``ENOENT`` means the entry is gone, and it keeps meaning that.
+
+    Both attempts sit inside a `_converting` block, so the errno chaos above never reaches a caller
+    as raw text: the FIRST attempt lets ``ENOENT`` through (it is the retry's trigger, not an
+    answer), and the SECOND is authoritative — a create whose directory is genuinely gone converts
+    it, because with ``O_CREAT`` there is no other reading of that errno. ``passthrough`` carries
+    ``FileExistsError`` for the ``O_EXCL`` callers, which act on it rather than refuse it.
     """
-    try:
-        return os.open(name, flags, mode, **_args(dir_fd))
-    except FileNotFoundError:
+    with _converting(label, "created", kind, passthrough=passthrough):
+        try:
+            return os.open(name, flags, mode, **_args(dir_fd))
+        except FileNotFoundError:
+            pass            # the macOS create race; the second attempt below is authoritative
+    with _converting(label, "created", kind, passthrough=passthrough):
         return os.open(name, flags, mode, **_args(dir_fd))
 
 
@@ -170,27 +247,25 @@ def open_dir(parent_fd: int | None, name: str, *, create: bool = False,
     label = what or f"the directory {name!r}"
     if create:
         try:
-            if parent_fd is None:
-                Path(name).mkdir(parents=True, exist_ok=True)
-            else:
-                os.mkdir(name, dir_fd=parent_fd)
+            with _converting(label, "created", LaneUnreadable, passthrough=(FileExistsError,)):
+                if parent_fd is None:
+                    Path(name).mkdir(parents=True, exist_ok=True)
+                else:
+                    os.mkdir(name, dir_fd=parent_fd)
         except FileExistsError:
             pass            # occupied; the open below decides whether what occupies it is usable
-        except OSError as exc:
-            raise refusal(label, exc, verb="created") from exc
-    try:
+    # `ENOENT` is the one errno this hop does NOT own: it is the caller's "provably empty" answer
+    # and passes through untouched. Everything else the open can say is a refusal.
+    with _converting(label, "opened", LaneUnreadable, passthrough=(FileNotFoundError,)):
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, **_args(parent_fd))
-    except FileNotFoundError:
-        raise               # never created here: the caller decides what an absent tree means
-    except OSError as exc:
-        raise refusal(label, exc) from exc
     if not create:
         return fd
     try:
-        os.fchmod(fd, DIR_MODE)
-    except OSError as exc:
-        os.close(fd)
-        raise refusal(label, exc, verb="created") from exc
+        with _converting(label, "created", LaneUnreadable):
+            os.fchmod(fd, DIR_MODE)
+    except BaseException:
+        close_quietly(fd)
+        raise
     return fd
 
 
@@ -208,18 +283,15 @@ def _open_regular(dir_fd: int, name: str, what: str,
     check and the read cannot be answered by two different objects.
     """
     plain_name(name)
-    try:
+    with _converting(what, "opened", kind, passthrough=(FileNotFoundError,)):
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
-    except FileNotFoundError:
-        raise
-    except OSError as exc:
-        raise refusal(what, exc, kind=kind) from exc
     try:
-        info = os.fstat(fd)
+        with _converting(what, "opened", kind):
+            info = os.fstat(fd)
         if not _stat.S_ISREG(info.st_mode):
             raise kind(f"{what} could not be opened: not a regular file")
     except BaseException:
-        os.close(fd)
+        close_quietly(fd)
         raise
     return fd, info
 
@@ -241,10 +313,14 @@ def read_regular(dir_fd: int, name: str, max_bytes: int, *, what: str | None = N
     try:
         if info.st_size > max_bytes:
             raise kind(f"{label} could not be read: larger than {max_bytes} bytes")
-        with os.fdopen(fd, "rb", closefd=False) as handle:
-            return handle.read(max_bytes)
+        # The READ is a syscall too, and the file object's own `read` is where an EIO on a failing
+        # disk arrives. It used to leave here raw, past every `except LaneUnreadable` on the way up,
+        # which is how an unreadable packet came back to `inbox._next` as "no packet waiting".
+        with _converting(label, "read", kind):
+            with os.fdopen(fd, "rb", closefd=False) as handle:
+                return handle.read(max_bytes)
     finally:
-        os.close(fd)
+        close_quietly(fd)
 
 
 def entry_size(dir_fd: int, name: str, *, what: str | None = None,
@@ -256,7 +332,7 @@ def entry_size(dir_fd: int, name: str, *, what: str | None = None,
     from a file the open itself would then refuse.
     """
     fd, info = _open_regular(dir_fd, name, what or f"the entry {name!r}", kind)
-    os.close(fd)
+    close_quietly(fd)
     return info.st_size
 
 
@@ -267,19 +343,19 @@ def create_exclusive(dir_fd: int, name: str, *, what: str | None = None,
     ``O_CREAT | O_EXCL | O_NOFOLLOW``: ``O_EXCL`` is what makes a pre-created name — a symlink, a
     FIFO, a hard link to someone else's file — a refusal rather than something we write through, and
     ``O_NOFOLLOW`` refuses an existing symlink on its own terms instead of leaving ``O_EXCL`` to
-    report it as a plain ``EEXIST``. ``EEXIST`` is deliberately NOT converted: "that name is already
-    taken" is an answer the caller acts on (a stale temporary to clear, a packet already published),
-    not a refusal.
+    report it as a plain ``EEXIST``. ``EEXIST`` is deliberately NOT converted — and it now really is
+    not: it passes through `_create` by name, so the docstring and the code say the same thing.
+    "That name is already taken" is an answer the caller acts on (a stale temporary to clear, a
+    packet already published, a mute switch already thrown), not a refusal.
     """
     label = what or f"the entry {name!r}"
     plain_name(name)
-    try:
-        return _create(dir_fd, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW)
-    except OSError as exc:
-        raise refusal(label, exc, verb="created", kind=kind) from exc
+    return _create(dir_fd, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                   label=label, kind=kind, passthrough=(FileExistsError,))
 
 
-def write_all(fd: int, body: bytes) -> None:
+def write_all(fd: int, body: bytes, *, what: str = "the body",
+              kind: type[PacketError] = LaneUnreadable) -> None:
     """Write the WHOLE buffer, in as many calls as the kernel needs.
 
     ``os.write`` may write fewer bytes than it was given and report how many. Ignoring that return
@@ -289,9 +365,10 @@ def write_all(fd: int, body: bytes) -> None:
     """
     view = memoryview(body)
     while view:
-        written = os.write(fd, view)
+        with _converting(what, "written", kind):
+            written = os.write(fd, view)
         if written <= 0:
-            raise OSError(f"short write: {len(view)} byte(s) of the body were not written")
+            raise kind(f"{what} could not be written: {len(view)} byte(s) were not written")
         view = view[written:]
 
 
@@ -302,11 +379,9 @@ def _write_and_sync(fd: int, data: bytes, label: str, kind: type[PacketError]) -
     is the same failure one syscall earlier. Both leave as the caller's refusal rather than as a raw
     ``OSError``, because both are reachable from an ordinary command on a full disk.
     """
-    try:
-        write_all(fd, data)
+    write_all(fd, data, what=label, kind=kind)
+    with _converting(label, "written", kind):
         os.fsync(fd)
-    except OSError as exc:
-        raise refusal(label, exc, verb="written", kind=kind) from exc
 
 
 def replace_regular(dir_fd: int, name: str, data: bytes, *, what: str | None = None,
@@ -341,14 +416,14 @@ def replace_regular(dir_fd: int, name: str, data: bytes, *, what: str | None = N
     label = what or f"the entry {name!r}"
     plain_name(name)
     tmp = f"{TMP_PREFIX}{name}{TMP_SUFFIX}"
+    tmp_what = f"{label} (temporary {tmp!r})"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     try:
-        try:
-            fd = _create(dir_fd, tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW)
-        except FileExistsError:
-            unlink(dir_fd, tmp, missing_ok=True)    # a save that did not finish; see the docstring
-            fd = _create(dir_fd, tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW)
-    except OSError as exc:
-        raise refusal(f"{label} (temporary {tmp!r})", exc, verb="created", kind=kind) from exc
+        fd = _create(dir_fd, tmp, flags, label=tmp_what, kind=kind,
+                     passthrough=(FileExistsError,))
+    except FileExistsError:
+        unlink(dir_fd, tmp, missing_ok=True)        # a save that did not finish; see the docstring
+        fd = _create(dir_fd, tmp, flags, label=tmp_what, kind=kind)
     try:
         _write_and_sync(fd, data, label, kind)
         reveal(dir_fd, tmp, dir_fd, name, what=label, kind=kind)
@@ -359,7 +434,7 @@ def replace_regular(dir_fd: int, name: str, data: bytes, *, what: str | None = N
             pass                    # the caller's own failure is the one worth reporting
         raise
     finally:
-        os.close(fd)
+        close_quietly(fd)
 
 
 def stage_and_reveal(src_dir_fd: int, src_name: str, data: bytes, *, dst_dir_fd: int,
@@ -384,14 +459,13 @@ def stage_and_reveal(src_dir_fd: int, src_name: str, data: bytes, *, dst_dir_fd:
     label = what or f"the entry {src_name!r}"
     plain_name(src_name)
     plain_name(dst_name)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     try:
-        try:
-            fd = _create(src_dir_fd, src_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW)
-        except FileExistsError:
-            unlink(src_dir_fd, src_name, missing_ok=True)
-            fd = _create(src_dir_fd, src_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW)
-    except OSError as exc:
-        raise refusal(label, exc, verb="created", kind=kind) from exc
+        fd = _create(src_dir_fd, src_name, flags, label=label, kind=kind,
+                     passthrough=(FileExistsError,))
+    except FileExistsError:
+        unlink(src_dir_fd, src_name, missing_ok=True)
+        fd = _create(src_dir_fd, src_name, flags, label=label, kind=kind)
     try:
         _write_and_sync(fd, data, label, kind)
         reveal(src_dir_fd, src_name, dst_dir_fd, dst_name, what=label, kind=kind)
@@ -402,7 +476,7 @@ def stage_and_reveal(src_dir_fd: int, src_name: str, data: bytes, *, dst_dir_fd:
             pass                    # the caller's own failure is the one worth reporting
         raise
     finally:
-        os.close(fd)
+        close_quietly(fd)
 
 
 def open_lockfile(dir_fd: int, name: str, *, what: str | None = None,
@@ -418,29 +492,42 @@ def open_lockfile(dir_fd: int, name: str, *, what: str | None = None,
     well as opened: it must be a regular file with ``st_nlink == 1``. A hard link at the lock's name
     is a second name for a file someone else controls, which is not a lock this process can trust.
 
+    **The returned handle OWNS the descriptor.** ``os.fdopen`` is asked for ``closefd=True`` (the
+    default), so the caller's one ``handle.close()`` releases the lock file's descriptor. It used to
+    be ``closefd=False``, which made ``handle.close()`` close the *buffer* and leave the descriptor
+    open forever: every watcher tick and every publish leaked one fd, and a long-running ``--loop``
+    ran the process out of them. The error paths below close through the handle for the same reason
+    — closing both would be a double close on an integer the kernel may already have handed out.
+
     The caller is responsible for releasing: ``flock(handle, LOCK_UN)`` then ``handle.close()``.
     """
     label = what or f"the lock file {name!r}"
     plain_name(name)
+    fd = _create(dir_fd, name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                 label=label, kind=kind)
+    handle: IO[bytes] | None = None
     try:
-        fd = _create(dir_fd, name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError as exc:
-        raise refusal(label, exc, kind=kind) from exc
-    try:
-        info = os.fstat(fd)
+        with _converting(label, "opened", kind):
+            info = os.fstat(fd)
         if not _stat.S_ISREG(info.st_mode):
             raise kind(f"{label} could not be opened: not a regular file")
         if info.st_nlink != 1:
             raise kind(f"{label} could not be opened: it is a hard link to another file")
-        handle = os.fdopen(fd, "r+b", closefd=False)
+        with _converting(label, "opened", kind):
+            handle = os.fdopen(fd, "r+b", closefd=True)
     except BaseException:
-        os.close(fd)
+        # `handle` is assigned only by the LAST statement above, so a failure anywhere before it
+        # leaves the raw descriptor unowned and it is this branch that must release it.
+        if handle is None:
+            close_quietly(fd)
+        else:
+            close_handle_quietly(handle)
         raise
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        with _converting(label, "locked", kind):
+            fcntl.flock(handle, fcntl.LOCK_EX)
     except BaseException:
-        handle.close()
-        os.close(fd)
+        close_handle_quietly(handle)
         raise
     return handle
 
@@ -451,13 +538,13 @@ def unlink(dir_fd: int, name: str, *, missing_ok: bool = False,
     name and not what a symlink at that name points at."""
     plain_name(name)
     try:
-        os.unlink(name, dir_fd=dir_fd)
+        with _converting(what or f"the entry {name!r}", "removed", kind,
+                         passthrough=(FileNotFoundError,)):
+            os.unlink(name, dir_fd=dir_fd)
     except FileNotFoundError:
         if missing_ok:
             return
-        raise
-    except OSError as exc:
-        raise refusal(what or f"the entry {name!r}", exc, verb="removed", kind=kind) from exc
+        raise           # the name is already gone: a lost race, and the caller's to read
 
 
 def rename(src_fd: int, src_name: str, dst_fd: int, dst_name: str, *,
@@ -471,12 +558,9 @@ def rename(src_fd: int, src_name: str, dst_fd: int, dst_name: str, *,
     """
     plain_name(src_name)
     plain_name(dst_name)
-    try:
+    with _converting(what or f"the entry {src_name!r}", "moved", kind,
+                     passthrough=(FileNotFoundError,)):
         os.rename(src_name, dst_name, src_dir_fd=src_fd, dst_dir_fd=dst_fd)
-    except FileNotFoundError:
-        raise               # the source is already gone: a lost race, and the caller's to read
-    except OSError as exc:
-        raise refusal(what or f"the entry {src_name!r}", exc, verb="moved", kind=kind) from exc
 
 
 def reveal(src_fd: int, src_name: str, dst_fd: int, dst_name: str, *,
@@ -492,44 +576,48 @@ def reveal(src_fd: int, src_name: str, dst_fd: int, dst_name: str, *,
     """
     plain_name(src_name)
     plain_name(dst_name)
-    try:
+    with _converting(what or f"the entry {src_name!r}", "moved", kind,
+                     passthrough=(FileNotFoundError,)):
         os.replace(src_name, dst_name, src_dir_fd=src_fd, dst_dir_fd=dst_fd)
-    except FileNotFoundError:
-        raise               # the source is already gone: a lost race, and the caller's to read
-    except OSError as exc:
-        raise refusal(what or f"the entry {src_name!r}", exc, verb="moved", kind=kind) from exc
 
 
-def stat_nolink(dir_fd: int, name: str) -> os.stat_result | None:
-    """Is this NAME taken in this directory? ``None`` when it is not.
+def stat_nolink(dir_fd: int, name: str, *, what: str | None = None,
+                kind: type[PacketError] = LaneUnreadable) -> os.stat_result | None:
+    """Is this NAME taken in this directory? ``None`` when it is not, a refusal when we cannot tell.
 
     ``follow_symlinks=False`` reports the LINK, so a symlink, a directory, a FIFO and a device all
     count as occupying their own name — which is what "taken" has to mean, or a publish picks a name
-    that is already there. An error other than "there is no such entry" propagates: if the directory
-    cannot be interrogated then we do not know the name is free, and choosing it anyway is how a
-    write overwrites something.
+    that is already there.
 
-    ``PermissionError`` is deliberately not one of those errors. A lock file created by another
-    process under a stricter umask is a real, ordinary case, and the question asked here is about the
-    NAME, which the directory's own read permission already answered.
+    Exactly ONE errno means "free": ``ENOENT``, the name is not there. Everything else the
+    interrogation can say — ``EIO`` on a failing disk, ``EACCES``, ``ENOTDIR`` because the thing
+    above us was swapped — means *we do not know*, and "we do not know" must never be spelled
+    ``None``. ``None`` is the answer that lets a caller choose a name and write to it, so a
+    transient ``EIO`` read as "free" is how a write lands on top of something.
+
+    ``PermissionError`` used to be mapped to ``None`` here, on the argument that a directory's own
+    read permission already answered the question. It does not: `os.stat` by ``dir_fd`` needs
+    *search* permission on the directory, so a ``PermissionError`` says the lookup could not be
+    performed at all, which is exactly the case this function must not answer "free" to. It is now a
+    refusal like every other errno.
+
+    :raises kind: the name's occupancy could not be determined.
     """
+    label = what or f"the entry {name!r}"
     plain_name(name)
     try:
-        return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        with _converting(label, "examined", kind, passthrough=(FileNotFoundError,)):
+            return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     except FileNotFoundError:
-        return None
-    except PermissionError:
-        return None
+        return None         # the one errno that answers the question: that name is free
 
 
 def list_names(dir_fd: int, *, what: str = "the directory",
                kind: type[PacketError] = LaneUnreadable) -> list[str]:
     """Every name in a directory we hold, or a refusal. ``os.scandir`` never follows entries."""
-    try:
+    with _converting(what, "listed", kind):
         with os.scandir(dir_fd) as entries:
             return [entry.name for entry in entries]
-    except OSError as exc:
-        raise refusal(what, exc, verb="listed", kind=kind) from exc
 
 
 def free_name(dir_fd: int, name: str) -> str:
@@ -538,11 +626,12 @@ def free_name(dir_fd: int, name: str) -> str:
     The question is asked, and the answer is used, against ONE descriptor, so the name that was
     chosen and the name that is then used cannot be answered by two different directories.
     """
-    if stat_nolink(dir_fd, name) is None:
+    what = f"the candidate name {name!r}"
+    if stat_nolink(dir_fd, name, what=what) is None:
         return name
     stem, suffix = os.path.splitext(name)
     for index in range(2, 1000):
         candidate = f"{stem}-{index}{suffix}"
-        if stat_nolink(dir_fd, candidate) is None:
+        if stat_nolink(dir_fd, candidate, what=f"the candidate name {candidate!r}") is None:
             return candidate
     raise PacketError(f"cannot find a free filename for {name}")

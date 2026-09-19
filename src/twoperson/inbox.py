@@ -320,9 +320,9 @@ def _ensure_tree(root: Path) -> Path:
     root_fd = _open_root_dir(root, create=True)
     try:
         for name in _SUBDIRS:
-            os.close(_safefs.open_dir(root_fd, name, create=True, what=f"the lane {name!r}"))
+            _safefs.close_quietly(_safefs.open_dir(root_fd, name, create=True, what=f"the lane {name!r}"))
     finally:
-        os.close(root_fd)
+        _safefs.close_quietly(root_fd)
     return root
 
 
@@ -339,7 +339,7 @@ def _publish_lock(root: Path):
     try:
         handle = _safefs.open_lockfile(root_fd, ".lock", what="the publish lock")
     finally:
-        os.close(root_fd)
+        _safefs.close_quietly(root_fd)
     try:
         yield
     finally:
@@ -439,7 +439,7 @@ def _lane_dir_fd(root: Path, lane: str) -> int:
     try:
         return _safefs.open_dir(root_fd, lane, what=f"the lane {lane!r}")
     finally:
-        os.close(root_fd)
+        _safefs.close_quietly(root_fd)
 
 
 def _split_lane_path(path: Path) -> tuple[Path, str, str]:
@@ -493,7 +493,7 @@ def _read_lane_file(path: Path) -> bytes:
     try:
         return _safefs.read_regular(lane_fd, name, _MAX_ENTRY_BYTES, what=_entry_what(lane, name))
     finally:
-        os.close(lane_fd)
+        _safefs.close_quietly(lane_fd)
 
 
 def _lane_entry_size(path: Path) -> int:
@@ -507,7 +507,7 @@ def _lane_entry_size(path: Path) -> int:
     try:
         return _safefs.entry_size(lane_fd, name, what=_entry_what(lane, name))
     finally:
-        os.close(lane_fd)
+        _safefs.close_quietly(lane_fd)
 
 
 def _write_lane_file(root: Path, lane: str, name: str, body: bytes) -> None:
@@ -534,7 +534,7 @@ def _write_lane_file(root: Path, lane: str, name: str, body: bytes) -> None:
     try:
         _safefs.replace_regular(lane_fd, name, body, what=_entry_what(lane, name))
     finally:
-        os.close(lane_fd)
+        _safefs.close_quietly(lane_fd)
 
 
 def _lane_member(root: Path, lane: str, path: Path) -> str:
@@ -590,9 +590,9 @@ def _move_lane_entry(src: Path, *, root: Path, src_lane: str, dst_lane: str) -> 
             final = _safefs.free_name(dst_fd, name)
             _safefs.rename(src_fd, name, dst_fd, final)
         finally:
-            os.close(dst_fd)
+            _safefs.close_quietly(dst_fd)
     finally:
-        os.close(src_fd)
+        _safefs.close_quietly(src_fd)
     return root / dst_lane / final
 
 
@@ -646,9 +646,9 @@ def _atomic_publish(directory: Path, lane: str, name: str, body: str) -> Path:
                                          dst_dir_fd=lane_fd, dst_name=final,
                                          what=f"the staging entry {_safe_name(name)!r}")
             finally:
-                os.close(lane_fd)
+                _safefs.close_quietly(lane_fd)
         finally:
-            os.close(staging_fd)
+            _safefs.close_quietly(staging_fd)
     return directory / lane / final
 
 
@@ -690,7 +690,7 @@ def find_packet(packet_id: str, root: Path | str | None = None) -> tuple[str, Pa
                 # that a packet nobody can see does not exist — and its answer is what makes a
                 # verdict *about something*, so a silent None here is a verdict bound to nothing.
                 raise
-            except (PacketError, OSError):
+            except (PacketError, FileNotFoundError):
                 continue
             if packet["packet_id"] == packet_id:
                 return lane, path, packet
@@ -711,7 +711,7 @@ def _all_verdicts(root: Path | str | None) -> list[dict]:
                 # which answers "no verdict by that id exists" — under-reporting a SHIP GATE. A lane
                 # that refused must decline to answer, never answer short.
                 raise
-            except (PacketError, OSError):
+            except (PacketError, FileNotFoundError):
                 continue
     return out
 
@@ -933,7 +933,7 @@ def _lane_scan(root: Path | str | None, lane: str) -> LaneScan:
         fd = _lane_dir_fd(directory, lane)
     except FileNotFoundError:
         return LaneScan(files=(), refused=(), complete=True)   # never created: provably empty
-    except (LaneUnreadable, OSError) as exc:
+    except PacketError as exc:
         # This function is the layer whose JOB is to report a refusal rather than raise one, so it
         # catches the refusal `_lane_dir_fd` now raises and turns it back into an incomplete scan.
         # Catching only `OSError` here would let `LaneUnreadable` — which is a `PacketError`, not an
@@ -954,13 +954,22 @@ def _lane_scan(root: Path | str | None, lane: str) -> LaneScan:
             # Stated against the open lane, not against a path that could now mean something else.
             # `follow_symlinks=False` reports the LINK, so `S_ISREG` is false for a symlink, a
             # directory, a FIFO or a device in a single answer.
-            entry_stat = _safefs.stat_nolink(fd, name)
+            try:
+                entry_stat = _safefs.stat_nolink(fd, name, what=_entry_what(lane, name))
+            except PacketError as exc:
+                # One entry we cannot interrogate costs the WHOLE lane, and says so. The tempting
+                # alternative — skip the entry and report the rest as a complete scan — is "we do not
+                # know" spelled as a clean list, which is the one answer `complete` exists to keep
+                # out of this function. `stat_nolink` used to answer `None` (i.e. "free") for a
+                # `PermissionError` and to let an `EIO` out raw, so this call had no refusal to
+                # catch and a single bad entry took down the caller's whole pass instead.
+                return LaneScan(files=(), refused=(f"<{exc}>",), complete=False)
             if entry_stat is None or not _stat.S_ISREG(entry_stat.st_mode):
                 refused.append(name)
                 continue
             files.append(directory / lane / name)
     finally:
-        os.close(fd)
+        _safefs.close_quietly(fd)
     return LaneScan(files=tuple(sorted(files)), refused=tuple(refused), complete=not refused)
 
 
@@ -1037,7 +1046,7 @@ def _next(root: Path | str | None, *, claim: bool) -> Claimed | None:
         except PacketError as exc:
             quarantine(path, str(exc), root=directory)
             continue
-        except OSError:  # vanished or unreadable between listing and load — nothing to audit
+        except FileNotFoundError:  # vanished between listing and load — nothing to audit
             continue
         if not claim:
             return Claimed(path=path, packet=packet)
@@ -1162,7 +1171,7 @@ def read_signals(root: Path | str | None = None) -> list[tuple[Path, dict]]:
             raise       # a refused lane is not a bad file: never quarantine over it (see `_next`)
         except PacketError as exc:
             quarantine(path, str(exc), root=directory, lane="signals")
-        except OSError:  # vanished or unreadable between listing and load — nothing to report
+        except FileNotFoundError:  # vanished between listing and load — nothing to report
             continue
     return out
 
@@ -1246,7 +1255,7 @@ def read_verdicts(root: Path | str | None = None) -> list[tuple[Path, dict]]:
             raise       # a refused lane is not a bad file: never quarantine over it (see `_next`)
         except PacketError as exc:
             quarantine(path, str(exc), root=directory, lane="verdicts")
-        except OSError:  # vanished or unreadable between listing and load — nothing to report
+        except FileNotFoundError:  # vanished between listing and load — nothing to report
             continue
     return out
 
@@ -1329,7 +1338,7 @@ def verdicted_packet_ids(root: Path | str | None = None) -> frozenset[str]:
             verdict = loads_verdict(_read_lane_file(path))
         except LaneUnreadable:
             raise       # a refused lane must not shrink this set: short reads back as "unresolved"
-        except (PacketError, OSError):
+        except (PacketError, FileNotFoundError):
             continue
         packet_id = verdict.get("packet_id")
         if isinstance(packet_id, str) and packet_id:
@@ -1372,7 +1381,7 @@ def _next_consult(root: Path | str | None, *, claim: bool) -> Claimed | None:
         except PacketError as exc:
             quarantine(path, str(exc), root=directory, lane="consult")
             continue
-        except OSError:  # vanished or unreadable between listing and load — nothing to answer
+        except FileNotFoundError:  # vanished between listing and load — nothing to answer
             continue
         if not claim:
             return Claimed(path=path, packet=consult)
@@ -1469,7 +1478,7 @@ def read_advice(root: Path | str | None = None) -> list[tuple[Path, dict]]:
             raise       # a refused lane is not a bad file: never quarantine over it (see `_next`)
         except PacketError as exc:
             quarantine(path, str(exc), root=directory, lane="advice")
-        except OSError:  # vanished or unreadable between listing and load — nothing to report
+        except FileNotFoundError:  # vanished between listing and load — nothing to report
             continue
     return out
 
@@ -1525,7 +1534,7 @@ def answered_consult_ids(root: Path | str | None = None) -> frozenset[str]:
             advice = loads_advice(_read_lane_file(path))
         except LaneUnreadable:
             raise       # a refused lane must not shrink this set: short reads back as "unanswered"
-        except (PacketError, OSError):
+        except (PacketError, FileNotFoundError):
             continue
         consult_id = advice.get("consult_id")
         if isinstance(consult_id, str) and consult_id:

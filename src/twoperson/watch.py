@@ -149,7 +149,7 @@ def _writable_root_fd(root: Path | str | None) -> int | None:
     """
     try:
         return inbox._open_root_dir(inbox_root(root), create=True)
-    except (OSError, PacketError) as exc:
+    except (FileNotFoundError, PacketError) as exc:
         # `PacketError` is the refusal (`LaneUnreadable`) the chain raises for a root that is not a
         # real directory, AND for a root it could not create; it is not an `OSError`, so catching
         # only `OSError` would raise out of the watcher on exactly the cases this guards.
@@ -184,12 +184,12 @@ def is_muted(root: Path | str | None = None) -> bool:
     """
     try:
         root_fd = inbox._open_root_dir(inbox_root(root))
-    except (OSError, PacketError):
+    except (FileNotFoundError, PacketError):
         return False        # an unreadable inbox is not a mute; the caller's own probe fails closed
     try:
         return _safefs.stat_nolink(root_fd, SWITCH_NAME) is not None
     finally:
-        os.close(root_fd)
+        _safefs.close_quietly(root_fd)
 
 
 def set_muted(muted: bool, root: Path | str | None = None) -> bool:
@@ -210,17 +210,17 @@ def set_muted(muted: bool, root: Path | str | None = None) -> bool:
     try:
         if muted:
             try:
-                os.close(_safefs.create_exclusive(root_fd, SWITCH_NAME, what=what,
+                _safefs.close_quietly(_safefs.create_exclusive(root_fd, SWITCH_NAME, what=what,
                                                   kind=_safefs.SafeFsRefusal))
             except FileExistsError:
                 pass        # already muted: the switch is idempotent in both directions
         else:
             _safefs.unlink(root_fd, SWITCH_NAME, missing_ok=True, what=what,
                            kind=_safefs.SafeFsRefusal)
-    except (OSError, PacketError) as exc:
+    except (FileNotFoundError, PacketError) as exc:
         log.warning("twoperson.watch_switch_failed", muted=muted, error=str(exc))
     finally:
-        os.close(root_fd)
+        _safefs.close_quietly(root_fd)
     return is_muted(root)
 
 
@@ -319,7 +319,7 @@ def scan_new(root: Path | str | None, cursor: Cursor) -> WatchDelta:
     def _lane(name: str, read, seen: frozenset[str]) -> tuple[tuple[str, ...], frozenset[str]]:
         try:
             now = frozenset(p.name for p in read(root))
-        except LaneUnreadable as exc:
+        except PacketError as exc:
             unreadable.append(f"{name}: {exc}")
             return (), seen          # carry the slice forward; announce nothing, forget nothing
         return tuple(sorted(now - seen)), now
@@ -377,7 +377,7 @@ def _dispatch_lock(root: Path | str | None):
         try:
             handle = _safefs.open_lockfile(root_fd, DISPATCH_LOCK_NAME,
                                            what=f"the watch lock {DISPATCH_LOCK_NAME!r}")
-        except (OSError, PacketError) as exc:
+        except PacketError as exc:
             # `PacketError` is the refusal the primitive raises for a lock name that is a FIFO, a
             # hard link or not a regular file; it is not an `OSError`, so catching only `OSError`
             # would crash the watcher on exactly the hostile case this guard exists for.
@@ -385,7 +385,7 @@ def _dispatch_lock(root: Path | str | None):
             yield
             return
     finally:
-        os.close(root_fd)
+        _safefs.close_quietly(root_fd)
     try:
         try:
             yield
@@ -428,23 +428,62 @@ def load_cursor(root: Path | str | None = None) -> Cursor:
     """
     try:
         root_fd = inbox._open_root_dir(inbox_root(root))
-    except (OSError, PacketError):
+    except (FileNotFoundError, PacketError):
         return Cursor()
     try:
         raw = _safefs.read_regular(root_fd, CURSOR_NAME, MAX_CURSOR_BYTES,
                                    what=f"the cursor file {CURSOR_NAME!r}",
                                    kind=_safefs.SafeFsRefusal)
-    except (OSError, PacketError):
+    except (FileNotFoundError, PacketError):
         return Cursor()
     finally:
-        os.close(root_fd)
+        _safefs.close_quietly(root_fd)
     try:
-        return Cursor.from_json(json.loads(raw.decode("utf-8")))
+        parsed = json.loads(raw.decode("utf-8"))
     except UnicodeDecodeError as exc:
         log.warning("twoperson.watch_cursor_unreadable", reason="not utf-8", error=str(exc))
         return Cursor()
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        log.warning("twoperson.watch_cursor_unreadable", reason="not json", error=str(exc))
         return Cursor()
+    except RecursionError as exc:
+        # The byte cap bounds SIZE, and size is not depth: 400KB of `[` is a perfectly valid UTF-8
+        # file that is well under `MAX_CURSOR_BYTES` and deeper than the interpreter will parse, so
+        # `json.loads` answers with a stack overflow. `RecursionError` is neither an `OSError` nor a
+        # `JSONDecodeError`, so it sailed past every handler here and killed the tick — the same
+        # "a bound that bounds the wrong quantity" shape as the byte cap itself.
+        log.warning("twoperson.watch_cursor_unreadable", reason="too deeply nested", error=str(exc))
+        return Cursor()
+    problem = _cursor_shape(parsed)
+    if problem is not None:
+        # "Tolerant" must not mean "silent": the recovery is the same either way, but a cursor that
+        # is not a cursor is a fact the operator can act on, and a file we cannot account for is
+        # exactly what this log line is for.
+        log.warning("twoperson.watch_cursor_unreadable", reason=problem)
+        return Cursor()
+    return Cursor.from_json(parsed)
+
+
+#: The four keys a cursor is made of, and the only ones a well-formed one can carry.
+_CURSOR_KEYS = ("packets", "verdicts", "consults", "advice")
+
+
+def _cursor_shape(obj: object) -> str | None:
+    """Why ``obj`` is not a cursor, or ``None`` when it is one. Recovering is not the same as saying
+    nothing: `Cursor.from_json` degrades silently by design, so the reason has to be derived HERE,
+    before the tolerance, or a wrong-shaped cursor and an absent one are indistinguishable in the
+    log."""
+    if not isinstance(obj, dict):
+        return f"not a JSON object but {type(obj).__name__}"
+    for key in _CURSOR_KEYS:
+        value = obj.get(key)
+        if value is None:
+            continue                    # an absent lane is an empty lane; that is a cursor too
+        if not isinstance(value, list):
+            return f"{key!r} is {type(value).__name__}, not a list"
+        if any(not isinstance(item, str) for item in value):
+            return f"{key!r} holds something that is not a filename"
+    return None
 
 
 def save_cursor(cursor: Cursor, root: Path | str | None = None) -> None:
@@ -462,13 +501,13 @@ def save_cursor(cursor: Cursor, root: Path | str | None = None) -> None:
     try:
         _replace_in_root(root_fd, CURSOR_NAME,
                          json.dumps(cursor.to_json(), ensure_ascii=False).encode("utf-8"))
-    except (OSError, PacketError) as exc:
+    except (FileNotFoundError, PacketError) as exc:
         # `PacketError` is the refusal the primitive raises for a cursor name that is a FIFO, a hard
         # link or a symlink; it is not an `OSError`, so catching only `OSError` would crash the
         # watcher's save on exactly the hostile case this guard exists for.
         log.warning("twoperson.watch_cursor_save_failed", error=str(exc))
     finally:
-        os.close(root_fd)
+        _safefs.close_quietly(root_fd)
 
 
 # --------------------------------------------------------------------------------------------

@@ -941,12 +941,18 @@ def test_a_publish_survives_a_short_write_whole(root, monkeypatch):
 
 
 def test_a_write_that_makes_no_progress_raises_rather_than_spinning(tmp_path, monkeypatch):
-    """A zero-byte write cannot finish the buffer, and retrying it forever is not an answer."""
+    """A zero-byte write cannot finish the buffer, and retrying it forever is not an answer.
+
+    The refusal, not a bare ``OSError``: a write that made no progress is one of the module's own
+    documented failures, and a caller two levels up is reading `LaneUnreadable` — a raw ``OSError``
+    from here would sail past every refusal handler on the way to the CLI and reach the operator as
+    a traceback.
+    """
     target = tmp_path / "body.bin"
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         monkeypatch.setattr(inbox.os, "write", lambda fd, data: 0)
-        with pytest.raises(OSError):
+        with pytest.raises(PacketError, match="could not be written"):
             _safefs.write_all(fd, b"anything")
     finally:
         os.close(fd)

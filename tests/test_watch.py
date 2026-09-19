@@ -445,11 +445,17 @@ def test_dispatch_lock_degrades_to_a_no_op_when_the_lock_file_cannot_be_opened(r
     # `_safefs.open_lockfile` (i.e. `os.open`) since the descriptor-chain rewire, so a
     # `builtins.open` patch intercepted nothing and this test passed without exercising the
     # degrade at all. `tried` is asserted below so it cannot silently go vacuous again.
+    #
+    # The injected failure is a `SafeFsRefusal` and not a bare `OSError`, because that is now the
+    # only failure the primitive CAN have: `_safefs` converts every syscall errno at one point, so
+    # an `OSError` out of `open_lockfile` is a state the contract says does not exist and a test
+    # that injects one would be pinning a handler for a shape that cannot arrive. The syscall-level
+    # end of this — an `EACCES` on the `os.open` itself — is swept by `tests/test_safefs_faults.py`.
     tried: list[str] = []
 
     def guarded_open(dir_fd, name, **k):
         tried.append(name)
-        raise OSError("cannot create lock file")
+        raise watch._safefs.SafeFsRefusal("the watch lock could not be opened: Permission denied")
 
     monkeypatch.setattr(watch._safefs, "open_lockfile", guarded_open)
 

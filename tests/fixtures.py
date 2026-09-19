@@ -6,7 +6,12 @@ rule that broke rather than "the schema".
 from __future__ import annotations
 
 import copy
+import os
+import pathlib
+import sys
 from typing import Any
+
+from twoperson import _safefs
 
 
 def valid_packet(**overrides: Any) -> dict:
@@ -128,3 +133,49 @@ def guarded(fn, *args, **kwargs):
     if "error" in box:
         raise box["error"]
     return box.get("value")
+
+
+# --------------------------------------------------------------------------------------------
+# Fault injection at the SYSCALL, confined to this package's own frames.
+#
+# A suite that patches ``os.write`` outright also disarms pytest's capture and its logging handlers,
+# because those write with the same function: the injected failure lands in the test harness instead
+# of in the code under test, and the row either errors for the wrong reason or passes for one. The
+# raiser below looks at the CALLER instead — it fails a call only when a frame of ``twoperson`` is on
+# the stack — so the fault is injected precisely where the contract is being tested and nowhere else.
+# --------------------------------------------------------------------------------------------
+
+#: The package whose frames the injector is allowed to break.
+PACKAGE_DIR = pathlib.Path(_safefs.__file__).resolve().parent
+
+
+def _called_from_package() -> bool:
+    """Is a frame of this package on the stack above the injected call?"""
+    frame = sys._getframe(2)            # 0 = here, 1 = the raiser, 2 = the raiser's caller
+    while frame is not None:
+        filename = frame.f_code.co_filename
+        if filename.startswith(str(PACKAGE_DIR) + os.sep):
+            return True
+        frame = frame.f_back
+    return False
+
+
+def fault(errno_value: int, real, detail: str = ""):
+    """A replacement for ``real`` that raises ``OSError(errno_value)`` — from this package only."""
+    def raiser(*args, **kwargs):
+        if _called_from_package():
+            raise OSError(errno_value, detail or os.strerror(errno_value))
+        return real(*args, **kwargs)
+    return raiser
+
+
+def inject(monkeypatch, name: str, errno_value: int, *, holder=None, attr: str | None = None):
+    """Make ``holder.name`` (default: ``os.name``) fail with ``errno_value`` inside this package.
+
+    ``attr`` names the real callable when it is not the attribute being replaced — for a patch that
+    installs a PROXY (an ``os.fdopen`` that returns a handle whose ``read`` fails, say).
+    """
+    holder = os if holder is None else holder
+    real = getattr(holder, attr or name)
+    monkeypatch.setattr(holder, name, fault(errno_value, real))
+    return real

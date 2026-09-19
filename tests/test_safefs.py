@@ -29,7 +29,7 @@ import pytest
 from twoperson import _safefs, inbox, watch
 from twoperson.packet import PacketError
 from twoperson.watch import Cursor
-from tests.fixtures import guarded as _guarded, valid_packet
+from tests.fixtures import guarded as _guarded, inject as _inject, valid_packet
 
 
 @pytest.fixture
@@ -365,7 +365,12 @@ def _enospc_fchmod(monkeypatch):
 
 
 def _enospc_temp_write(monkeypatch):
-    monkeypatch.setattr(_safefs, "write_all", _enospc)
+    # At the SYSCALL the body is drained with, not at `write_all`: `write_all` is the module's own
+    # conversion point for that call, so patching the wrapper would replace the thing under test
+    # with a raiser and prove nothing about the site. `_safefs.os` IS the `os` module, so the
+    # instrumented raiser confines the failure to this package's frames — an unconfined `os.write`
+    # patch also disarms pytest's capture and every logging handler in the process.
+    _inject(monkeypatch, "write", errno.ENOSPC)
 
 
 def _enospc_replace(monkeypatch):
