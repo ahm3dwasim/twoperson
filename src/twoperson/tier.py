@@ -38,6 +38,29 @@ HEAVY_MARKERS: tuple[str, ...] = (
     "migration", "infra", "delete", "policy", "routing", "release", "kernel",
 )
 
+#: Extensions that carry PROSE. The cap asks "could this change break production", and only a
+#: document answers no — so the question is asked of the FILE and never of the directory it sits in.
+_PROSE_SUFFIXES: tuple[str, ...] = (".md", ".rst", ".txt")
+
+#: `.txt` names that are not prose: a dependency manifest is input that gets INSTALLED, so changing
+#: a pin changes what runs. Matched on the file's own basename, so `requirements-dev.txt` counts.
+_MANIFEST_PREFIXES: tuple[str, ...] = ("requirements", "constraints")
+
+
+def _is_prose(path: str) -> bool:
+    """Is this changed path a document rather than something that executes or gets installed?
+
+    Asked of the file's own name. `startswith("docs/")` used to stand in for this and is a statement
+    about the DIRECTORY: it handed the prose ceiling to `docs/deploy.py`, which is a program that
+    touches the deploy path, while `src/deploy.py` was scored as the deploy change it is. An
+    extension that an interpreter or an installer acts on is never prose, wherever it lives, and a
+    path with no extension at all is not assumed to be one.
+    """
+    name = path.rsplit("/", 1)[-1].lower()
+    if not name.endswith(_PROSE_SUFFIXES):
+        return False
+    return not (name.endswith(".txt") and name[:-4].startswith(_MANIFEST_PREFIXES))
+
 
 @dataclass(frozen=True)
 class Classification:
@@ -135,9 +158,9 @@ def classify_packet(packet: Mapping[str, Any]) -> Classification:
     # A change touching no executable path cannot break production, whatever surface its prose is
     # about: a policy document naming `security` and `routing` scored exactly as high as a change to
     # the router. Capped, not exempted — a document change still deserves a careful read, and
-    # `medium` is one. The test is the file list, never the packet's description of itself.
-    if paths and not [q for q in paths
-                      if not (q.endswith(".md") or q.endswith(".txt") or q.startswith("docs/"))]:
+    # `medium` is one. The test is the file list, never the packet's description of itself, and it is
+    # asked of each FILE: see `_is_prose` for why the directory a file sits in cannot answer it.
+    if paths and all(_is_prose(q) for q in paths):
         if score > DOCS_ONLY_CEILING:
             reasons.append(f"docs-only change: capped from {score} to {DOCS_ONLY_CEILING}")
             score = DOCS_ONLY_CEILING

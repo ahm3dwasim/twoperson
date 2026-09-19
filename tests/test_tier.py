@@ -204,3 +204,63 @@ def test_the_bands(score, tier):
     """Pinned individually. The old bands made 3 medium and 6 high, and those two off-by-one steps
     are what put ordinary work on expensive rungs."""
     assert _tier_for(score) == tier
+
+# --- the prose ceiling is asked of the FILE, not of its directory --------------------------------
+#
+# `startswith("docs/")` stood in for "is this a document" and so answered a question about the
+# DIRECTORY. It handed the prose ceiling to `docs/deploy.py` — a program on the deploy path — while
+# scoring `src/deploy.py` as the deploy change it is, and it gave that same ceiling to every `.txt`,
+# including the dependency manifests, which are input that gets installed.
+#
+# The cap only bites above `DOCS_ONLY_CEILING`, so every case below is scored well past it. Nine
+# files carry the file-count bump; the control differs from the case ONLY in the basename shape.
+
+def _nine(path):
+    """Nine files of the same shape as ``path`` — enough to score past the ceiling either way."""
+    head, dot, tail = path.rpartition(".")
+    if not dot or "/" in tail:
+        return [f"{path}-{i}" for i in range(9)]
+    return [f"{head}-{i}.{tail}" for i in range(9)]
+
+
+def test_a_file_under_docs_is_scored_by_its_own_extension_not_its_directory():
+    """The probe: the same file, under a different directory, scored differently — the only thing
+    that changed was the directory name."""
+    in_docs = classify_packet(_heavy_change(_nine("docs/deploy.py")))
+    in_src = classify_packet(_heavy_change(_nine("src/deploy.py")))
+
+    assert in_docs.score == in_src.score, (
+        f"docs/deploy.py scored {in_docs.score} against src/deploy.py's {in_src.score}: the cap is "
+        "reading the directory, not the file"
+    )
+    assert in_docs.score > DOCS_ONLY_CEILING
+    assert not any("docs-only" in r for r in in_docs.reasons), in_docs.reasons
+
+
+@pytest.mark.parametrize("path", ["requirements.txt", "requirements-dev.txt", "constraints.txt"])
+def test_a_dependency_manifest_is_not_prose(path):
+    """`.txt` is the prose extension; a manifest is what gets INSTALLED, so a changed pin is a
+    change to what runs. Read against a control that differs only in the basename."""
+    manifest = classify_packet(_heavy_change(_nine(path)))
+    prose = classify_packet(_heavy_change(_nine("notes.txt")))
+
+    assert prose.score == DOCS_ONLY_CEILING, "plain .txt stopped being prose"
+    assert manifest.score > DOCS_ONLY_CEILING, f"{path} was given the prose ceiling"
+    assert not any("docs-only" in r for r in manifest.reasons), manifest.reasons
+
+
+@pytest.mark.parametrize("path", ["docs/guide.md", "guide.rst", "notes/TODO.txt", "README.md"])
+def test_prose_is_capped_wherever_it_lives(path):
+    """The other direction, kept: a document is a document outside `docs/` too."""
+    capped = classify_packet(_heavy_change(_nine(path)))
+    assert capped.score == DOCS_ONLY_CEILING
+    assert any("docs-only" in r for r in capped.reasons), capped.reasons
+
+
+@pytest.mark.parametrize("path", ["docs/config.yaml", "docs/Makefile", "src/app.py", "docs/note"])
+def test_a_path_that_is_not_prose_keeps_its_score(path):
+    """Never prose by assumption: anything an interpreter or an installer can act on, and anything
+    with no extension at all, keeps whatever it scored."""
+    uncapped = classify_packet(_heavy_change(_nine(path)))
+    assert uncapped.score > DOCS_ONLY_CEILING
+    assert not any("docs-only" in r for r in uncapped.reasons), uncapped.reasons

@@ -33,6 +33,10 @@ All notable changes to this project are documented here. The format follows
   different ship report's different test changes at the same head, since `changed_files` is
   self-reported per packet. The feature was unreleased, so there is no compatibility path for the
   old boolean field.
+- A lane operation that loses a race now absorbs only `FileNotFoundError` — "the source is already
+  gone" — instead of any `OSError`. A lane that cannot be *opened* is a refusal, not a lost race, and
+  reporting it as "nothing to claim" was the same refusal-read-as-absence mistake the lane listing
+  already fails closed to avoid.
 
 ### Fixed
 
@@ -69,6 +73,39 @@ All notable changes to this project are documented here. The format follows
   own; a refused lane carries its cursor slice forward untouched, so nothing in it is announced and
   nothing in it is marked seen; and `watch --once` exits `2` with the refusal on stderr instead of
   printing "nothing new" and exiting `0`.
+- **`O_NOFOLLOW` was guarding only the last component, so a symlinked inbox ROOT or a lane swapped
+  for a symlink after the listing was still followed.** Opening `<root>/<lane>` with `O_NOFOLLOW`
+  refuses a symlinked *lane* and says nothing about the root above it, which the kernel re-resolved
+  on every call — a scan through a symlinked root returned `complete=True` for a listing taken
+  outside the inbox, and a lane swapped after the scan redirected the read, the claim and the rename
+  that followed it, because the scanner closes its descriptor and hands back plain paths. Every
+  read, claim, rename and publish is now addressed through a **descriptor chain**: the root is opened
+  once with `O_NOFOLLOW | O_DIRECTORY`, each lane is opened by `dir_fd` from that root, and each
+  entry by `dir_fd` from its lane — `os.rename`/`os.replace` take `src_dir_fd`/`dst_dir_fd` and name
+  no path at all, and the size read, the free-name choice and the `.reason.txt` write go through the
+  same chain. The root itself is validated by that open rather than by an `lstat` that a second
+  resolution could invalidate; directories *above* the inbox root are the operator's own layout and
+  stay out of scope, which the module now says in a comment. A symlinked root is refused by scan,
+  read, claim, publish and `_ensure_tree`, and a lane swapped for a symlink between the listing and
+  the read or the claim is refused in the syscall that would have followed it.
+- **A publish could report success after writing only part of the packet.** `os.write` may write
+  fewer bytes than it was given and report how many; the return value was ignored, so a short write
+  left a truncated packet in the lane with no error anywhere. The buffer is now drained in a loop,
+  and a write that makes no progress raises rather than spinning.
+- **A failed publish left its staging file behind and blocked every retry of that packet.** The
+  staging entry was unlinked only when `os.replace` failed, so a failure in the write, the fsync or
+  the destination lookup — or the short write above — stranded it, and since the staging create is
+  `O_EXCL` the next attempt at the same packet refused forever. Every step after the create is now
+  inside one cleanup block: any failure removes the staging entry and re-raises, so a retry of the
+  same packet succeeds.
+- **The docs-only score cap was decided by the directory a file sits in, not by the file.** The
+  predicate was `path.startswith("docs/") or path.endswith(".md") or path.endswith(".txt")`, so
+  `docs/deploy.py` — a program on the deploy path — was capped to the prose ceiling while
+  `src/deploy.py` scored as the deploy change it is, and any `.txt` anywhere was treated as prose.
+  The cap now asks the file's own extension: `.md` and `.rst` are prose, `.txt` is prose unless its
+  basename is a dependency manifest (`requirements*.txt`, `constraints*.txt` — input that gets
+  installed, so changing a pin changes what runs), and no executable or source extension is ever
+  prose wherever it lives. A path with no extension is not assumed to be one.
 
 ## [0.1.1] - 2026-09-03
 

@@ -46,7 +46,10 @@ Safety properties this module owns:
 * **Exclusive claim.** Claiming is `os.rename` out of `pending/`; the loser of a race gets an
   `OSError`, never a duplicate. A packet is therefore audited at most once.
 * **No path authority.** Target names are built only from a validated slug and a normalised
-  timestamp, and every write is asserted to resolve inside the inbox root.
+  timestamp, and every read, claim, rename and publish is addressed through a descriptor chain
+  opened `O_NOFOLLOW | O_DIRECTORY` from the inbox root down: the root descriptor, then the lane by
+  `dir_fd`, then the entry by `dir_fd`. A symlinked root, or a lane swapped for a symlink after it
+  was listed, is refused in the syscall that would have followed it rather than re-resolved.
 * **Hostile input is quarantined, not returned.** Anything in `pending/` that is oversize,
   unparseable, symlinked, a directory, or schema-invalid is moved to `rejected/` with a reason.
 * **A refusal is not an empty lane.** If a lane cannot be listed in full, its readers raise
@@ -275,35 +278,44 @@ def inbox_root(root: Path | str | None = None) -> Path:
     return Path(override) if override else _default_parent() / INBOX_DIRNAME
 
 
-def _chmod_own_directory(path: Path) -> None:
-    """`chmod` a directory we opened ourselves, never a path we merely named.
+def _fchmod_dir(fd: int) -> None:
+    """Set a directory we are HOLDING to owner-only.
 
     `mkdir(exist_ok=True)` SUCCEEDS on a symlink that points at a directory — it is an "already
     exists" case, not an error — and `os.chmod` then follows that symlink. So a lane replaced by a
     link to somewhere else had the *target's* permissions rewritten to 0700 by an ordinary `publish`
-    or `archive`, outside the inbox entirely. Opening with `O_NOFOLLOW` refuses the link atomically,
-    and `fchmod` acts on the descriptor, so what is created, what is checked, and what is modified
-    are all provably the same object.
+    or `archive`, outside the inbox entirely. Every directory here is opened with `O_NOFOLLOW`
+    relative to the descriptor above it and permission-set with `fchmod`, so what is created, what
+    is checked, and what is modified are all provably the same object.
     """
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
-    try:
-        os.fchmod(fd, _DIR_MODE)
-    finally:
-        os.close(fd)
+    os.fchmod(fd, _DIR_MODE)
 
 
 def _ensure_tree(root: Path) -> Path:
     """Create the inbox tree owner-only. `mkdir(mode=...)` is umask-masked, so chmod explicitly.
 
-    Every directory here is created and then permission-set THROUGH ITS OWN DESCRIPTOR: see
-    `_chmod_own_directory` for why naming it twice is not the same as holding it once.
+    Each level is created RELATIVE to the descriptor of the level above it, and the chmod happens
+    through the level's own descriptor: see `_fchmod_dir` for why naming a directory twice is not
+    the same as holding it once. Creating `root / name` by path instead would re-resolve the root
+    once per lane, so a root swapped for a symlink part-way through the loop would have had the
+    remaining lanes created somewhere else.
     """
     root.mkdir(parents=True, exist_ok=True)
-    _chmod_own_directory(root)
-    for name in _SUBDIRS:
-        directory = root / name
-        directory.mkdir(exist_ok=True)
-        _chmod_own_directory(directory)
+    root_fd = _open_root_dir(root)      # refuses a root that is a symlink, not a real directory
+    try:
+        _fchmod_dir(root_fd)
+        for name in _SUBDIRS:
+            try:
+                os.mkdir(name, dir_fd=root_fd)
+            except FileExistsError:
+                pass                    # already there; the open below decides whether it is usable
+            lane_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=root_fd)
+            try:
+                _fchmod_dir(lane_fd)
+            finally:
+                os.close(lane_fd)
+    finally:
+        os.close(root_fd)
     return root
 
 
@@ -312,9 +324,18 @@ def _publish_lock(root: Path):
     """Serialise name-selection + rename across processes (the repo's budget-ledger idiom).
 
     The lock lives on its own file, never on a packet, so an atomic replace can never disturb a
-    concurrent locker's open file description.
+    concurrent locker's open file description. It is created relative to the root's descriptor with
+    `O_NOFOLLOW`, so a `.lock` swapped for a symlink cannot aim the lock — or the file it opens —
+    at something outside the inbox.
     """
-    handle = open(root / ".lock", "w")
+    root_fd = _open_root_dir(root)
+    try:
+        handle = os.fdopen(
+            os.open(".lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=root_fd),
+            "w",
+        )
+    finally:
+        os.close(root_fd)
     try:
         fcntl.flock(handle, fcntl.LOCK_EX)
         yield
@@ -334,15 +355,211 @@ def _assert_inside(root: Path, target: Path) -> Path:
     return target
 
 
-def _free_name(path: Path) -> Path:
-    """``path`` if it is free, else ``<stem>-2``, ``<stem>-3``… — publishing never clobbers."""
-    if not path.exists():
-        return path
-    for suffix in range(2, 1000):
-        candidate = path.with_name(f"{path.stem}-{suffix}{path.suffix}")
-        if not candidate.exists():
+# --------------------------------------------------------------------------------------------
+# The descriptor chain
+#
+# Every path an inbox operation touches has the shape `<root>/<lane>/<entry>`, and each hop is
+# opened with `O_NOFOLLOW` RELATIVE TO THE DESCRIPTOR ABOVE IT. `O_NOFOLLOW` on a bare path guards
+# only its LAST component: the components above it are resolved by the kernel on every call, so a
+# root or a lane swapped for a symlink is followed even though each individual open "checked" a
+# symlink. Holding the chain and addressing each hop by `dir_fd` removes the question entirely — an
+# operation can no longer be redirected by a swap of a path it does not name.
+#
+# The root is validated by that same open. `lstat`-then-open would be two resolutions with a window
+# between them, which is not a check; `O_NOFOLLOW | O_DIRECTORY` refuses a symlinked or
+# non-directory root in the single syscall that would have followed it. Directories ABOVE the inbox
+# root are the operator's own layout and are deliberately out of scope: the inbox does not own
+# them, cannot know what they are for, and refusing a checkout reached through a symlinked parent
+# would refuse ordinary setups.
+# --------------------------------------------------------------------------------------------
+
+def _open_root_dir(root: Path) -> int:
+    """The inbox root's own descriptor, or `OSError` if the root is not a real directory."""
+    return os.open(root, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+
+
+def _lane_dir_fd(root: Path, lane: str) -> int:
+    """An open descriptor for one lane, reached THROUGH the root's, or `OSError`.
+
+    `O_NOFOLLOW | O_DIRECTORY` refuses a symlinked or non-directory lane in the same syscall that
+    opens it, and opening it relative to the root's descriptor means the root is held for that hop
+    too. Every read, rename and write below is addressed RELATIVE to the descriptor this returns,
+    so no operation depends on a path meaning the same thing twice.
+    """
+    root_fd = _open_root_dir(root)
+    try:
+        return os.open(lane, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=root_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _split_lane_path(path: Path) -> tuple[Path, str, str]:
+    """``<root>/<lane>/<entry>`` -> ``(root, lane, entry)``.
+
+    Exactly two components are stripped, so a root that is itself a deep or a relative path comes
+    back the way `_lane_scan` built it. The shape is the module's own invariant: every path handed
+    out by a lane listing, and every path handed back to a lane operation, is ``root / lane / name``
+    and nothing else is a lane entry.
+    """
+    lane_dir = path.parent
+    return lane_dir.parent, lane_dir.name, path.name
+
+
+def _open_lane_entry(path: Path) -> int:
+    """An open descriptor for one lane ENTRY, resolved from the root down under `O_NOFOLLOW`.
+
+    Handing a bare path to `open()` guards only its last component, so an entry could be listed
+    safely and then read from outside the inbox once the *lane* above it was swapped for a symlink
+    in the window between the listing and the read. The chain is root -> lane -> entry, and each hop
+    is refused in the syscall that would have followed it.
+    """
+    root, lane, name = _split_lane_path(path)
+    lane_fd = _lane_dir_fd(root, lane)
+    try:
+        return os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=lane_fd)
+    finally:
+        os.close(lane_fd)
+
+
+def _read_lane_file(path: Path) -> bytes:
+    """Read one lane file through the descriptor chain, refusing a symlink AT OPEN.
+
+    The check and the open are one operation, so a swap between them is not a race to lose: the
+    refusal happens in the syscall that would otherwise have consumed the wrong file. A swap to a
+    different REGULAR file is still possible and is not claimed otherwise; that attacker already
+    holds write access to a 0700 directory, and what they would gain is writing a packet, which they
+    could do directly.
+    """
+    fd = _open_lane_entry(path)
+    try:
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            return handle.read()
+    finally:
+        os.close(fd)
+
+
+def _lane_entry_size(path: Path) -> int:
+    """One lane entry's size, read through the same chain as its content.
+
+    A size cap is a read of the entry too: `path.stat()` re-resolves the lane by path and follows a
+    symlink, so the number a caller used to decide whether to open the file could come from a file
+    the read itself would then refuse.
+    """
+    fd = _open_lane_entry(path)
+    try:
+        return os.fstat(fd).st_size
+    finally:
+        os.close(fd)
+
+
+def _assert_plain_name(name: str) -> str:
+    """Refuse a lane entry name that is not exactly ONE filesystem component.
+
+    Names moved by this module come from a directory listing, so they are one component by
+    construction. The check exists so a caller passing a constructed path cannot turn a move into a
+    traversal, and so the refusal is deliberate rather than whatever the kernel happened to answer.
+    Separators are POSIX ones, which is the surface this module already requires.
+    """
+    if not name or name in (".", "..") or "/" in name or "\0" in name:
+        raise PacketError(f"refusing a lane entry name that is not one component: {name!r}")
+    return name
+
+
+def _occupies(lane_fd: int, name: str) -> bool:
+    """Is this name already taken IN THIS LANE? A symlink occupies its own name, so it counts.
+
+    An error other than "there is no such entry" propagates: if the lane cannot be interrogated then
+    we do not know the name is free, and choosing it anyway is how a publish overwrites something.
+    """
+    try:
+        os.stat(name, dir_fd=lane_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _free_name_in(lane_fd: int, name: str) -> str:
+    """``name`` if it is free IN THIS LANE, else ``<stem>-2``, ``<stem>-3``… — never clobbers.
+
+    The question is asked, and the answer is used, against ONE descriptor. `Path.exists()` resolves
+    the lane by path, so the name that was chosen and the name that was then used could be answered
+    by two different directories; here the check and the operation cannot disagree about which lane
+    they mean.
+    """
+    if not _occupies(lane_fd, name):
+        return name
+    stem, suffix = os.path.splitext(name)
+    for index in range(2, 1000):
+        candidate = f"{stem}-{index}{suffix}"
+        if not _occupies(lane_fd, candidate):
             return candidate
-    raise PacketError(f"cannot find a free filename for {path.name}")
+    raise PacketError(f"cannot find a free filename for {name}")
+
+
+def _write_all(fd: int, body: bytes) -> None:
+    """Write the WHOLE buffer, in as many calls as the kernel needs.
+
+    `os.write` may write fewer bytes than it was given and report how many. Ignoring that return
+    value publishes a TRUNCATED file and reports success — the tail of the body is silently dropped
+    — so the buffer is drained in a loop. A zero-byte write has made no progress and is raised
+    rather than spun on.
+    """
+    view = memoryview(body)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError(f"short write: {len(view)} byte(s) of the body were not written")
+        view = view[written:]
+
+
+def _write_lane_file(path: Path, body: bytes) -> None:
+    """Create or replace one file IN a lane, through the descriptor chain.
+
+    Used for the `.reason.txt` recorded beside a quarantined packet. `Path.write_text` resolves the
+    lane again, so a lane swapped for a symlink would have had the reason — and only the reason —
+    written outside the inbox.
+    """
+    root, lane, name = _split_lane_path(path)
+    _assert_plain_name(name)
+    lane_fd = _lane_dir_fd(root, lane)
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600,
+                     dir_fd=lane_fd)
+        try:
+            _write_all(fd, body)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(lane_fd)
+
+
+def _move_lane_entry(src: Path, dst_lane: str) -> Path:
+    """Move one lane entry into another lane of the SAME inbox, both ends by descriptor.
+
+    `os.rename(src, dst)` resolves both paths again, so a lane swapped for a symlink after the
+    listing redirected the move — and the file it moved — outside the inbox. `os.rename` with
+    `src_dir_fd`/`dst_dir_fd` names no path at all: both lanes are held open with
+    `O_NOFOLLOW | O_DIRECTORY`, and a rename never follows a symlink at either end (it replaces
+    one), so neither end can be redirected. The free-name choice is made against the destination
+    lane's descriptor for the same reason.
+
+    `FileNotFoundError` is left to the caller: it is what "the source is already gone" looks like,
+    which every caller here treats as a lost race and not as a failure. A lane that cannot be
+    opened is a different answer and is allowed to propagate.
+    """
+    root, src_lane, name = _split_lane_path(src)
+    _assert_plain_name(name)
+    src_fd = _lane_dir_fd(root, src_lane)
+    try:
+        dst_fd = _lane_dir_fd(root, dst_lane)
+        try:
+            final = _free_name_in(dst_fd, name)
+            os.rename(name, final, src_dir_fd=src_fd, dst_dir_fd=dst_fd)
+        finally:
+            os.close(dst_fd)
+    finally:
+        os.close(src_fd)
+    return root / dst_lane / final
 
 
 def _stamp(created_at: str) -> str:
@@ -355,34 +572,12 @@ def _stamp(created_at: str) -> str:
 # Publish
 # --------------------------------------------------------------------------------------------
 
-def _lane_dir_fd(directory: Path, lane: str) -> int:
-    """An open descriptor for one lane, or `OSError` if it is not a real directory.
-
-    `O_NOFOLLOW | O_DIRECTORY` refuses a symlinked or non-directory lane in the same syscall that
-    opens it. Every read and write below is then addressed RELATIVE to this descriptor, so no
-    operation depends on the path meaning the same thing twice.
-    """
-    return os.open(directory / lane, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
-
-
-def _read_lane_file(path: Path) -> bytes:
-    """Read one lane file, refusing a symlink AT OPEN rather than after a stat.
-
-    The lane scan stats entries safely against the lane descriptor and then hands back plain paths,
-    which every reader would otherwise re-resolve with `read_bytes()` — so swapping an entry for a
-    symlink between the scan and the read made the reader consume content from outside the inbox.
-    The check was sound and the thing it checked was not the thing that got opened.
-
-    `O_NOFOLLOW` moves the refusal into the open itself. A swap to a different REGULAR file is still
-    possible and is not claimed otherwise; that attacker already holds write access to a 0700
-    directory, and what they would gain is writing a packet, which they could do directly.
-    """
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+def _unlink_staging(staging_fd: int, name: str) -> None:
+    """Best-effort removal of a staging entry — the caller's own failure is the one to report."""
     try:
-        with os.fdopen(fd, "rb", closefd=False) as handle:
-            return handle.read()
-    finally:
-        os.close(fd)
+        os.unlink(name, dir_fd=staging_fd)
+    except OSError as exc:
+        log.warning("twoperson.staging_cleanup_failed", name=_safe_name(name), error=str(exc))
 
 
 def _atomic_publish(directory: Path, lane: str, name: str, body: str) -> Path:
@@ -395,8 +590,15 @@ def _atomic_publish(directory: Path, lane: str, name: str, body: str) -> Path:
     would let a lane swapped for a symlink in that window send them outside the inbox. Both
     directories are held open with `O_NOFOLLOW | O_DIRECTORY` for the whole operation instead, and
     the create and the rename are addressed relative to those descriptors — a later swap of either
-    path cannot redirect an operation that no longer names a path. The containment assertions stay:
-    they reject a hostile NAME, which is a different attack from a hostile directory.
+    path cannot redirect an operation that no longer names a path. The containment assertion stays:
+    it rejects a hostile NAME, which is a different attack from a hostile directory. The free-name
+    choice is made against the destination's descriptor too, so the name that is picked is the name
+    the rename actually uses.
+
+    The staging entry is removed on ANY failure after it was created, not just on a failed
+    `os.replace`. `O_EXCL` means a leftover would refuse the next attempt at the same packet: a
+    short write, a destination lookup that raises, and a failed replace all have to leave
+    `staging/` as they found it, or one failed publish blocks every retry of it.
     """
     _assert_inside(directory, directory / "staging" / name)
     with _publish_lock(directory):
@@ -408,21 +610,22 @@ def _atomic_publish(directory: Path, lane: str, name: str, body: str) -> Path:
                 # write through it; O_NOFOLLOW so an existing symlink is refused, not followed.
                 handle = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                                  0o600, dir_fd=staging_fd)
+                # Everything from the create to the replace is inside this block on purpose: each of
+                # those steps can fail, and each of them leaves the staging name behind if it does.
                 try:
-                    os.write(handle, body.encode("utf-8"))
+                    _write_all(handle, body.encode("utf-8"))
+                    final = _free_name_in(lane_fd, name)
+                    os.replace(name, final, src_dir_fd=staging_fd, dst_dir_fd=lane_fd)
+                except BaseException:
+                    _unlink_staging(staging_fd, name)
+                    raise
                 finally:
                     os.close(handle)
-                target = _assert_inside(directory, _free_name(directory / lane / name))
-                try:
-                    os.replace(name, target.name, src_dir_fd=staging_fd, dst_dir_fd=lane_fd)
-                except OSError:
-                    os.unlink(name, dir_fd=staging_fd)
-                    raise
             finally:
                 os.close(lane_fd)
         finally:
             os.close(staging_fd)
-    return target
+    return directory / lane / final
 
 
 def publish(packet: Mapping[str, Any], *, root: Path | str | None = None) -> Path:
@@ -470,7 +673,7 @@ def _all_verdicts(root: Path | str | None) -> list[dict]:
     for lane in ("verdicts", "verdicts_seen"):
         for path in _lane_files(root, lane):
             try:
-                if path.stat().st_size > MAX_VERDICT_BYTES:
+                if _lane_entry_size(path) > MAX_VERDICT_BYTES:
                     continue
                 out.append(loads_verdict(_read_lane_file(path)))
             except (PacketError, OSError):
@@ -684,10 +887,15 @@ def _lane_scan(root: Path | str | None, lane: str) -> LaneScan:
     lane cannot be opened at all (ELOOP on Linux, ENOTDIR on macOS), and neither can a lane that is a
     regular file, a FIFO, or anything else that is not a directory. No enumeration of the ways a lane
     can fail to be a directory has to be complete for that to hold.
+
+    The lane is opened relative to the ROOT's descriptor, not by the path `root / lane`. Opening the
+    path guards only the lane component: the root above it was still resolved by the kernel, so a
+    symlinked root was followed and a listing from outside the inbox came back as a COMPLETE scan of
+    this lane — the same "checked something other than what was opened" mistake, one level up.
     """
-    directory = inbox_root(root) / lane
+    directory = inbox_root(root)
     try:
-        fd = os.open(directory, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+        fd = _lane_dir_fd(directory, lane)
     except FileNotFoundError:
         return LaneScan(files=(), refused=(), complete=True)   # never created: provably empty
     except OSError as exc:
@@ -719,7 +927,7 @@ def _lane_scan(root: Path | str | None, lane: str) -> LaneScan:
             if not _stat.S_ISREG(entry_stat.st_mode):
                 refused.append(name)
                 continue
-            files.append(directory / name)
+            files.append(directory / lane / name)
     finally:
         os.close(fd)
     return LaneScan(files=tuple(sorted(files)), refused=tuple(refused), complete=not refused)
@@ -755,7 +963,7 @@ def has_pending(root: Path | str | None = None) -> bool:
 
 def _load(path: Path) -> dict:
     """Read + validate one pending file, size-guarded before any parse."""
-    size = path.stat().st_size
+    size = _lane_entry_size(path)
     if size > MAX_PACKET_BYTES:
         raise PacketError(f"packet: size {size} exceeds the {MAX_PACKET_BYTES}-byte limit")
     return loads_packet(_read_lane_file(path))
@@ -763,11 +971,11 @@ def _load(path: Path) -> dict:
 
 def quarantine(path: Path, reason: str, *, root: Path | str | None = None) -> Path:
     """Move a bad packet to ``rejected/`` and record why beside it. Returns the new path."""
-    directory = _ensure_tree(inbox_root(root))
-    target = _assert_inside(directory, _free_name(directory / "rejected" / path.name))
-    os.rename(path, target)
-    target.with_name(f"{target.stem}.reason.txt").write_text(
-        f"{datetime.now(timezone.utc).isoformat(timespec='seconds')}\n{reason}\n", encoding="utf-8"
+    _ensure_tree(inbox_root(root))
+    target = _move_lane_entry(path, "rejected")
+    _write_lane_file(
+        target.parent / f"{target.stem}.reason.txt",
+        f"{datetime.now(timezone.utc).isoformat(timespec='seconds')}\n{reason}\n".encode("utf-8"),
     )
     log.warning("twoperson.quarantined", path=str(target), reason=reason)
     return target
@@ -788,11 +996,13 @@ def _next(root: Path | str | None, *, claim: bool) -> Claimed | None:
         if not claim:
             return Claimed(path=path, packet=packet)
         _ensure_tree(directory)
-        target = _assert_inside(directory, _free_name(directory / "claimed" / path.name))
         try:
-            os.rename(path, target)
-        except OSError:
+            target = _move_lane_entry(path, "claimed")
+        except FileNotFoundError:
             continue  # another auditor claimed it first; there is no duplicate to hand back
+        # Only "the source is already gone" is absorbed above. A lane that cannot be OPENED is a
+        # different answer entirely, and letting it through as "nothing to claim" is the same
+        # refusal-read-as-absence mistake the lane listing fails closed to avoid.
         log.info("twoperson.claimed", packet_id=packet["packet_id"], path=str(target))
         return Claimed(path=target, packet=packet)
     return None
@@ -823,11 +1033,11 @@ def requeue_claimed(path: Path, *, root: Path | str | None = None) -> Path:
     the next tick INSTEAD of sitting lost in `claimed/` forever with no verdict ever written.
 
     Exclusive via `os.rename`: if another process already requeued or re-claimed this exact path, the
-    rename raises `OSError` — the caller should treat that as "someone else already recovered it",
-    not as a failure to surface, exactly like a lost `claim_next` race is not an error."""
-    directory = _ensure_tree(inbox_root(root))
-    target = _assert_inside(directory, _free_name(directory / "pending" / path.name))
-    os.rename(path, target)
+    rename raises `FileNotFoundError` — the caller should treat that as "someone else already
+    recovered it", not as a failure to surface, exactly like a lost `claim_next` race is not an
+    error. A lane that cannot be opened raises instead: that is a refusal, not a lost race."""
+    _ensure_tree(inbox_root(root))
+    target = _move_lane_entry(path, "pending")
     log.warning("twoperson.requeued", path=str(target))
     return target
 
@@ -846,9 +1056,8 @@ def archive_claimed(path: Path, *, root: Path | str | None = None) -> Path:
     audited again for no reason. Best-effort by design — call this AFTER `publish_verdict` succeeds;
     if archiving itself fails, the verdict (the actual audit record) is already safe, so a caller
     should log and move on rather than treat it as a review failure."""
-    directory = _ensure_tree(inbox_root(root))
-    target = _assert_inside(directory, _free_name(directory / "audited" / path.name))
-    os.rename(path, target)
+    _ensure_tree(inbox_root(root))
+    target = _move_lane_entry(path, "audited")
     log.info("twoperson.archived", path=str(target))
     return target
 
@@ -893,7 +1102,7 @@ def read_signals(root: Path | str | None = None) -> list[tuple[Path, dict]]:
     out: list[tuple[Path, dict]] = []
     for path in pending_signals(directory):
         try:
-            size = path.stat().st_size
+            size = _lane_entry_size(path)
             if size > MAX_SIGNAL_BYTES:
                 raise PacketError(f"signal: size {size} exceeds the {MAX_SIGNAL_BYTES}-byte limit")
             out.append((path, loads_signal(_read_lane_file(path))))
@@ -933,10 +1142,9 @@ def ack_signals(paths: Iterable[Path] | None = None, *, root: Path | str | None 
     for path in candidates:
         if path.resolve().parent != signals_dir:
             continue  # only ack a file that is actually a signal in THIS inbox's signals/ lane
-        target = _assert_inside(directory, _free_name(directory / "signals_seen" / path.name))
         try:
-            os.rename(path, target)
-        except OSError:
+            target = _move_lane_entry(path, "signals_seen")
+        except FileNotFoundError:
             continue  # another auditor took it first, or it vanished — nothing to hand back
         acked.append(target)
     if acked:
@@ -969,7 +1177,7 @@ def read_verdicts(root: Path | str | None = None) -> list[tuple[Path, dict]]:
     out: list[tuple[Path, dict]] = []
     for path in pending_verdicts(directory):
         try:
-            size = path.stat().st_size
+            size = _lane_entry_size(path)
             if size > MAX_VERDICT_BYTES:
                 raise PacketError(f"verdict: size {size} exceeds the {MAX_VERDICT_BYTES}-byte limit")
             out.append((path, loads_verdict(_read_lane_file(path))))
@@ -1008,10 +1216,9 @@ def ack_verdicts(paths: Iterable[Path], *, root: Path | str | None = None) -> li
         # Only ack a file that is actually a verdict in THIS inbox's verdicts/ lane.
         if path.resolve().parent != verdicts_dir:
             continue
-        target = _assert_inside(directory, _free_name(directory / "verdicts_seen" / path.name))
         try:
-            os.rename(path, target)
-        except OSError:
+            target = _move_lane_entry(path, "verdicts_seen")
+        except FileNotFoundError:
             continue  # another reader took it first, or it vanished — nothing to hand back
         acked.append(target)
     if acked:
@@ -1050,7 +1257,7 @@ def verdicted_packet_ids(root: Path | str | None = None) -> frozenset[str]:
     ids: set[str] = set()
     for path in _lane_files(directory, "verdicts") + _lane_files(directory, "verdicts_seen"):
         try:
-            size = path.stat().st_size
+            size = _lane_entry_size(path)
             if size > MAX_VERDICT_BYTES:
                 continue
             verdict = loads_verdict(_read_lane_file(path))
@@ -1078,7 +1285,7 @@ def has_pending_consults(root: Path | str | None = None) -> bool:
 
 def _load_consult(path: Path) -> dict:
     """Read + validate one pending consult, size-guarded before any parse."""
-    size = path.stat().st_size
+    size = _lane_entry_size(path)
     if size > MAX_CONSULT_BYTES:
         raise PacketError(f"consult: size {size} exceeds the {MAX_CONSULT_BYTES}-byte limit")
     return loads_consult(_read_lane_file(path))
@@ -1100,10 +1307,9 @@ def _next_consult(root: Path | str | None, *, claim: bool) -> Claimed | None:
         if not claim:
             return Claimed(path=path, packet=consult)
         _ensure_tree(directory)
-        target = _assert_inside(directory, _free_name(directory / "consult_claimed" / path.name))
         try:
-            os.rename(path, target)
-        except OSError:
+            target = _move_lane_entry(path, "consult_claimed")
+        except FileNotFoundError:
             continue  # another auditor claimed it first; there is no duplicate to hand back
         log.info("twoperson.consult_claimed", consult_id=consult["consult_id"], path=str(target))
         return Claimed(path=target, packet=consult)
@@ -1133,9 +1339,8 @@ def requeue_claimed_consult(path: Path, *, root: Path | str | None = None) -> Pa
     """Move a claimed consult back to ``consult/`` — the consult-lane sibling of `requeue_claimed`,
     for the same reason: a crash between `claim_consult` and `publish_advice` must not lose the
     question forever. Exclusive via `os.rename`, same race handling as `requeue_claimed`."""
-    directory = _ensure_tree(inbox_root(root))
-    target = _assert_inside(directory, _free_name(directory / "consult" / path.name))
-    os.rename(path, target)
+    _ensure_tree(inbox_root(root))
+    target = _move_lane_entry(path, "consult")
     log.warning("twoperson.consult_requeued", path=str(target))
     return target
 
@@ -1150,9 +1355,8 @@ def archive_claimed_consult(path: Path, *, root: Path | str | None = None) -> Pa
     """Move a claimed consult to ``consult_answered/`` — the consult-lane sibling of
     `archive_claimed`, for the same reason: keeps `consult_claimed/` meaning "unresolved" so the
     stale-claim sweep never mistakes a completed answer for an orphan."""
-    directory = _ensure_tree(inbox_root(root))
-    target = _assert_inside(directory, _free_name(directory / "consult_answered" / path.name))
-    os.rename(path, target)
+    _ensure_tree(inbox_root(root))
+    target = _move_lane_entry(path, "consult_answered")
     log.info("twoperson.consult_archived", path=str(target))
     return target
 
@@ -1182,7 +1386,7 @@ def read_advice(root: Path | str | None = None) -> list[tuple[Path, dict]]:
     out: list[tuple[Path, dict]] = []
     for path in pending_advice(directory):
         try:
-            size = path.stat().st_size
+            size = _lane_entry_size(path)
             if size > MAX_ADVICE_BYTES:
                 raise PacketError(f"advice: size {size} exceeds the {MAX_ADVICE_BYTES}-byte limit")
             out.append((path, loads_advice(_read_lane_file(path))))
@@ -1215,10 +1419,9 @@ def ack_advice(paths: Iterable[Path], *, root: Path | str | None = None) -> list
         # Only ack a file that is actually an advice in THIS inbox's advice/ lane.
         if path.resolve().parent != advice_dir:
             continue
-        target = _assert_inside(directory, _free_name(directory / "advice_seen" / path.name))
         try:
-            os.rename(path, target)
-        except OSError:
+            target = _move_lane_entry(path, "advice_seen")
+        except FileNotFoundError:
             continue  # another reader took it first, or it vanished — nothing to hand back
         acked.append(target)
     if acked:
@@ -1237,7 +1440,7 @@ def answered_consult_ids(root: Path | str | None = None) -> frozenset[str]:
     ids: set[str] = set()
     for path in _lane_files(directory, "advice") + _lane_files(directory, "advice_seen"):
         try:
-            size = path.stat().st_size
+            size = _lane_entry_size(path)
             if size > MAX_ADVICE_BYTES:
                 continue
             advice = loads_advice(_read_lane_file(path))

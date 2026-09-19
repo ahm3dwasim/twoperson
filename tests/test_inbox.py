@@ -116,21 +116,30 @@ def test_a_packet_is_claimed_at_most_once(root):
 
 
 def test_claim_race_only_one_winner(root, monkeypatch):
-    """Two claimers hitting the same file: the loser must get nothing, not a duplicate."""
+    """Two claimers hitting the same file: the loser must get nothing, not a duplicate.
+
+    The claim rename is addressed through lane descriptors now, so this spy sees a bare NAME and a
+    pair of `dir_fd`s instead of two paths. The "other" claimer is simulated through the same
+    descriptors, which is exactly what a real concurrent claimer would use — the race, and the
+    loser's answer to it, are unchanged.
+    """
     inbox.publish(valid_packet())
     target = inbox.pending()[0]
     real_rename = os.rename
     stolen = {"done": False}
 
-    def steal_then_rename(src, dst):
-        if not stolen["done"] and str(src) == str(target):
+    def steal_then_rename(src, dst, **kwargs):
+        if not stolen["done"] and str(src) == target.name:
             stolen["done"] = True
-            real_rename(src, root / "claimed" / target.name)  # the "other" claimer wins first
-        return real_rename(src, dst)
+            real_rename(src, dst, **kwargs)  # the "other" claimer wins first
+        return real_rename(src, dst, **kwargs)
 
     (root / "claimed").mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(inbox.os, "rename", steal_then_rename)
     assert inbox.claim_next() is None
+    assert [p.name for p in inbox.claimed()] == [target.name], (
+        "the packet the other claimer took is still exactly where they put it"
+    )
 
 
 def test_peek_does_not_claim(root):
@@ -534,16 +543,24 @@ def test_the_lane_is_opened_once_and_every_entry_is_stated_against_that_descript
 
     This pins the structural property instead of trying to lose a race in a test: the listing goes
     through ONE descriptor opened with `O_NOFOLLOW | O_DIRECTORY`, so nothing it returns depends on
-    the path resolving the same way twice.
+    the path resolving the same way twice. The descriptor now comes from the chain — root first,
+    then the lane relative to it — so the root cannot be re-resolved behind the listing's back
+    either; `_lane_dir_fd` is where both hops and both flags live.
     """
     import inspect
 
-    source = inspect.getsource(inbox._lane_scan)
-    assert "O_NOFOLLOW" in source and "O_DIRECTORY" in source, (
+    chain = inspect.getsource(inbox._lane_dir_fd)
+    assert "O_NOFOLLOW" in chain and "O_DIRECTORY" in chain, (
         "the lane is not opened with the flags that refuse a symlink atomically"
     )
+    assert "dir_fd=root_fd" in chain and "_open_root_dir" in chain, (
+        "the lane is opened by path, so the root above it is resolved by the kernel again"
+    )
+    assert chain.count("os.open(") == 1, "the lane is resolved more than once"
+
+    source = inspect.getsource(inbox._lane_scan)
+    assert source.count("_lane_dir_fd(") == 1, "the lane is resolved more than once"
     assert "dir_fd=fd" in source, "entries are stated by path, not against the open lane"
-    assert source.count("os.open(") == 1, "the lane is resolved more than once"
 
 
 def test_ensure_tree_never_chmods_through_a_symlink(root, tmp_path):
@@ -683,3 +700,289 @@ def test_the_staging_write_refuses_a_pre_created_symlink(root, tmp_path):
     with pytest.raises((OSError, PacketError)):
         inbox.publish(packet, root=root)
     assert outside.read_text(encoding="utf-8") == "{}", "we wrote through a pre-created symlink"
+
+
+# --------------------------------------------------------------------------------------------
+# The chain is rooted at the ROOT, not at the lane
+#
+# `O_NOFOLLOW` on a bare path guards only its last component. Every path this module handles is
+# `<root>/<lane>/<entry>`, so the two components above the entry were still resolved by the kernel
+# on every call: a symlinked ROOT was followed by the listing (which then reported a COMPLETE scan
+# of a directory outside the inbox), and a lane swapped for a symlink after the listing was
+# followed by every read, claim and rename that re-opened it by path.
+# --------------------------------------------------------------------------------------------
+
+def _symlinked_root(root, tmp_path):
+    """A real inbox tree, reached only through a symlink standing where the root should be.
+
+    The tree is built for real so the probes have something to find: a followed symlink would
+    return these files, and the assertions below would be satisfied by the wrong answer.
+    """
+    real = tmp_path / "real-inbox"
+    real.mkdir()
+    inbox._ensure_tree(real)
+    inbox.publish(valid_packet(), root=real)
+    root.symlink_to(real)
+    return real
+
+
+def test_a_symlinked_root_is_refused_by_the_lane_listing(root, tmp_path):
+    """The probe r1 shipped: `_lane_scan` followed the root and answered `complete=True`."""
+    real = _symlinked_root(root, tmp_path)
+    assert len(inbox._lane_scan(real, "pending").files) == 1, "the fixture inbox is not readable"
+
+    scan = inbox._lane_scan(root, "pending")
+    assert scan.files == (), "the listing walked through a symlinked root"
+    assert scan.complete is False, (
+        "a listing taken outside the inbox was reported as a complete scan of this lane"
+    )
+    with pytest.raises(inbox.LaneUnreadable):
+        inbox.pending(root)
+
+
+def test_a_symlinked_root_is_refused_by_the_read(root, tmp_path):
+    """The path resolves — through the symlink — to a real packet. It must still not be read."""
+    real = _symlinked_root(root, tmp_path)
+    through_the_link = root / "pending" / inbox._lane_scan(real, "pending").files[0].name
+    assert through_the_link.exists(), "the probe path does not resolve; it would prove nothing"
+
+    with pytest.raises(OSError):
+        inbox._read_lane_file(through_the_link)
+
+
+def test_a_symlinked_root_is_refused_by_the_claim(root, tmp_path):
+    """`claim_next` is a listing plus a move; neither may be answered by an outside directory."""
+    _symlinked_root(root, tmp_path)
+    with pytest.raises((OSError, inbox.LaneUnreadable)):
+        inbox.claim_next(root)
+
+
+def test_a_symlinked_root_is_refused_by_the_publish(root, tmp_path):
+    """`mkdir(exist_ok=True)` SUCCEEDS through a symlink to a directory — the write must not."""
+    real = _symlinked_root(root, tmp_path)
+    before = sorted(p.name for p in (real / "pending").iterdir())
+
+    with pytest.raises(OSError):
+        inbox.publish(valid_packet(packet_id="through-the-link"), root=root)
+
+    assert sorted(p.name for p in (real / "pending").iterdir()) == before, (
+        "a packet was published through a symlinked root"
+    )
+    assert list((real / "staging").iterdir()) == [], "staging was written through a symlinked root"
+
+
+def test_ensure_tree_refuses_a_symlinked_root(root, tmp_path):
+    """The tree is created; the refusal is about WHICH directory the tree is created in."""
+    real = tmp_path / "elsewhere"
+    real.mkdir(mode=0o755)
+    before = oct(real.stat().st_mode)[-3:]
+    root.symlink_to(real)
+
+    with pytest.raises(OSError):
+        inbox._ensure_tree(root)
+    assert oct(real.stat().st_mode)[-3:] == before, "an outside directory's mode was rewritten"
+    assert list(real.iterdir()) == [], "the inbox tree was created outside the inbox root"
+
+
+def test_a_lane_swapped_for_a_symlink_after_the_listing_is_refused_at_the_read(root, tmp_path):
+    """The r1 finding, exactly as probed: the scan legitimately returns the entry, then the LANE —
+    not the entry — is swapped. `O_NOFOLLOW` on the entry's own path says nothing about that."""
+    import shutil
+    published = inbox.publish(valid_packet(), root=root)
+    scan = inbox._lane_scan(root, "pending")
+    assert [p.name for p in scan.files] == [published.name] and scan.complete is True
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    smuggled = outside / published.name
+    smuggled.write_text(json.dumps(valid_packet(packet_id="smuggled")), encoding="utf-8")
+    shutil.rmtree(root / "pending")
+    (root / "pending").symlink_to(outside)
+
+    with pytest.raises(OSError):
+        inbox._read_lane_file(published)
+    assert json.loads(smuggled.read_text(encoding="utf-8"))["packet_id"] == "smuggled", (
+        "content from outside the inbox reached the reader"
+    )
+
+
+def test_a_lane_swapped_for_a_symlink_after_the_listing_is_refused_at_the_move(root, tmp_path):
+    """A claim is a rename; the rename addressed BOTH lanes by path, so this swap moved a file from
+    outside the inbox into `claimed/` and handed it to a reviewer as an audited packet."""
+    import shutil
+    published = inbox.publish(valid_packet(), root=root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    smuggled = outside / published.name
+    smuggled.write_text(json.dumps(valid_packet(packet_id="smuggled")), encoding="utf-8")
+    shutil.rmtree(root / "pending")
+    (root / "pending").symlink_to(outside)
+
+    with pytest.raises(OSError):
+        inbox._move_lane_entry(published, "claimed")
+
+    assert smuggled.exists(), "a file from outside the inbox was moved into the claimed lane"
+    assert list((root / "claimed").iterdir()) == [], "the claimed lane received an outside file"
+
+
+def test_a_lane_swapped_for_a_symlink_between_the_scan_and_the_claim_is_refused(root, tmp_path,
+                                                                                 monkeypatch):
+    """The same swap, driven through the public `claim_next` rather than the helper.
+
+    The listing is genuinely complete when it runs — the swap happens after it — so this is the
+    window the scan cannot close. What the caller must never get is the OTHER answer, "nothing to
+    claim": that is a refusal reported as an empty inbox, which is the failure this whole section of
+    the module exists to prevent.
+    """
+    import shutil
+    published = inbox.publish(valid_packet(), root=root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    smuggled = outside / published.name
+    smuggled.write_text(json.dumps(valid_packet(packet_id="smuggled")), encoding="utf-8")
+
+    real_load = inbox._load
+
+    def swap_the_lane_then_load(path):
+        packet = real_load(path)        # the listing has already happened by the time we are here
+        shutil.rmtree(root / "pending")
+        (root / "pending").symlink_to(outside)
+        return packet
+
+    monkeypatch.setattr(inbox, "_load", swap_the_lane_then_load)
+    with pytest.raises(OSError):
+        inbox.claim_next(root)
+
+    assert smuggled.exists(), "a file from outside the inbox was claimed"
+    assert inbox.claimed(root) == [], "the claimed lane received an outside file"
+
+
+# --- a short write is not a small packet --------------------------------------------------------
+
+def test_a_short_write_is_looped_until_the_whole_body_is_written(tmp_path, monkeypatch):
+    """`os.write` may write fewer bytes than it was given and report how many. Ignoring that return
+    value publishes a TRUNCATED file and reports success — the tail of the packet silently gone."""
+    body = b"x" * 4096
+    real_write = os.write
+    calls = {"count": 0}
+
+    def one_byte_at_a_time(fd, data):
+        calls["count"] += 1
+        return real_write(fd, bytes(data[:1]))
+
+    target = tmp_path / "body.bin"
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        monkeypatch.setattr(inbox.os, "write", one_byte_at_a_time)
+        inbox._write_all(fd, body)
+        monkeypatch.undo()
+    finally:
+        os.close(fd)
+
+    assert calls["count"] > 1, "the body went out in one write; a short write was never exercised"
+    assert target.read_bytes() == body, "a short write truncated the body"
+
+
+def test_a_publish_survives_a_short_write_whole(root, monkeypatch):
+    """The same property where it matters: the bytes a reader ends up with are all of them."""
+    from twoperson.packet import dumps_packet, validate_packet
+    packet = valid_packet()
+    expected = dumps_packet(validate_packet(packet)).encode("utf-8")
+    assert len(expected) > 1, "a one-byte body cannot demonstrate a short write"
+
+    real_write = os.write
+
+    def one_byte_at_a_time(fd, data):
+        return real_write(fd, bytes(data[:1]))
+
+    monkeypatch.setattr(inbox.os, "write", one_byte_at_a_time)
+    path = inbox.publish(packet, root=root)
+    monkeypatch.undo()
+
+    assert path.read_bytes() == expected, "the published packet was truncated by a short write"
+
+
+def test_a_write_that_makes_no_progress_raises_rather_than_spinning(tmp_path, monkeypatch):
+    """A zero-byte write cannot finish the buffer, and retrying it forever is not an answer."""
+    target = tmp_path / "body.bin"
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        monkeypatch.setattr(inbox.os, "write", lambda fd, data: 0)
+        with pytest.raises(OSError):
+            inbox._write_all(fd, b"anything")
+    finally:
+        os.close(fd)
+
+
+# --- a failed publish leaves nothing behind ------------------------------------------------------
+
+def _boom(*_args, **_kwargs):
+    raise OSError("injected failure")
+
+
+@pytest.mark.parametrize("fail_at", ["the write", "the destination lookup", "the replace"])
+def test_a_publish_that_fails_after_the_create_leaves_no_staging_leftover(root, monkeypatch, fail_at):
+    """`O_EXCL` is what makes the staging name safe and what makes a leftover fatal: the NEXT
+    attempt at the same packet is refused by a file the FAILED attempt left behind. Cleaning up only
+    on a failed `os.replace` covers one of the four steps that run between the create and the end.
+    """
+    from twoperson.inbox import _stamp
+    packet = valid_packet()
+    name = f"{_stamp(packet['created_at'])}-{packet['packet_id']}.json"
+
+    if fail_at == "the write":
+        monkeypatch.setattr(inbox, "_write_all", _boom)
+    elif fail_at == "the destination lookup":
+        monkeypatch.setattr(inbox, "_free_name_in", _boom)
+    else:
+        monkeypatch.setattr(inbox.os, "replace", _boom)
+
+    with pytest.raises(OSError):
+        inbox.publish(packet, root=root)
+
+    assert list((root / "staging").iterdir()) == [], (
+        f"a failure at {fail_at} left {name!r} in staging, which blocks every retry of this packet"
+    )
+    monkeypatch.undo()
+    path = inbox.publish(packet, root=root)
+    assert path.name == name and path.parent == root / "pending"
+
+
+# --- the root is held ONCE, and every lane below it is created from that descriptor ---------------
+
+def test_ensure_tree_creates_every_lane_relative_to_one_root_descriptor():
+    """`root / name` resolves the root again for every lane, so a root swapped part-way through the
+    loop has the remaining lanes created somewhere else. Structural, like the publish-rename guard
+    below: it pins the shape, because a test that wins the swap would be flaky and prove less.
+
+    Behaviourally this is already covered from above — `_chmod_own_directory` refused a symlinked
+    root before this change too, so no run of the suite distinguishes the two by outcome. The
+    property the finding names is that the root is resolved ONCE, and that is what is asserted.
+    """
+    import inspect
+
+    source = inspect.getsource(inbox._ensure_tree)
+    assert source.count("_open_root_dir(") == 1, "the root is resolved more than once"
+    assert "dir_fd=root_fd" in source, "a lane is created by path, so the root is resolved per lane"
+    assert "_fchmod_dir(lane_fd)" in source, (
+        "a lane's mode is set by name, which follows a symlink the open above just refused"
+    )
+
+
+def test_the_move_rename_is_addressed_by_descriptor_not_by_path():
+    """The claim/quarantine/requeue/archive move, pinned the same way.
+
+    Both lanes are opened with `O_NOFOLLOW | O_DIRECTORY` and the rename is relative to those
+    descriptors. A rename that named the paths instead would re-resolve both lanes — the same
+    check-then-reopen window the scan closes, one layer down — so the open alone is not the guard;
+    the addressing is. A behavioural probe cannot separate the two here, because the open refuses
+    the swap before the rename is reached.
+    """
+    import inspect
+
+    source = inspect.getsource(inbox._move_lane_entry)
+    assert "src_dir_fd=" in source and "dst_dir_fd=" in source, "the rename still names paths"
+    assert "_lane_dir_fd" in source, "the lanes are not held open across the move"
+    assert "_free_name_in" in source, (
+        "the destination name is chosen by path, so it can be answered by a different lane"
+    )
